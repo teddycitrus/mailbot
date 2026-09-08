@@ -33,7 +33,10 @@ a = Analysis(
     pathex=[str(ROOT)],
     binaries=[],
     datas=datas,
-    hiddenimports=["dns.resolver", "bs4", "lxml", "requests", "dotenv"],
+    # tzdata is loaded lazily by zoneinfo through importlib.resources, which
+    # static analysis does not see. Named explicitly so the timezone database
+    # is always collected into the build.
+    hiddenimports=["dns.resolver", "bs4", "lxml", "requests", "dotenv", "tzdata"],
     excludes=["tkinter", "matplotlib", "numpy", "pytest", "PIL"],
     noarchive=False,
 )

@@ -4,3 +4,9 @@ dnspython>=2.4
 beautifulsoup4>=4.12
 lxml>=5.0
 pytest>=8.0
+
+# zoneinfo has no timezone database of its own on Windows, and minimal Linux
+# images often lack one too. Without this, ZoneInfo("America/Toronto") raises
+# ZoneInfoNotFoundError and every send-window check fails. It happened to work
+# locally only because pandas had pulled tzdata in as a transitive dependency.
+tzdata>=2024.1
