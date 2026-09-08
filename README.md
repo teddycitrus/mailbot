@@ -8,6 +8,8 @@
 [![Stargazers][stars-shield]][stars-url]
 [![Issues][issues-shield]][issues-url]
 [![MIT License][license-shield]][license-url]
+[![Latest Release][release-shield]][release-url]
+[![Downloads][downloads-shield]][downloads-url]
 
 </div>
 
@@ -22,7 +24,7 @@
     <a href="https://github.com/teddycitrus/mailbot"><strong>Explore the docs »</strong></a>
     <br />
     <br />
-    <a href="https://github.com/teddycitrus/mailbot/releases/latest">Download</a>
+    <a href="https://github.com/teddycitrus/mailbot/releases/latest/download/mailbot.exe"><strong>Download for Windows »</strong></a>
     &middot;
     <a href="https://github.com/teddycitrus/mailbot/issues/new?labels=bug">Report Bug</a>
     &middot;
@@ -138,10 +140,16 @@ This is a cold email tool, so the restraint is the point:
 
 ### Installation
 
-Download the latest build from the
-[releases page](https://github.com/teddycitrus/mailbot/releases/latest), put it
-in a folder of its own, and run it. The console opens in your browser and walks
-you through setup.
+Download the latest build:
+
+    https://github.com/teddycitrus/mailbot/releases/latest/download/mailbot.exe
+
+That link always serves the newest release, so it is safe to bookmark or share.
+Every version is also listed on the
+[releases page](https://github.com/teddycitrus/mailbot/releases).
+
+Put the executable in a folder of its own and run it. The console opens in your
+browser and walks you through setup.
 
 Windows will warn that the publisher is unrecognised, because the build is not
 code signed. Choose "More info" and then "Run anyway" if you are willing to
@@ -331,3 +339,7 @@ Project Link: [https://github.com/teddycitrus/mailbot](https://github.com/teddyc
 [issues-url]: https://github.com/teddycitrus/mailbot/issues
 [license-shield]: https://img.shields.io/github/license/teddycitrus/mailbot.svg?style=for-the-badge
 [license-url]: https://github.com/teddycitrus/mailbot/blob/main/LICENSE
+[release-shield]: https://img.shields.io/github/v/release/teddycitrus/mailbot.svg?style=for-the-badge
+[release-url]: https://github.com/teddycitrus/mailbot/releases/latest
+[downloads-shield]: https://img.shields.io/github/downloads/teddycitrus/mailbot/total.svg?style=for-the-badge
+[downloads-url]: https://github.com/teddycitrus/mailbot/releases
