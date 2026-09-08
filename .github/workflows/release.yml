@@ -1,0 +1,63 @@
+# Builds the Windows executable and attaches it to a GitHub release.
+#
+# Runs on a clean runner, so the build physically cannot contain the
+# maintainer's credentials, resume or contact database: none of those files
+# exist in the repository. verify-build proves it anyway before publishing.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build dashboard
+        working-directory: dashboard
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+      - name: Build executable
+        run: python -m PyInstaller packaging/mailbot.spec --noconfirm --distpath dist --workpath build
+
+      - name: Verify the build carries no private data
+        run: python -m src.main verify-build dist/mailbot.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mailbot-windows
+          path: dist/mailbot.exe
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/mailbot.exe
+          generate_release_notes: true

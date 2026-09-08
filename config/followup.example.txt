@@ -1,0 +1,11 @@
+Subject: Re: {original_subject}
+
+Hi {first_name},
+
+Bumping this once in case it got buried. Still interested, and still happy to
+keep it short.
+
+If it is not the right time, no reply needed and I will not follow up again.
+
+Best,
+{sender_name}

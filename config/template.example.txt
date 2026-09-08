@@ -1,0 +1,18 @@
+Subject: Quick note about {company}
+
+Hi {first_name},
+
+{personal_note}
+
+Two or three sentences about who you are and what you are looking for. Keep it
+short: this is a cold email to someone who did not ask for it.
+
+My resume is attached. If you are hiring, I would welcome a short conversation.
+If I have the wrong person, a pointer to whoever owns hiring would help.
+
+Best,
+{sender_name}
+{sender_email}
+
+Not interested? Reply to this message or write to {unsubscribe} and I will not
+contact you again.

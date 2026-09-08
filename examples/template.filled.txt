@@ -1,0 +1,26 @@
+Subject: ML engineer interested in {company}
+
+Hi {first_name},
+
+{personal_note}
+
+I am a machine learning engineer looking for my next role on a small team where
+the model work sits close to the product. I have taken models end to end: data
+pipeline, training, evaluation, and the serving path that keeps them useful once
+real traffic hits them.
+
+Two things I have built that seem relevant to what you are doing:
+
+  - A retrieval pipeline for support ticket triage
+  - A ranking model serving production traffic
+
+My resume is attached. If you are hiring now, or expect to be in the next couple
+of months, I would welcome a short conversation. If I have the wrong person, I
+would be grateful if you pointed me at whoever owns hiring.
+
+Thanks for reading,
+{sender_name}
+{sender_email}
+
+Not interested? Reply to this message or write to {unsubscribe} and I will not
+contact you again.
