@@ -9,7 +9,8 @@ from src.models import (
     VERIFIED,
 )
 from src.verifier import (
-    Verifier, candidate_addresses, is_never_send, is_role_account, valid_syntax,
+    Verifier, candidate_addresses, first_name_from_email, is_never_send,
+    is_role_account, valid_syntax,
 )
 
 
@@ -289,3 +290,28 @@ def test_repeated_timeouts_pause_probing():
     before = v.calls
     v.verify("later@acme.ai", source=SRC_INFERRED)
     assert v.calls == before, "must stop probing once throttled"
+
+
+# The template opens "Dear {first_name},". A contact scraped without a name
+# once rendered "Dear there," and three of those reached real inboxes, so the
+# recovery path and, more importantly, its refusals are pinned here.
+@pytest.mark.parametrize("email,expected", [
+    ("omar@inkeep.com", "Omar"),
+    ("austin+hn@krea.ai", "Austin"),          # plus-tag stripped
+    ("john.smith@x.io", "John"),              # surname stripped
+    ("MORGAN@experiencedevin.com", "Morgan"), # case normalised
+])
+def test_first_name_recovered_from_address(email, expected):
+    assert first_name_from_email(email) == expected
+
+
+@pytest.mark.parametrize("email", [
+    "kk@datrics.ai",            # initials, not a name
+    "gp@attack.capital",        # initials
+    "carehub@hellocozmo.ai",    # shared inbox absent from ROLE_LOCALS
+    "hiring@qualgent.ai",       # role account
+    "support@acme.com",         # role account
+    "a1b2@acme.com",            # not alphabetic
+])
+def test_first_name_declines_when_not_a_person(email):
+    assert first_name_from_email(email) == ""

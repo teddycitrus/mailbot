@@ -45,6 +45,7 @@ class Company:
     employees: Optional[int] = None
     is_hiring: bool = False
     yc_url: str = ""
+    github_org: str = ""
     source: str = "yc"
     status: str = NEW
     skip_reason: str = ""

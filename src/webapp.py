@@ -293,6 +293,26 @@ def static_root() -> Path:
     return project_root() / "dashboard" / "dist"
 
 
+FILENAME_RE = re.compile(rb'filename="([^"]*)"')
+
+
+def uploaded_filename(part: bytes) -> str:
+    """The client's own name for an uploaded file, reduced to a safe PDF name.
+
+    The recipient sees this on the attachment, so a resume that arrives as
+    john_mannully_resume.pdf should stay that rather than becoming resume.pdf.
+    Anything outside a conservative character set is replaced, and a name that
+    is not a plain .pdf is rejected so this cannot write outside assets/.
+    """
+    match = FILENAME_RE.search(part.split(b"\r\n\r\n")[0])
+    if not match:
+        return ""
+    raw = match.group(1).decode("utf-8", "replace")
+    name = raw.replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    return name if name.lower().endswith(".pdf") and len(name) > 4 else ""
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "mailbot"
 
@@ -403,8 +423,27 @@ class Handler(BaseHTTPRequestHandler):
         if not content.startswith(b"%PDF-"):
             return self._error("that is not a PDF")
         settings = Settings.load(env_path() if env_path().exists() else None)
-        settings.resume_path.parent.mkdir(parents=True, exist_ok=True)
-        settings.resume_path.write_bytes(content)
+        # Keep the name the file arrived with. It is what the recipient sees on
+        # the attachment, and "john_mannully_resume.pdf" reads better in their
+        # downloads folder than whatever placeholder the config shipped with.
+        target = settings.resume_path
+        uploaded = uploaded_filename(part)
+        if uploaded and uploaded != target.name:
+            new_target = target.parent / uploaded
+            # Prune the previous resume only inside the app's own assets
+            # folder. RESUME_PATH can point anywhere, and deleting every PDF
+            # in someone's Documents folder is not this endpoint's business.
+            if target.parent.resolve() == (project_root() / "assets").resolve():
+                for stale in target.parent.glob("*.pdf"):
+                    if stale.resolve() != new_target.resolve():
+                        stale.unlink()
+            target = new_target
+            write_env({"RESUME_PATH": str(
+                target.relative_to(project_root())
+                if target.is_relative_to(project_root()) else target
+            ).replace("\\", "/")})
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
         return self._json(setup_state())
 
 

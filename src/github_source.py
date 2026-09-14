@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter
 from dataclasses import dataclass, field
@@ -90,6 +91,22 @@ class GitHubClient:
 
     def org_exists(self, slug: str) -> bool:
         return bool(self._get(f"/orgs/{slug}"))
+
+    def search_orgs(self, query: str, per_page: int = 100, page: int = 1) -> list[dict]:
+        """One page of the org search. Returns logins only; see `get_user`.
+
+        The search endpoint has its own quota, 30 requests a minute when
+        authenticated, which the client's 20-a-minute limiter stays under.
+        """
+        payload = self._get(
+            "/search/users?q=" + urllib.parse.quote(query)
+            + f"&per_page={per_page}&page={page}"
+        )
+        return (payload or {}).get("items", []) or []
+
+    def get_user(self, login: str) -> dict:
+        """Full profile for one account. Search hits do not carry `blog`."""
+        return self._get(f"/users/{login}") or {}
 
     def harvest(self, org: str, domain: str, repos: int = 3,
                 commits: int = 40) -> GitHubFindings:

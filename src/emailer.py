@@ -70,8 +70,35 @@ class Template:
 KNOWN_FIELDS = frozenset({
     "first_name", "full_name", "company", "role", "location", "batch",
     "one_liner", "personal_note", "sender_name", "sender_email", "unsubscribe",
-    "original_subject",
+    "original_subject", "resume_link",
 })
+
+
+# The resume travels as an attachment. The hosted link is the fallback for the
+# one case the attachment cannot cover, and the two never ship together: Gmail
+# renders a Drive link as its own chip beside the attachment, so a message
+# carrying both looks like it holds two different resumes.
+RESUME_LINK_LABEL = "View my resume"
+
+
+def resume_link_line(url: str) -> str:
+    """The signature line offering a hosted resume, or nothing if unconfigured."""
+    return f"[{RESUME_LINK_LABEL}]({url})" if url else ""
+
+
+def has_resume_link(body: str, url: str = "") -> bool:
+    return bool(url and url in body) or f"[{RESUME_LINK_LABEL}](" in body
+
+
+def with_resume_link(body: str, url: str) -> str:
+    """Append the hosted link to a body whose attachment did not make it.
+
+    Idempotent, so a body rendered from a template that already carries the
+    link is left alone rather than growing a second copy.
+    """
+    if not url or has_resume_link(body, url):
+        return body
+    return body.rstrip("\n") + f"\n{resume_link_line(url)}\n"
 
 
 UNEDITED_MARKER = re.compile(r"\[[A-Z][A-Z0-9 ,.'-]{3,}\]")
@@ -189,6 +216,20 @@ def recipient_timezone(location: str, default: str) -> str:
         if needle in low:
             return zone
     return default
+
+
+# Legal suffixes read badly in a salutation: "Dear Datrics Inc.," is worse
+# than "Dear Datrics,". Brand words like AI or Labs are left alone, because
+# they are usually part of how the company actually calls itself.
+LEGAL_SUFFIX = re.compile(
+    r"[,\s]+(inc|llc|ltd|limited|corp|corporation|co|gmbh|bv|sa|plc)\.?$",
+    re.IGNORECASE,
+)
+
+
+def greeting_name(company: str) -> str:
+    """The company as you would address it in a salutation."""
+    return LEGAL_SUFFIX.sub("", (company or "").strip()).strip()
 
 
 def local_window_open(location: str, default_tz: str, start: dtime, end: dtime,

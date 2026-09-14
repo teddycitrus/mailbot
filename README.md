@@ -83,14 +83,24 @@ the computer you run it on.
 
 ### How It Finds Addresses
 
-Four free sources, in the order they are tried:
+Five free sources, in the order they are tried:
 
 | Source | What it gives | Cost |
 | --- | --- | --- |
 | Y Combinator OSS directory | Companies, location, headcount, batch, hiring flag | No key |
+| GitHub org search by city | Companies that never applied to an accelerator | Token |
 | Company website crawl | Any address the company publishes itself | No key |
 | Public git commits | Addresses engineers published in their own commits | Optional token |
 | Hacker News "Who is hiring" | Addresses the hiring person typed themselves | No key |
+
+Discovery runs on two sources because one accelerator is not a market. YC's
+directory is roughly thirty San Francisco companies for every Toronto one, which
+describes YC rather than the cities. GitHub org search is keyed on a
+self-reported location, so it reaches companies outside that pipeline and gives
+every target city comparable depth. The tradeoff is metadata: a YC record
+carries a batch and a team size, a GitHub org carries neither, so the age filter
+falls back to the org's creation date and the headcount filter cannot run.
+Companies are tagged with the source they came from and stay distinguishable.
 
 When no address is published, one is inferred from the person's name and the
 domain's observed naming convention, then confirmed over SMTP: an MX lookup,
@@ -135,7 +145,8 @@ This is a cold email tool, so the restraint is the point:
 
 * A mail account you can create an app password for. Gmail needs two-factor
   authentication enabled first.
-* Your resume as a PDF.
+* Your resume as a PDF. The filename travels with the email, so name it
+  after yourself rather than leaving it as resume.pdf.
 * Nothing else. Both API integrations are optional and both have free tiers.
 
 ### Installation
@@ -193,8 +204,9 @@ Every stage is also a command, which is what the scheduled jobs call:
 
 ```sh
 python -m src.main dashboard      # setup and progress console
-python -m src.main discover       # find qualifying companies
-python -m src.main hn             # import the Hacker News hiring thread
+python -m src.main discover       # find qualifying companies (Y Combinator)
+python -m src.main gh             # find companies via GitHub org search
+python -m src.main hn             # import the Hacker News hiring threads
 python -m src.main enrich         # find and verify a contact at each company
 python -m src.main queue          # render personalised drafts
 python -m src.main preview        # read the drafts before anything is sent
@@ -277,7 +289,8 @@ contacts people whose local window is currently open.
 - [ ] macOS and Linux builds
 - [ ] Funding signal keyed on domain rather than company name
 - [ ] Headcount growth as a ranking input, once enough history accumulates
-- [ ] Pluggable discovery sources beyond Y Combinator
+- [x] Discovery sources beyond Y Combinator
+- [ ] City startup directories, for cities GitHub and YC both under-serve
 
 See the [open issues](https://github.com/teddycitrus/mailbot/issues) for the
 full list.

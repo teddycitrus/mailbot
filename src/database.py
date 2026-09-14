@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS companies (
     employees     INTEGER,
     is_hiring     INTEGER DEFAULT 0,
     yc_url        TEXT DEFAULT '',
+    github_org    TEXT DEFAULT '',
     source        TEXT DEFAULT 'yc',
     status        TEXT DEFAULT 'new',
     skip_reason   TEXT DEFAULT '',
@@ -136,6 +137,7 @@ class Database:
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
 
     def close(self) -> None:
@@ -158,6 +160,20 @@ class Database:
 
     # ---------- companies ----------
 
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created.
+
+        CREATE TABLE IF NOT EXISTS silently leaves an existing table alone, so a
+        new column has to be added explicitly or every read of it raises on the
+        databases that matter, the ones already carrying live send history.
+        """
+        have = {row[1] for row in self.conn.execute("PRAGMA table_info(companies)")}
+        if "github_org" not in have:
+            self.conn.execute(
+                "ALTER TABLE companies ADD COLUMN github_org TEXT DEFAULT ''"
+            )
+            self.conn.commit()
+
     def upsert_company(self, c: Company) -> int:
         """Insert, or return the existing id. Domain is the identity key."""
         row = self.conn.execute(
@@ -168,12 +184,12 @@ class Database:
         cur = self.conn.execute(
             """INSERT INTO companies
                (name, domain, website, location, industry, one_liner, description,
-                batch, founded_year, employees, is_hiring, yc_url, source, status,
-                skip_reason, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                batch, founded_year, employees, is_hiring, yc_url, github_org,
+                source, status, skip_reason, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (c.name, c.domain, c.website, c.location, c.industry, c.one_liner,
              c.description, c.batch, c.founded_year, c.employees, int(c.is_hiring),
-             c.yc_url, c.source, c.status, c.skip_reason, _now()),
+             c.yc_url, c.github_org, c.source, c.status, c.skip_reason, _now()),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -428,6 +444,39 @@ class Database:
             (local_date,),
         ).fetchone()
         return int(row["n"])
+
+    def active_send_days(self, before_local_date: str) -> int:
+        """How many distinct days the bot sent on, before the given date.
+
+        Days sent on, not calendar days elapsed: a weekend, an outage or a
+        week with an empty queue must not hand the ramp credit it has not
+        earned. Excluding today keeps today's cap fixed for the whole day.
+        """
+        row = self.conn.execute(
+            """SELECT COUNT(DISTINCT local_date) AS n FROM sends
+               WHERE status = 'sent' AND local_date < ?""",
+            (before_local_date,),
+        ).fetchone()
+        return int(row["n"])
+
+    def recent_bounce_pct(self, window: int = 100) -> float:
+        """Bounce rate over the most recent `window` sends, as a percentage.
+
+        The inbox scan records a bounce on the contact rather than on the
+        send row, so this joins back to contacts to count them.
+        """
+        row = self.conn.execute(
+            """SELECT COUNT(*) AS total,
+                      SUM(CASE WHEN c.status = ? THEN 1 ELSE 0 END) AS bounced
+               FROM (SELECT contact_id FROM sends
+                     WHERE status = 'sent' ORDER BY id DESC LIMIT ?) s
+               JOIN contacts c ON c.id = s.contact_id""",
+            (BOUNCED, max(1, window)),
+        ).fetchone()
+        total = int(row["total"] or 0)
+        if not total:
+            return 0.0
+        return 100.0 * int(row["bounced"] or 0) / total
 
     def sends_on(self, local_date: str) -> list[sqlite3.Row]:
         return self.conn.execute(

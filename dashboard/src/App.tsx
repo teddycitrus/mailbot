@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "./api";
 import DashboardView from "./components/DashboardView";
 import Sidebar, { type NavItem } from "./components/Sidebar";
@@ -12,6 +12,11 @@ import type { DashboardData, HealthCheck, SetupState } from "./types";
  *  it does, the progress dashboard takes over and setup stays reachable from
  *  the sidebar.
  */
+
+/** How often the running dashboard re-reads the database. The send and build
+ *  jobs are separate processes, so a tab left open would otherwise keep showing
+ *  whatever was true when it was opened. */
+const POLL_MS = 15_000;
 
 type Theme = "light" | "dark" | "system";
 
@@ -48,6 +53,33 @@ function ThemeToggle({ theme, setTheme }: ReturnType<typeof useTheme>) {
   );
 }
 
+/** Age of the numbers on screen. Keeps its own timer so a ticking clock does
+ *  not re-render the tables and charts every few seconds. */
+function LastUpdated({ at, stale }: { at: Date | null; stale: boolean }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 5000);
+    return () => window.clearInterval(id);
+  }, []);
+  if (!at) return null;
+  const secs = Math.max(0, Math.round((now - at.getTime()) / 1000));
+  const ago =
+    secs < 60
+      ? `${secs}s ago`
+      : secs < 3600
+        ? `${Math.floor(secs / 60)}m ago`
+        : at.toLocaleTimeString();
+  return (
+    <span
+      className={`hidden text-xs sm:inline ${stale ? "text-negative" : "text-muted"}`}
+      title={at.toLocaleString()}
+    >
+      {stale ? "offline, last update " : "updated "}
+      {ago}
+    </span>
+  );
+}
+
 export default function App() {
   const themeState = useTheme();
   const [setup, setSetup] = useState<SetupState | null>(null);
@@ -58,27 +90,63 @@ export default function App() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [stale, setStale] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const inFlight = useRef(false);
+
+  /** Pulls the numbers only. Deliberately leaves `page` alone: a background
+   *  poll must never move the user off the page they are reading. */
+  const loadData = useCallback(async () => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setRefreshing(true);
+    try {
+      const [d, h] = await Promise.all([api.getDashboard(), api.getHealth()]);
+      setData(d);
+      setChecks(h.checks);
+      setLastUpdated(new Date());
+      setStale(false);
+    } catch {
+      setStale(true); // keep the last good numbers up, but say they are stale
+    } finally {
+      inFlight.current = false;
+      setRefreshing(false);
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
       const s = await api.getSetup();
       setSetup(s);
       setPage(s.configured ? "overview" : "setup");
-      if (s.configured) {
-        const [d, h] = await Promise.all([api.getDashboard(), api.getHealth()]);
-        setData(d);
-        setChecks(h.checks);
-      }
+      if (s.configured) await loadData();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not reach the local service.");
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [loadData]);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  const configured = setup?.configured ?? false;
+
+  useEffect(() => {
+    if (!configured) return;
+    const tick = () => {
+      if (!document.hidden) void loadData();
+    };
+    const id = window.setInterval(tick, POLL_MS);
+    // A hidden tab stops polling; the same handler catches it up on return.
+    document.addEventListener("visibilitychange", tick);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", tick);
+    };
+  }, [configured, loadData]);
 
   const save = async (values: Record<string, string>) => {
     setSaving(true);
@@ -117,6 +185,8 @@ export default function App() {
       ]
     : [{ id: "setup", label: "Setup" }];
 
+  const showLive = configured && page !== "setup";
+
   return (
     <div className="grid min-h-full grid-cols-1 lg:grid-cols-[16rem_1fr]">
       <a href="#main" className="skip-link">
@@ -150,6 +220,20 @@ export default function App() {
           <h1 className="flex-1 truncate text-sm font-semibold">
             {page === "setup" ? "Configuration" : "Overview"}
           </h1>
+          {showLive && (
+            <>
+              <LastUpdated at={lastUpdated} stale={stale} />
+              <button
+                type="button"
+                onClick={() => void loadData()}
+                disabled={refreshing}
+                className="rounded-md border border-border px-3 py-1.5 text-xs font-medium
+                           text-muted hover:text-text disabled:opacity-50"
+              >
+                {refreshing ? "Refreshing" : "Refresh"}
+              </button>
+            </>
+          )}
           <ThemeToggle {...themeState} />
         </header>
 

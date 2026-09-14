@@ -15,20 +15,24 @@ from pathlib import Path
 from .config import Settings
 from .database import Database
 from .emailer import (
+    greeting_name, has_resume_link, resume_link_line, with_resume_link,
     build_message, in_send_window, load_template, local_date, local_now,
     local_window_open, make_backend, pace_delay, unedited_markers,
     validate_template,
 )
 from .finder import discover as discover_companies, enrich_company
+from .gh_discovery import discover as discover_orgs
 from .github_source import GitHubClient
-from .hn_source import fetch_posts
+from .hn_source import fetch_posts, fetch_recent_posts
 from .llm import Personalizer
 from .models import (
     Company, Contact, ENRICHED, NO_CONTACTS, PENDING, SRC_SCRAPED,
 )
 from .scraper import Fetcher
 from .reporting import BAR, _print_table, build_digest, print_summary
-from .verifier import Verifier, is_never_send, is_role_account
+from .verifier import (
+    Verifier, first_name_from_email, is_never_send, is_role_account,
+)
 
 class Pipeline:
     def __init__(self, settings: Settings):
@@ -72,6 +76,29 @@ class Pipeline:
             )
         return len(found)
 
+    def discover_github(self, limit: int = 40) -> int:
+        """Companies from GitHub org search, alongside the YC directory.
+
+        Runs on the same funnel as everything else: rows land with status=new
+        and the existing enrich stage takes them from there.
+        """
+        if not self.settings.github_token:
+            print("gh: set GITHUB_TOKEN, the search endpoint needs one")
+            return 0
+        found, stats = discover_orgs(self.github, self.settings, self.db, limit=limit)
+        for company in found:
+            self.db.upsert_company(company)
+        print(f"gh: {stats.added} added of {stats.scanned} orgs scanned "
+              f"({stats.already_known} already known, {stats.rejected} no usable "
+              f"domain, {self.github.budget})")
+        if found:
+            _print_table(
+                [(c.name, c.domain, c.location[:20], c.github_org,
+                  c.founded_year or "") for c in found],
+                ("company", "domain", "location", "org", "since"),
+            )
+        return len(found)
+
     def enrich(self, limit: int) -> int:
         companies = self.db.companies_by_status("new", limit=limit)
         if not companies:
@@ -108,17 +135,23 @@ class Pipeline:
         _print_table(rows, ("company", "email", "verify", "conf", "role/note"))
         return added
 
-    def import_hn(self, limit: int = 40) -> int:
-        """Pull contacts from the monthly Hacker News hiring thread.
+    def import_hn(self, limit: int = 40, months: int = 1) -> int:
+        """Pull contacts from the monthly Hacker News hiring threads.
 
         These arrive already enriched: the poster published their own address,
         so there is nothing to infer and nothing to guess. They still go through
         verification and the same duplicate gate as everything else.
+
+        `months` reads that many threads back. The addresses do not rot and the
+        companies are mostly still hiring, so a backfill is close to free volume.
         """
         settings = self.settings
-        posts = fetch_posts(settings.target_locations)
+        if months > 1:
+            posts = fetch_recent_posts(settings.target_locations, months=months)
+        else:
+            posts = fetch_posts(settings.target_locations)
         if not posts:
-            print("hn: no qualifying posts in the current thread")
+            print("hn: no qualifying posts in the threads read")
             return 0
         added, rows = 0, []
         for post in posts[:limit]:
@@ -177,12 +210,21 @@ class Pipeline:
             print(f"warning: template still has {len(holes)} unedited placeholder(s): "
                   f"{', '.join(holes[:3])}")
             print("         drafts will queue for preview but send() will refuse them")
+        # The resume is an attachment first. The hosted link only appears
+        # when there is no PDF to attach, because a message carrying both
+        # shows the recipient two resume chips and reads as sloppy.
         attachments = []
+        resume_link = ""
         if self.settings.resume_path.exists():
             attachments.append(str(self.settings.resume_path))
-        else:
+        elif self.settings.resume_link:
+            resume_link = resume_link_line(self.settings.resume_link)
             print(f"warning: resume not found at {self.settings.resume_path}, "
-                  "queuing without attachment; send() will refuse these drafts")
+                  "falling back to the resume link in the body")
+        else:
+            print(f"warning: resume not found at {self.settings.resume_path} "
+                  "and no RESUME_LINK is set; queuing without either, "
+                  "send() will refuse these drafts")
 
         contacts = self.db.contacts_by_status(PENDING, limit=limit * 3)
         queued = 0
@@ -202,12 +244,24 @@ class Pipeline:
             if row["company_id"] and self.db.company_has_contacted(row["company_id"]):
                 rows.append((row["email"], "skip", "company already contacted"))
                 continue
+            # The template opens "Dear {first_name}," so a missing name used to
+            # render "Dear there,". Recover a given name from the address where
+            # the local part is plainly one, and otherwise address the company:
+            # "Dear Datrics," is a fair greeting for a shared inbox, where
+            # guessing a person's name would not be. Resolved before
+            # personalising so a skip costs no LLM call.
+            first = (row["first_name"]
+                     or first_name_from_email(row["email"])
+                     or greeting_name(row["company_name"] or ""))
+            if not first:
+                rows.append((row["email"], "skip", "no name and no company"))
+                continue
             note = self.personalizer.line_for(
                 row["company_name"] or "", row["one_liner"] or "",
                 row["description"] or "", row["role"] or "",
             )
             context = {
-                "first_name": row["first_name"] or "there",
+                "first_name": first,
                 "full_name": " ".join(
                     p for p in (row["first_name"], row["last_name"]) if p
                 ),
@@ -220,8 +274,12 @@ class Pipeline:
                 "sender_name": self.settings.from_name,
                 "sender_email": self.settings.from_email,
                 "unsubscribe": self.settings.unsubscribe_mailto,
+                "resume_link": resume_link,
             }
             subject, body = template.render(context)
+            if resume_link:
+                # Covers a template that has no {resume_link} placeholder.
+                body = with_resume_link(body, self.settings.resume_link)
             self.db.queue_draft(row["id"], subject, body, attachments)
             queued += 1
             rows.append((row["email"], "queued", subject[:40]))
@@ -240,14 +298,33 @@ class Pipeline:
                                 f"unedited template: {', '.join(holes[:2])}"))
                 continue
             attachments = [a for a in (draft["attachments"] or "").split("|") if a]
-            if want_resume and not attachments:
+            # A draft carrying the hosted link instead of the PDF is complete:
+            # that is the fallback the queue applies when there is nothing to
+            # attach. One or the other must be there, never neither.
+            if want_resume and not attachments and not has_resume_link(draft["body"]):
                 blocked.append((draft["email"], "no resume attached"))
                 continue
-            if any(not Path(a).exists() for a in attachments):
+            missing = [a for a in attachments if not Path(a).exists()]
+            if missing and not self.settings.resume_link:
                 blocked.append((draft["email"], "attachment file is missing"))
                 continue
             ready.append(draft)
         return ready, blocked
+
+    def _todays_cap(self, today: str) -> tuple[int, str]:
+        """Today's send cap, after the warmup ramp.
+
+        Short-circuited when the ramp is off so the common case costs no
+        queries. Both send and followup go through here, so the two share
+        one cap rather than each getting a full allowance.
+        """
+        settings = self.settings
+        if not getattr(settings, "send_ramp_enabled", False):
+            return settings.daily_send_limit, "ramp off"
+        return settings.daily_cap(
+            self.db.active_send_days(today),
+            self.db.recent_bounce_pct(),
+        )
 
     def followup(self, limit: int, ignore_window: bool = False) -> int:
         """Send one polite nudge to people who never answered.
@@ -266,9 +343,10 @@ class Pipeline:
 
         today = local_date(settings.send_timezone)
         already = self.db.sent_count_on(today)
-        remaining = max(0, settings.daily_send_limit - already)
+        cap, why_cap = self._todays_cap(today)
+        remaining = max(0, cap - already)
         if remaining == 0:
-            print(f"followup: daily cap reached ({already}/{settings.daily_send_limit})")
+            print(f"followup: daily cap reached ({already}/{cap}, {why_cap})")
             return 0
 
         due = self.db.due_for_followup(
@@ -279,11 +357,16 @@ class Pipeline:
             print("followup: nobody due")
             return 0
 
+        # Same rule as the first email: attach the PDF, and only reach for
+        # the hosted link when there is no PDF to attach.
         attachments = ([str(settings.resume_path)]
                        if settings.resume_path.exists() else [])
-        if not attachments:
-            print("followup: resume missing, refusing to send")
+        if not attachments and not settings.resume_link:
+            print("followup: resume missing and no RESUME_LINK set, refusing to send")
             return 0
+        if not attachments:
+            print(f"followup: resume missing at {settings.resume_path}, "
+                  "falling back to the resume link")
 
         sent = 0
         backend = make_backend(settings)
@@ -303,14 +386,24 @@ class Pipeline:
                         )
                         if not open_now:
                             continue
+                    first = (row["first_name"]
+                             or first_name_from_email(row["email"])
+                             or greeting_name(row["company_name"] or ""))
+                    if not first:
+                        print(f"  skip {row['email']}: no name and no company")
+                        continue
                     subject, body = template.render({
-                        "first_name": row["first_name"] or "there",
+                        "first_name": first,
                         "original_subject": (row["first_subject"] or "").lstrip("Re: "),
                         "company": row["company_name"] or "",
                         "sender_name": settings.from_name,
                         "sender_email": settings.from_email,
                         "unsubscribe": settings.unsubscribe_mailto,
+                        "resume_link": ("" if attachments
+                                        else resume_link_line(settings.resume_link)),
                     })
+                    if not attachments:
+                        body = with_resume_link(body, settings.resume_link)
                     message = build_message(
                         subject, body, row["email"],
                         " ".join(p for p in (row["first_name"], row["last_name"]) if p),
@@ -376,9 +469,10 @@ class Pipeline:
                 return 0
 
         already = self.db.sent_count_on(today)
-        remaining = max(0, settings.daily_send_limit - already)
+        cap, why_cap = self._todays_cap(today)
+        remaining = max(0, cap - already)
         if remaining == 0:
-            print(f"send: daily cap reached ({already}/{settings.daily_send_limit})")
+            print(f"send: daily cap reached ({already}/{cap}, {why_cap})")
             return 0
 
         # Pull more than the budget so recipients outside their local morning
@@ -438,7 +532,7 @@ class Pipeline:
             print(f"send: could not reach {settings.smtp_host}: "
                   f"{type(exc).__name__}: {exc}")
             return 0
-        print(f"send: {sent} delivered, {already + sent}/{settings.daily_send_limit} today")
+        print(f"send: {sent} delivered, {already + sent}/{cap} today ({why_cap})")
         return sent
 
     def _deliver(self, backend, drafts: list, today: str) -> int:
@@ -452,12 +546,29 @@ class Pipeline:
                     self.db.mark_draft(draft["id"], "skipped")
                     continue
                 attachments = [a for a in (draft["attachments"] or "").split("|") if a]
-                message = build_message(
-                    draft["subject"], draft["body"], draft["email"],
-                    " ".join(p for p in (draft["first_name"], draft["last_name"]) if p),
-                    settings.from_email, settings.from_name,
-                    settings.reply_to, settings.unsubscribe_mailto, attachments,
-                )
+                body = draft["body"]
+                try:
+                    message = build_message(
+                        draft["subject"], body, draft["email"],
+                        " ".join(p for p in (draft["first_name"], draft["last_name"]) if p),
+                        settings.from_email, settings.from_name,
+                        settings.reply_to, settings.unsubscribe_mailto, attachments,
+                    )
+                except FileNotFoundError as exc:
+                    # The PDF moved between queueing and sending. Send the link
+                    # instead of dropping the resume from the message entirely.
+                    if not settings.resume_link:
+                        print(f"  BLOCKED {draft['email']}: {exc}")
+                        self.db.mark_draft(draft["id"], "failed")
+                        continue
+                    print(f"  {draft['email']}: {exc}, using the resume link")
+                    body = with_resume_link(body, settings.resume_link)
+                    message = build_message(
+                        draft["subject"], body, draft["email"],
+                        " ".join(p for p in (draft["first_name"], draft["last_name"]) if p),
+                        settings.from_email, settings.from_name,
+                        settings.reply_to, settings.unsubscribe_mailto,
+                    )
                 result = backend.send(message)
                 self.db.record_send(
                     draft["contact_id"], draft["email"], draft["subject"],

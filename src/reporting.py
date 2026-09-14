@@ -122,11 +122,14 @@ def print_summary(db, settings, fetcher, personalizer) -> None:
     )
     stats = db.stats()
     used = db.sent_count_on(today)
+    cap, why_cap = settings.daily_cap(
+        db.active_send_days(today), db.recent_bounce_pct()
+    )
     print(f"\n{BAR}\nQUOTAS AND PIPELINE\n{BAR}")
     _print_table(
         [
-            ("daily sends", f"{used}/{settings.daily_send_limit}",
-             f"{max(0, settings.daily_send_limit - used)} left"),
+            ("daily sends", f"{used}/{cap}",
+             f"{max(0, cap - used)} left, {why_cap}"),
             ("http fetches", f"{fetcher.budget.used}/"
                              f"{fetcher.budget.limit}",
              f"{fetcher.budget.remaining} left"),

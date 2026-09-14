@@ -237,6 +237,14 @@ class EnrichResult:
     note: str = ""
 
 
+def _row_get(row, key: str, default: str = "") -> str:
+    """Read an optional column from a sqlite3.Row or a plain mapping."""
+    try:
+        return row[key] or default
+    except (IndexError, KeyError, TypeError):
+        return default
+
+
 def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
                    settings, github=None) -> EnrichResult:
     """Find the best reachable person at one company."""
@@ -262,8 +270,12 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
     # person, not inferred, so they survive a catch-all domain. The observed
     # naming pattern is reused below when nothing else pans out.
     if github is not None and not github.exhausted:
-        org = find_org_for(fetcher, company_row["website"], html=html or "",
-                           company_name=company_row["name"], client=github)
+        # A company discovered through GitHub already knows its org. Rediscovery
+        # costs a call and can resolve to a different account with a similar
+        # name, so the recorded slug wins when there is one.
+        org = _row_get(company_row, "github_org") or find_org_for(
+            fetcher, company_row["website"], html=html or "",
+            company_name=company_row["name"], client=github)
         if org:
             findings = github.harvest(org, domain)
             gh_pattern = findings.pattern

@@ -78,6 +78,41 @@ def is_role_account(email: str) -> bool:
     return local_part(email) in ROLE_LOCALS
 
 
+# Tokens that mark a mailbox as functional rather than personal, matched as
+# substrings because shared inboxes get invented faster than any fixed list can
+# track. "carehub" is absent from ROLE_LOCALS but is no more a person than
+# "support" is.
+NON_NAME_TOKENS = (
+    "care", "hub", "team", "info", "hello", "support", "contact", "admin",
+    "sales", "job", "hiring", "career", "press", "help", "desk", "mail",
+    "inbox", "noreply", "reply", "billing", "legal", "office", "service",
+    "account", "partner", "media", "invest", "founder", "recruit", "talent",
+    "people", "apply", "join", "connect", "reach", "enquir", "inquir",
+)
+
+_GIVEN_NAME_RE = re.compile(r"^[a-z]{3,20}$")
+
+
+def first_name_from_email(email: str) -> str:
+    """Recover a given name from an address like omar@inkeep.com.
+
+    Only answers when the local part really does look like one person's given
+    name. Initials, digits and role mailboxes come back empty. The bias is
+    deliberately towards returning nothing: the greeting is the first thing the
+    recipient reads, so a confidently wrong name there is worse than declining
+    to write the message at all.
+    """
+    if is_role_account(email) or is_never_send(email):
+        return ""
+    part = local_part(email).split("+", 1)[0]       # austin+hn  -> austin
+    part = re.split(r"[._\-]", part, maxsplit=1)[0]          # first.last -> first
+    if not _GIVEN_NAME_RE.match(part):              # kk, a1, s -> decline
+        return ""
+    if any(token in part for token in NON_NAME_TOKENS):
+        return ""
+    return part.capitalize()
+
+
 class Verifier:
     """MX and SMTP checks with a per-domain cache to avoid re-probing."""
 

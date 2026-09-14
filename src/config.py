@@ -107,6 +107,10 @@ class Settings:
     db_path: Path
     template_path: Path
     resume_path: Path
+    # Hosted copy of the same resume. Used only when the PDF cannot be
+    # attached, never alongside it: a recipient who sees an attachment and
+    # a Drive link in the same message reads it as two documents.
+    resume_link: str
 
     # Targeting
     target_locations: tuple[str, ...]
@@ -119,6 +123,10 @@ class Settings:
 
     # Guardrails
     daily_send_limit: int
+    send_ramp_enabled: bool
+    send_ramp_start: int
+    send_ramp_step: int
+    send_ramp_max_bounce_pct: int
     send_delay_seconds: int
     dry_run: bool
     send_window_start: dtime
@@ -163,7 +171,8 @@ class Settings:
             imap_pass=os.getenv("IMAP_PASS", ""),
             db_path=_path("DB_PATH", "outreach.db"),
             template_path=_path("TEMPLATE_PATH", "config/template.txt"),
-            resume_path=_path("RESUME_PATH", "assets/resume.pdf"),
+            resume_path=_path("RESUME_PATH", "assets/john_mannully_resume.pdf"),
+            resume_link=os.getenv("RESUME_LINK", "").strip(),
             target_locations=_split(
                 os.getenv("TARGET_LOCATIONS", "San Francisco,New York,Toronto")
             ),
@@ -178,6 +187,10 @@ class Settings:
             hiring_only=_bool("HIRING_ONLY", True),
             prefer_recently_funded=_bool("PREFER_RECENTLY_FUNDED", True),
             daily_send_limit=_int("DAILY_SEND_LIMIT", 25),
+            send_ramp_enabled=_bool("SEND_RAMP_ENABLED", True),
+            send_ramp_start=_int("SEND_RAMP_START", 8),
+            send_ramp_step=_int("SEND_RAMP_STEP", 2),
+            send_ramp_max_bounce_pct=_int("SEND_RAMP_MAX_BOUNCE_PCT", 5),
             send_delay_seconds=_int("SEND_DELAY_SECONDS", 20),
             dry_run=_bool("DRY_RUN", True),
             send_window_start=_clock("SEND_WINDOW_START", "08:30"),
@@ -191,6 +204,40 @@ class Settings:
             followup_template_path=_path(
                 "FOLLOWUP_TEMPLATE_PATH", "config/followup.txt"),
         )
+
+    def daily_cap(self, active_days: int, bounce_pct: float) -> tuple[int, str]:
+        """Today's cap, grown from SEND_RAMP_START toward DAILY_SEND_LIMIT.
+
+        A young sending address that opens at full daily volume reads as a
+        blast, because mailbox providers judge a sender on how its volume
+        grows as much as on the volume itself. So the cap starts small and
+        earns one step per day actually sent on, never past DAILY_SEND_LIMIT,
+        which stays the hard ceiling.
+
+        `active_days` counts days sent on *before* today, so the cap holds
+        still for the whole of today instead of climbing the moment the
+        first message goes out.
+
+        Returns the cap and a short reason, because a cap that silently
+        disagrees with DAILY_SEND_LIMIT is otherwise baffling in the logs.
+        """
+        ceiling = max(0, self.daily_send_limit)
+        if not self.send_ramp_enabled:
+            return ceiling, "ramp off"
+
+        earned = self.send_ramp_start + self.send_ramp_step * max(0, active_days)
+        cap = max(0, min(ceiling, earned))
+
+        # Climbing while mail is bouncing is what gets an address blocked, so
+        # fall back to the opening step until the bounce rate recovers.
+        if bounce_pct > self.send_ramp_max_bounce_pct:
+            held = max(0, min(cap, self.send_ramp_start))
+            return held, (f"held at {held}, bounce rate {bounce_pct:.1f}% "
+                          f"over {self.send_ramp_max_bounce_pct}%")
+
+        if cap >= ceiling:
+            return ceiling, f"ramp complete at {ceiling}/day"
+        return cap, f"ramp day {active_days + 1}, climbing to {ceiling}"
 
     def require(self, *names: str) -> None:
         """Fail loudly and all at once rather than midway through a run."""

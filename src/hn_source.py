@@ -36,6 +36,20 @@ ML_TERMS = (
     "embedding", "inference", "model training", "data scientist",
 )
 
+# An HN comment carries no team size, so the under-200-people filter cannot run
+# here the way it does on a YC record. Reading a year of threads instead of one
+# multiplies that gap, so the largest employers who post every month are named
+# outright. This is a floor, not a substitute for a headcount signal.
+TOO_BIG = {
+    "adobe.com", "google.com", "microsoft.com", "amazon.com", "apple.com",
+    "meta.com", "netflix.com", "oracle.com", "salesforce.com", "ibm.com",
+    "intel.com", "nvidia.com", "cisco.com", "sap.com", "vmware.com",
+    "uber.com", "lyft.com", "airbnb.com", "dropbox.com", "shopify.com",
+    "spotify.com", "stripe.com", "square.com", "block.xyz", "twilio.com",
+    "atlassian.com", "datadoghq.com", "snowflake.com", "databricks.com",
+    "palantir.com", "bloomberg.net", "jpmorgan.com", "goldmansachs.com",
+}
+
 # Free-mail hosts: a personal address, not a company one.
 CONSUMER = {
     "gmail.com", "googlemail.com", "yahoo.com", "hotmail.com", "outlook.com",
@@ -113,23 +127,42 @@ def parse_comment(text: str, targets: tuple[str, ...]) -> HNPost:
     return post
 
 
-def latest_thread_id(session: requests.Session | None = None,
-                     timeout: int = 20) -> str:
-    """Newest 'Ask HN: Who is hiring?' story id."""
+def recent_thread_ids(count: int = 12, session: requests.Session | None = None,
+                      timeout: int = 20) -> list[str]:
+    """The `count` newest 'Ask HN: Who is hiring?' story ids, newest first.
+
+    One thread is posted a month. Reading only the current one throws away a
+    year of addresses that were published for exactly this purpose and cost one
+    request each to fetch. Threads stay useful for months: the companies in them
+    are still hiring, and the poster's address does not rot.
+    """
     get = (session or requests).get
     try:
         resp = get(SEARCH_URL, params={
-            "query": "Ask HN: Who is hiring?", "tags": "story", "hitsPerPage": 5,
+            "query": "Ask HN: Who is hiring?", "tags": "story",
+            # Over-fetch: the same search returns 'Who wants to be hired?' and
+            # 'Freelancer?' threads, which the title filter below drops.
+            "hitsPerPage": max(5, count * 4),
         }, timeout=timeout)
         if resp.status_code != 200:
-            return ""
+            return []
+        ids = []
         for hit in resp.json().get("hits", []):
             title = (hit.get("title") or "").lower()
             if "who is hiring" in title and "ask hn" in title:
-                return str(hit["objectID"])
+                ids.append(str(hit["objectID"]))
+            if len(ids) >= count:
+                break
+        return ids
     except Exception:
-        return ""
-    return ""
+        return []
+
+
+def latest_thread_id(session: requests.Session | None = None,
+                     timeout: int = 20) -> str:
+    """Newest 'Ask HN: Who is hiring?' story id."""
+    ids = recent_thread_ids(1, session, timeout)
+    return ids[0] if ids else ""
 
 
 def fetch_posts(targets: tuple[str, ...], thread_id: str = "",
@@ -153,5 +186,25 @@ def fetch_posts(targets: tuple[str, ...], thread_id: str = "",
         post = parse_comment(child["text"], targets)
         if not (post.is_ml and post.location and post.emails and post.domain):
             continue
+        if post.domain in TOO_BIG:
+            continue
         posts.append(post)
+    return posts
+
+
+def fetch_recent_posts(targets: tuple[str, ...], months: int = 12,
+                       timeout: int = 40) -> list[HNPost]:
+    """Qualifying comments across the last `months` hiring threads.
+
+    Deduplicated on domain, newest thread first, so a company that posts every
+    month is kept once with its most recent ad rather than twelve times.
+    """
+    posts: list[HNPost] = []
+    seen: set[str] = set()
+    for thread_id in recent_thread_ids(months, timeout=timeout):
+        for post in fetch_posts(targets, thread_id=thread_id, timeout=timeout):
+            if post.domain in seen:
+                continue
+            seen.add(post.domain)
+            posts.append(post)
     return posts

@@ -120,6 +120,11 @@ def _template(settings) -> Check:
 def _resume(settings) -> Check:
     path = settings.resume_path
     if not path.exists():
+        # The hosted link is the fallback, so a missing PDF degrades the email
+        # rather than stopping it. Without either, nothing can go out.
+        if settings.resume_link:
+            return Check("resume", WARN,
+                         f"missing at {path}; sends fall back to RESUME_LINK")
         return Check("resume", FAIL, f"missing at {path}; every send is blocked")
     size = path.stat().st_size
     if size < 1000:
@@ -167,7 +172,7 @@ def run_checks(settings: Settings) -> list[Check]:
 
 # Files that must never end up inside a build. Each is either a credential or
 # somebody's personal data, and an executable is trivially unpacked.
-NEVER_BUNDLE = ("outreach.db", "assets/resume.pdf", ".env")
+NEVER_BUNDLE = ("outreach.db", "assets/*.pdf", ".env")
 
 
 def scan_build(exe_path, settings: Settings) -> list[Check]:

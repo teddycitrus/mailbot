@@ -26,7 +26,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init", help="create the database and exit")
     p = sub.add_parser("discover", help="find qualifying companies")
     p.add_argument("--limit", type=int, default=15)
-    p = sub.add_parser("hn", help="import contacts from the HN who-is-hiring thread")
+    p = sub.add_parser("hn", help="import contacts from the HN who-is-hiring threads")
+    p.add_argument("--limit", type=int, default=40)
+    p.add_argument("--months", type=int, default=1,
+                   help="how many monthly threads back to read")
+    p = sub.add_parser("gh", help="find companies via GitHub org search (non-YC)")
     p.add_argument("--limit", type=int, default=40)
     p = sub.add_parser("enrich", help="find a contact at each new company")
     p.add_argument("--limit", type=int, default=15)
@@ -46,8 +50,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("run", help="discover, enrich, queue and send in one pass")
     p.add_argument("--limit", type=int, default=15)
     p.add_argument("--ignore-window", action="store_true")
-    sub.add_parser("bounces", help="scan the mailbox for bounces, replies and opt-outs")
-    sub.add_parser("inbox", help="alias for bounces")
+    # Scan depth is tunable because the two callers want opposite things: the
+    # once-a-day prep run wants a full sweep, while a 15-minute tick only needs
+    # the mail that arrived since the previous tick. Each examined message is a
+    # full RFC822 fetch, so the default sweep costs about ninety seconds.
+    for _name, _help in (("bounces", "scan the mailbox for bounces, replies and opt-outs"),
+                         ("inbox", "alias for bounces")):
+        p = sub.add_parser(_name, help=_help)
+        p.add_argument("--days", type=int, default=30,
+                       help="how far back to look")
+        p.add_argument("--limit", type=int, default=500,
+                       help="most recent messages to examine")
     p = sub.add_parser("suppress", help="never contact an address")
     p.add_argument("email")
     sub.add_parser("stats", help="print the summary tables")
@@ -96,7 +109,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "discover":
             pipeline.discover(args.limit)
         elif args.command == "hn":
-            pipeline.import_hn(args.limit)
+            pipeline.import_hn(args.limit, args.months)
+        elif args.command == "gh":
+            pipeline.discover_github(args.limit)
         elif args.command == "enrich":
             pipeline.enrich(args.limit)
         elif args.command == "queue":
@@ -118,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
             pipeline.summary()
         elif args.command in ("bounces", "inbox"):
             settings.require_for_bounces()
-            scan = scan_inbox(settings, pipeline.db)
+            scan = scan_inbox(settings, pipeline.db, args.days, args.limit)
             print(f"inbox: examined {scan.examined} message(s) -> "
                   f"{len(scan.bounced)} bounced, {len(scan.replied)} replied, "
                   f"{len(scan.opted_out)} opted out")

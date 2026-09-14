@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from src.emailer import (
+    greeting_name,
     Template, build_message, extract_bounced_addresses, in_send_window,
     is_hard_bounce, load_template, pace_delay, unedited_markers,
     validate_template,
@@ -153,6 +154,50 @@ def test_missing_attachment_fails_loudly(tmp_path):
                       attachments=[str(tmp_path / "nope.pdf")])
 
 
+# ------------------------------------------------- resume link as a fallback
+
+from src.emailer import (  # noqa: E402
+    KNOWN_FIELDS, has_resume_link, resume_link_line, with_resume_link,
+)
+
+DRIVE = "https://drive.google.com/file/d/abc/view"
+
+
+def test_resume_link_is_a_template_field():
+    """Templates carry {resume_link}, which renders empty on a normal send."""
+    assert "resume_link" in KNOWN_FIELDS
+
+
+def test_link_line_is_empty_when_no_link_is_configured():
+    assert resume_link_line("") == ""
+    assert resume_link_line(DRIVE) == f"[View my resume]({DRIVE})"
+
+
+def test_fallback_appends_the_link_to_a_body_that_lost_its_attachment():
+    body = with_resume_link("Best,\nJohn\n", DRIVE)
+    assert body.endswith(f"[View my resume]({DRIVE})\n")
+    assert has_resume_link(body)
+
+
+def test_fallback_does_not_add_a_second_copy_of_the_link():
+    once = with_resume_link("Best,\nJohn\n", DRIVE)
+    assert with_resume_link(once, DRIVE) == once
+    assert once.count("View my resume") == 1
+
+
+def test_a_normal_send_carries_the_pdf_and_no_link(tmp_path):
+    """The two never ship together: a Drive link beside an attachment reads as
+    two separate resumes in the recipient's client."""
+    pdf = tmp_path / "john_mannully_resume.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    msg = build_message("s", "Best,\nJohn\n", "a@b.com", "", "j@x.com", "J",
+                        attachments=[str(pdf)])
+    assert [p.get_filename() for p in msg.iter_attachments()] == [
+        "john_mannully_resume.pdf"]
+    plain = msg.get_body(preferencelist=("plain",)).get_content()
+    assert not has_resume_link(plain)
+
+
 # --------------------------------------------------------------- bounces
 
 DSN = """From: Mail Delivery Subsystem <mailer-daemon@googlemail.com>
@@ -281,3 +326,16 @@ def test_recipient_window_still_refuses_weekends():
     when = _utc(2026, 9, 12, 15, 35)  # Saturday
     ok, why = local_window_open("San Francisco, CA", TZ, START, END, when)
     assert not ok and "weekend" in why
+
+
+# A shared inbox with no person behind it is addressed by company instead:
+# "Dear Datrics," rather than a guessed name or the old "Dear there,".
+@pytest.mark.parametrize("company,expected", [
+    ("Datrics", "Datrics"),
+    ("Cozmo AI", "Cozmo AI"),        # brand words stay
+    ("Acme Inc.", "Acme"),           # legal suffix does not
+    ("Foo, LLC", "Foo"),
+    ("", ""),
+])
+def test_greeting_name(company, expected):
+    assert greeting_name(company) == expected

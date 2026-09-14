@@ -26,8 +26,13 @@ if (Test-Path $venv) { $script:python = $venv }
 
 "=== build run $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===" | Out-File -Append -Encoding utf8 $script:log
 # HN first: those contacts arrive already published, no inference needed.
-Write-Mailbot hn --limit 40
+# Three threads back, so a night the job does not run is caught up later.
+Write-Mailbot hn --limit 60 --months 3
+# Two discovery sources. YC has the better metadata, batch and team size, so it
+# still runs first. GitHub org search reaches companies that never applied to an
+# accelerator, which is the only way Toronto gets meaningful volume.
 Write-Mailbot discover --limit 60
-Write-Mailbot enrich   --limit 60
+Write-Mailbot gh       --limit 60
+Write-Mailbot enrich   --limit 90
 Write-Mailbot stats
 "=== finished $(Get-Date -Format 'HH:mm:ss') exit=$LASTEXITCODE ===" | Out-File -Append -Encoding utf8 $script:log

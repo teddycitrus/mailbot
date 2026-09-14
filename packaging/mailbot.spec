@@ -5,8 +5,8 @@ What ships: the Python package and the built dashboard bundle.
 
 What deliberately does NOT ship, and why: .env holds the builder's mail
 password and API keys, outreach.db holds real people's names and addresses, and
-assets/resume.pdf is a personal document with a phone number in it. A .exe is
-trivially unpacked, so anything added here is public. Each is created on the
+the resume PDF under assets/ is a personal document with a phone number in
+it. A .exe is trivially unpacked, so anything added here is public. Each is created on the
 user's own machine by the setup console instead.
 """
 
@@ -24,9 +24,15 @@ if not DIST.exists():
 # Ship the compiled front end and a template config the user can start from.
 datas = [(str(DIST), "dashboard"), (str(ROOT / ".env.example"), ".")]
 
-for unsafe in (".env", "outreach.db", "assets/resume.pdf"):
+for unsafe in (".env", "outreach.db"):
     if any(str(ROOT / unsafe) == src for src, _ in datas):
         raise SystemExit(f"refusing to bundle {unsafe}: it is personal data")
+
+# The resume is matched by shape rather than by name, because it is named after
+# whoever built it and a fixed filename would stop guarding the moment it changed.
+for src, _ in datas:
+    if Path(src).suffix.lower() == ".pdf":
+        raise SystemExit(f"refusing to bundle {src}: the resume is personal data")
 
 a = Analysis(
     [str(ROOT / "packaging" / "entry.py")],

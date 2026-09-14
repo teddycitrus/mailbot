@@ -2,7 +2,7 @@
 *.db
 *.db-wal
 *.db-shm
-assets/resume.pdf
+assets/*.pdf
 __pycache__/
 *.pyc
 .pytest_cache/
