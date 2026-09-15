@@ -136,10 +136,12 @@ def main(argv: list[str] | None = None) -> int:
             scan = scan_inbox(settings, pipeline.db, args.days, args.limit)
             print(f"inbox: examined {scan.examined} message(s) -> "
                   f"{len(scan.bounced)} bounced, {len(scan.replied)} replied, "
-                  f"{len(scan.opted_out)} opted out")
+                  f"{len(scan.opted_out)} opted out, "
+                  f"{len(scan.drafted)} reply draft(s) saved")
             rows = ([(a, "bounce", "hard" if h else "soft") for a, h in scan.bounced]
                     + [(a, "reply", "") for a in scan.replied]
-                    + [(a, "opt-out", "suppressed") for a in scan.opted_out])
+                    + [(a, "opt-out", "suppressed") for a in scan.opted_out]
+                    + [(a, "draft", "in Drafts, not sent") for a in scan.drafted])
             _print_table(rows, ("email", "kind", "detail"))
         elif args.command == "suppress":
             pipeline.db.suppress(args.email, "manual")

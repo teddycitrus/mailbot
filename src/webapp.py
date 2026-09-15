@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 from .config import Settings, app_root
 from .database import Database
 from .doctor import run_checks
+from .emailer import parse_template, validate_template
 
 # Values that must never be echoed back to the browser in clear text.
 SECRET_KEYS = {"SMTP_PASS", "IMAP_PASS", "GROQ_API_KEY", "GITHUB_TOKEN", "RESEND_API_KEY"}
@@ -111,6 +112,10 @@ def setup_state() -> dict[str, Any]:
 
     aspects = aspects_file.read_text(encoding="utf-8").strip() if aspects_file.exists() else ""
     template = template_file.read_text(encoding="utf-8") if template_file.exists() else STARTER_TEMPLATE
+    # No starter text here. Drafting writes into the user's mailbox, so it
+    # stays off until they write a reply template of their own.
+    reply_file = settings.reply_template_path
+    reply_template = reply_file.read_text(encoding="utf-8") if reply_file.exists() else ""
 
     def flag(done: bool, optional: bool = False) -> str:
         return "ok" if done else ("warn" if optional else "todo")
@@ -129,6 +134,7 @@ def setup_state() -> dict[str, Any]:
         values[key] = "********" if env.get(key) else ""
     values["ASPECTS"] = aspects
     values["TEMPLATE"] = template
+    values["REPLY_TEMPLATE"] = reply_template
 
     return {
         "configured": all([has_identity, has_creds, has_resume, has_aspects, has_template]),
@@ -138,6 +144,7 @@ def setup_state() -> dict[str, Any]:
             "resume": flag(has_resume),
             "aspects": flag(has_aspects),
             "template": flag(has_template),
+            "replies": flag(bool(reply_template.strip()), optional=True),
             "optional": flag(has_optional, optional=True),
             "targeting": flag(has_targeting, optional=True),
         },
@@ -148,6 +155,13 @@ def setup_state() -> dict[str, Any]:
 
 def apply_setup(payload: dict[str, str]) -> None:
     root = project_root()
+    reply_template = str(payload.get("REPLY_TEMPLATE", "")).strip()
+    if reply_template:
+        # Checked before anything is written, so a bad placeholder does not
+        # leave the save half applied. The scan would otherwise just skip
+        # drafting, and the user would never find out why.
+        validate_template(parse_template(reply_template, "reply template"))
+
     updates: dict[str, str] = {}
     for key, value in payload.items():
         if key not in ALLOWED_KEYS:
@@ -178,6 +192,15 @@ def apply_setup(payload: dict[str, str]) -> None:
         settings = Settings.load(env_path() if env_path().exists() else None)
         settings.template_path.parent.mkdir(parents=True, exist_ok=True)
         settings.template_path.write_text(payload["TEMPLATE"], encoding="utf-8")
+    if "REPLY_TEMPLATE" in payload:
+        # An empty box is how drafting is turned off: no file, no drafts.
+        reply_file = Settings.load(
+            env_path() if env_path().exists() else None).reply_template_path
+        if reply_template:
+            reply_file.parent.mkdir(parents=True, exist_ok=True)
+            reply_file.write_text(reply_template + "\n", encoding="utf-8")
+        elif reply_file.exists():
+            reply_file.unlink()
 
 
 # ------------------------------------------------------------- dashboard

@@ -69,6 +69,7 @@ export interface SetupState {
     resume: StepStatus;
     aspects: StepStatus;
     template: StepStatus;
+    replies: StepStatus;
     optional: StepStatus;
     targeting: StepStatus;
   };

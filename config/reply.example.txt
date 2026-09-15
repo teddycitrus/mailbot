@@ -1,0 +1,11 @@
+Subject: Re: {original_subject}
+
+Dear {first_name},
+
+I understand. Thanks for taking the time to respond.
+
+If it is not too much trouble, could I add you on LinkedIn? The work you do at {company} is interesting, and I would love to ask you some questions down the line.
+
+Best regards,
+{sender_name}
+[https://www.linkedin.com/in/your-profile/](https://www.linkedin.com/in/your-profile/)

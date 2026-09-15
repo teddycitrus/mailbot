@@ -129,7 +129,11 @@ def validate_template(template: Template,
 
 def load_template(path: str | Path) -> Template:
     """Template file is 'Subject: ...' on line one, blank line, then the body."""
-    text = Path(path).read_text(encoding="utf-8")
+    return parse_template(Path(path).read_text(encoding="utf-8"), str(path))
+
+
+def parse_template(text: str, path: str = "template") -> Template:
+    """The same rules as load_template, for text that is not in a file yet."""
     lines = text.splitlines()
     if not lines:
         raise ValueError(f"template {path} is empty")

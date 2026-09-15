@@ -262,6 +262,25 @@ export default function SetupView({
 
         <Step
           n={6}
+          title="Answering replies"
+          status={state.steps.replies}
+          blurb="Optional. Each person who replies gets an answer drafted from this template and saved to your Drafts folder. Drafts are never sent; you review and send them yourself."
+        >
+          <Field
+            id="reply_template"
+            label="Reply template"
+            multiline
+            hint="Available: {first_name} {company} {original_subject} {sender_name} {sender_email}. Write links as [label](url) to make them clickable. Leave empty to turn drafting off."
+            value={form.REPLY_TEMPLATE ?? ""}
+            onChange={set("REPLY_TEMPLATE")}
+            placeholder={
+              "Subject: Re: {original_subject}\n\nDear {first_name},\n\nI understand. Thanks for taking the time to respond.\n\nCould I add you on LinkedIn? The work you do at {company} is interesting.\n\nBest regards,\n{sender_name}\n[https://www.linkedin.com/in/your-profile/](https://www.linkedin.com/in/your-profile/)"
+            }
+          />
+        </Step>
+
+        <Step
+          n={7}
           title="Optional keys"
           status={state.steps.optional}
           blurb="Both free. Without them the bot still runs, just with less personalisation and slower discovery."
@@ -285,7 +304,7 @@ export default function SetupView({
         </Step>
 
         <Step
-          n={7}
+          n={8}
           title="Targeting and pace"
           status={state.steps.targeting}
           blurb="Start small. A new sending pattern that jumps straight to high volume is what gets accounts filtered."

@@ -67,8 +67,9 @@
 
 Mailbot finds people worth emailing at early-stage startups, works out their
 address, checks the address actually exists, writes a personalised note, and
-sends a small number of them each morning. It then reads the replies and stops
-contacting anyone who asks it to.
+sends a small number of them each morning. It then reads the replies, stops
+contacting anyone who asks it to, and drafts an answer to each reply for you to
+review and send yourself.
 
 Commercial tools in this space charge for the same pipeline. The expensive part
 of those products is not the technique, it is the proprietary contact corpus and
@@ -124,6 +125,7 @@ This is a cold email tool, so the restraint is the point:
 - One person per company, so it never looks like a blast
 - Sends only during the recipient's own local morning, on weekdays
 - Replies asking to stop are honoured automatically, before the next send
+- Answers to replies are only ever saved as drafts, never sent by the tool
 - Bounced addresses are suppressed on the next run
 - At most one follow-up, ever
 - Nothing is claimed about you except what you list in `config/aspects.txt`
@@ -212,7 +214,7 @@ python -m src.main queue          # render personalised drafts
 python -m src.main preview        # read the drafts before anything is sent
 python -m src.main send           # send, respecting cap and window
 python -m src.main followup       # one nudge to people who never replied
-python -m src.main inbox          # scan for bounces, replies and opt-outs
+python -m src.main inbox          # scan for bounces, replies and opt-outs, draft answers
 python -m src.main digest         # email yourself a weekly summary
 python -m src.main doctor         # check everything the scheduled jobs rely on
 ```
@@ -244,9 +246,15 @@ are never committed or bundled.
 | `GITHUB_TOKEN` | none | Optional. Raises the API limit from 60 to 5000 per hour |
 | `DRY_RUN` | `true` | Nothing is sent until this is false |
 
-Two files hold your own words:
+Three files hold your own words:
 
 * `config/template.txt` is the email. The first line must start with `Subject:`.
+* `config/reply.txt` is optional. When it exists, every person who replies gets
+  an answer drafted from it, threaded under their message and saved to your
+  Drafts folder over IMAP. Nothing is sent; you review each draft and send it
+  yourself. One draft per person, and out-of-office replies are skipped. Write
+  links as `[label](url)` to make them clickable. Delete the file to turn
+  drafting off. See `config/reply.example.txt`.
 * `config/aspects.txt` lists what you have actually built, one short phrase per
   line. The generated sentence may only draw on this list, so it cannot invent
   experience you do not have. An empty file means that sentence is left out.
@@ -284,6 +292,7 @@ contacts people whose local window is currently open.
 - [x] Per-domain address pattern learning
 - [x] Recipient-local send windows
 - [x] Reply, bounce and opt-out handling
+- [x] Drafted answers to replies, left for you to send
 - [x] Setup and progress console
 - [x] Packaged Windows build
 - [ ] macOS and Linux builds

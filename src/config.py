@@ -138,6 +138,9 @@ class Settings:
     followup_after_days: int
     followup_max_total_sends: int
     followup_template_path: Path
+    # Answer drafted for each reply and left in Drafts, never sent. Drafting
+    # is off when this file does not exist.
+    reply_template_path: Path
 
     @classmethod
     def load(cls, env_file: str | os.PathLike[str] | None = ".env") -> "Settings":
@@ -203,6 +206,7 @@ class Settings:
             followup_max_total_sends=_int("FOLLOWUP_MAX_TOTAL_SENDS", 2),
             followup_template_path=_path(
                 "FOLLOWUP_TEMPLATE_PATH", "config/followup.txt"),
+            reply_template_path=_path("REPLY_TEMPLATE_PATH", "config/reply.txt"),
         )
 
     def daily_cap(self, active_days: int, bounce_pct: float) -> tuple[int, str]:

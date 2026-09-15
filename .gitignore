@@ -16,3 +16,4 @@ build/
 config/aspects.txt
 config/template.txt
 config/followup.txt
+config/reply.txt
