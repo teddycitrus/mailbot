@@ -188,21 +188,29 @@ def build_reply_draft(template: Template, settings, incoming, first_name: str,
     return draft
 
 
-def drafts_mailbox(conn) -> str:
-    """The Drafts folder, found by its special-use flag.
+def special_mailbox(conn, flag: bytes, fallback: str) -> str:
+    """A folder found by its special-use flag rather than by name.
 
-    Gmail names it "[Gmail]/Drafts" and localises even that, so the name is
-    looked up rather than assumed.
+    Gmail names these "[Gmail]/Drafts" and "[Gmail]/Sent Mail", and localises
+    even that, so the name is looked up rather than assumed.
     """
     try:
         typ, lines = conn.list()
     except imaplib.IMAP4.error:
-        return "Drafts"
+        return fallback
     for line in (lines or []) if typ == "OK" else []:
         found = LIST_LINE.match(line) if isinstance(line, bytes) else None
-        if found and b"\\drafts" in found.group("flags").lower():
+        if found and flag in found.group("flags").lower():
             return found.group("name").decode("utf-8", errors="replace").strip()
-    return "Drafts"
+    return fallback
+
+
+def drafts_mailbox(conn) -> str:
+    return special_mailbox(conn, rb"\drafts", "Drafts")
+
+
+def sent_mailbox(conn) -> str:
+    return special_mailbox(conn, rb"\sent", "Sent")
 
 
 def save_draft(conn, mailbox: str, draft: EmailMessage) -> bool:

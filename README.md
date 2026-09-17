@@ -209,8 +209,10 @@ python -m src.main dashboard      # setup and progress console
 python -m src.main discover       # find qualifying companies (Y Combinator)
 python -m src.main gh             # find companies via GitHub org search
 python -m src.main hn             # import the Hacker News hiring threads
+python -m src.main priority       # seed the companies named in config/priority.txt
 python -m src.main enrich         # find and verify a contact at each company
 python -m src.main queue          # render personalised drafts
+python -m src.main mirror         # copy queued drafts into Gmail Drafts
 python -m src.main preview        # read the drafts before anything is sent
 python -m src.main send           # send, respecting cap and window
 python -m src.main followup       # one nudge to people who never replied
@@ -238,6 +240,9 @@ are never committed or bundled.
 | `SEND_WINDOW_START`, `SEND_WINDOW_END` | `08:30`, `10:00` | Local to each recipient |
 | `PER_RECIPIENT_TIMEZONE` | `true` | Send during their morning, not yours |
 | `MIN_CONFIDENCE` | `70` | Below this an address is never queued |
+| `QUEUE_TARGET` | `60` | How many finished drafts to keep waiting |
+| `MIRROR_TO_DRAFTS` | `true` | Copy queued drafts to Gmail Drafts as a fallback |
+| `PRIORITY_PATH` | `config/priority.txt` | Companies that skip the gates and go first |
 | `TARGET_LOCATIONS` | `San Francisco,New York,Toronto` | Comma separated |
 | `MAX_EMPLOYEES`, `MAX_COMPANY_AGE_YEARS` | `200`, `5` | Target filter |
 | `PREFER_RECENTLY_FUNDED` | `true` | Rank by recency of funding blended with ability to hire |
@@ -268,20 +273,61 @@ Three files hold your own words:
 powershell -ExecutionPolicy Bypass -File scripts\install_schedule.ps1
 ```
 
-Registers three Windows tasks:
+Registers five Windows tasks:
 
 | Task | When | What |
 | --- | --- | --- |
-| `mailbot-send` | Weekdays 08:35 and 11:35 | Inbox scan, queue, send, follow up |
-| `mailbot-build` | Weekdays 19:30 | Discover and enrich new companies |
+| `mailbot-draft` | Every day, 06:00 to 23:00, every 2h | Render drafts, copy them to Gmail Drafts |
+| `mailbot-prep` | Weekdays 08:25 | Full mailbox scan before the window opens |
+| `mailbot-send` | Weekdays 08:30 to 13:30, every 15m | Send two messages per tick |
+| `mailbot-build` | Every day 19:30 | Discover and enrich new companies |
 | `mailbot-digest` | Fridays 17:00 | Email you a weekly summary |
 
-Sending and enrichment are separate on purpose. Enrichment makes slow calls to
-third parties, and a single hung request should never eat the send window.
+The split that matters is drafting from sending. Drafting has no deadline, so
+it runs whenever the machine happens to be on and stops as soon as
+`QUEUE_TARGET` drafts are waiting. Sending is the only job that has to land in
+a particular hour, and it now does nothing but send what is already written.
 
-The two send times cover different timezones: 08:35 reaches recipients on
-Eastern time in their morning, 11:35 reaches Pacific in theirs. Each run only
-contacts people whose local window is currently open.
+That ordering is the fix for a real failure. Drafting used to happen at 08:25
+on weekdays, so a laptop asleep at 08:25 produced no drafts, and a laptop
+asleep until 10:25 also missed every send tick before then. One closed lid
+cost the whole day.
+
+Enrichment stays separate for its own reason: it makes slow calls to third
+parties, and a single hung request should never eat the send window.
+
+Each tick only contacts people whose local window is currently open, so the
+08:30 to 13:30 span covers Eastern recipients in their morning and then
+Pacific ones in theirs. Ticks when nobody's window is open simply send
+nothing.
+
+### If the laptop is gone
+
+With `MIRROR_TO_DRAFTS=true` every queued draft also sits in your Gmail Drafts
+folder, personalised and carrying the resume. If the machine is closed all
+day, open Gmail on a phone and send them by hand.
+
+Nothing goes out twice. The bot deletes its copy the moment SMTP accepts a
+message, and reads the Sent folder before every send run, so a draft you sent
+yourself is recorded and dropped from the queue before the scheduled run
+reaches it. An unfinished draft is never mirrored at all, because a copy in
+Drafts is something a human can send without passing the checks `send` makes.
+
+### Priority companies
+
+`config/priority.txt` is a hand-written list of companies to put at the front.
+They skip the team-size, age and location gates, and are enriched, drafted and
+sent before anything else. Nothing about sending is relaxed: they still need a
+verified contact and still obey the cap, the window and the suppression list.
+
+```sh
+python -m src.main priority --resolve
+```
+
+resolves a domain for any entry that has none and writes it back to the file.
+It only accepts a guessed domain when the site serving it names the company,
+and reports the rest for you to fill in by hand. Mailing a stranger who
+happens to own the `.com` is worse than missing a company.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 

@@ -12,6 +12,7 @@ import imaplib
 import smtplib
 import ssl
 from dataclasses import dataclass
+from pathlib import Path
 
 import requests
 
@@ -149,6 +150,50 @@ def _queue(settings, db) -> Check:
     return Check("queue", OK, f"{queued} queued, {pool} companies still to enrich")
 
 
+def _mirror(settings) -> Check:
+    """Can the drafting job still reach the Drafts folder?
+
+    Worth its own check because the mirror is the fallback for this machine
+    being unavailable, and a fallback that has quietly stopped working is
+    worse than none: you would only find out on the morning you needed it.
+    """
+    if not getattr(settings, "mirror_to_drafts", False):
+        return Check("gmail drafts", WARN,
+                     "MIRROR_TO_DRAFTS=false, no fallback if this machine is off")
+    if not (settings.imap_host and settings.imap_user and settings.imap_pass):
+        return Check("gmail drafts", FAIL, "needs IMAP_HOST/USER/PASS")
+    try:
+        from .inbox import drafts_mailbox
+        conn = imaplib.IMAP4_SSL(settings.imap_host, settings.imap_port)
+        conn.login(settings.imap_user, settings.imap_pass)
+        mailbox = drafts_mailbox(conn)
+        typ, _ = conn.select(mailbox)
+        conn.logout()
+        if typ != "OK":
+            return Check("gmail drafts", FAIL, f"cannot open {mailbox}")
+        return Check("gmail drafts", OK, mailbox)
+    except Exception as exc:
+        return Check("gmail drafts", FAIL, f"{type(exc).__name__}: {exc}")
+
+
+def _priority(settings) -> Check:
+    """The hand-written list, and how much of it is still unusable."""
+    from .priority import load
+    path = getattr(settings, "priority_path", None)
+    if not path or not Path(path).exists():
+        return Check("priority list", WARN, "no config/priority.txt")
+    entries = load(path)
+    if not entries:
+        return Check("priority list", WARN, f"{path} is empty")
+    unresolved = [e.name for e in entries if not e.domain]
+    if unresolved:
+        return Check("priority list", WARN,
+                     f"{len(entries) - len(unresolved)}/{len(entries)} resolved, "
+                     f"needs a domain: {', '.join(unresolved[:3])}"
+                     + (" ..." if len(unresolved) > 3 else ""))
+    return Check("priority list", OK, f"{len(entries)} companies")
+
+
 def run_checks(settings: Settings) -> list[Check]:
     checks = [_template(settings), _resume(settings)]
     try:
@@ -156,7 +201,8 @@ def run_checks(settings: Settings) -> list[Check]:
         checks.append(Check("send config", OK, f"backend={settings.email_backend}"))
     except ConfigError as exc:
         checks.append(Check("send config", FAIL, str(exc)))
-    checks += [_smtp(settings), _imap(settings), _groq(settings), _github(settings)]
+    checks += [_smtp(settings), _imap(settings), _mirror(settings),
+               _priority(settings), _groq(settings), _github(settings)]
     try:
         db = Database(settings.db_path)
         checks.append(_queue(settings, db))

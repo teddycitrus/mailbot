@@ -349,6 +349,60 @@ def build_message(subject: str, body: str, to_email: str, to_name: str,
     return msg
 
 
+def message_for_draft(settings, draft) -> tuple[EmailMessage, str]:
+    """Build the message a queued draft row describes.
+
+    Returns the message and a note, which is empty unless the resume PDF had
+    gone missing since the draft was queued and the hosted link was used in
+    its place. Raises FileNotFoundError when there is no link to fall back to,
+    because a draft that promises a resume and carries neither is not a draft
+    worth sending.
+
+    Shared by the two paths that turn a row into mail: the scheduled send, and
+    the copy pushed to the Gmail Drafts folder.
+    """
+    attachments = [a for a in (draft["attachments"] or "").split("|") if a]
+    to_name = " ".join(p for p in (draft["first_name"], draft["last_name"]) if p)
+    try:
+        return build_message(
+            draft["subject"], draft["body"], draft["email"], to_name,
+            settings.from_email, settings.from_name, settings.reply_to,
+            settings.unsubscribe_mailto, attachments,
+        ), ""
+    except FileNotFoundError as exc:
+        if not settings.resume_link:
+            raise
+        return build_message(
+            draft["subject"], with_resume_link(draft["body"], settings.resume_link),
+            draft["email"], to_name,
+            settings.from_email, settings.from_name, settings.reply_to,
+            settings.unsubscribe_mailto,
+        ), str(exc)
+
+
+def draft_defect(draft, settings) -> str:
+    """Why this draft must not go out, or "" when it is complete.
+
+    One rule, two callers. The scheduled send checks it as the last thing
+    before SMTP; the Gmail mirror checks it before a copy reaches the Drafts
+    folder, where a human could send it by hand and never pass the first check
+    at all. A draft still showing [BRACKETS], or one that has lost its resume,
+    must not be reachable by either route.
+    """
+    holes = unedited_markers(f"{draft['subject']}\n{draft['body']}")
+    if holes:
+        return f"unedited template: {', '.join(holes[:2])}"
+    attachments = [a for a in (draft["attachments"] or "").split("|") if a]
+    # A draft carrying the hosted link instead of the PDF is complete: that is
+    # the fallback the queue applies when there is nothing to attach. One or
+    # the other must be there, never neither.
+    if str(settings.resume_path) and not attachments and not has_resume_link(draft["body"]):
+        return "no resume attached"
+    if any(not Path(a).exists() for a in attachments) and not settings.resume_link:
+        return "attachment file is missing"
+    return ""
+
+
 # ------------------------------------------------------------- backends
 
 class SMTPBackend:

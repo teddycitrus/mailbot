@@ -140,12 +140,23 @@ def _matches_location(location: str, targets: tuple[str, ...]) -> str:
     return ""
 
 
-def qualifies(record: dict, settings, now_year: int) -> tuple[bool, str]:
-    """Apply the target criteria to one raw YC record."""
+def qualifies(record: dict, settings, now_year: int,
+              priority=None) -> tuple[bool, str]:
+    """Apply the target criteria to one raw YC record.
+
+    A company named in the priority list skips the criteria. Every one of them
+    is a proxy for "is this place worth writing to", and an explicit naming is
+    better evidence than the proxies. The two checks that survive are not
+    preferences: a dead company cannot hire, and a company with no website
+    gives the enrich stage nothing to work with.
+    """
     if record.get("status") != "Active":
         return False, "inactive"
     if not record.get("website"):
         return False, "no website"
+    if priority is not None and priority.has(name=record.get("name", ""),
+                                             domain=domain_from_url(record["website"])):
+        return True, ""
     if not _matches_location(record.get("all_locations", ""), settings.target_locations):
         return False, "location"
     team = record.get("team_size") or 0
@@ -161,7 +172,8 @@ def qualifies(record: dict, settings, now_year: int) -> tuple[bool, str]:
     return True, ""
 
 
-def discover(fetcher: Fetcher, settings, db, limit: int = 15) -> tuple[list[Company], DiscoveryStats]:
+def discover(fetcher: Fetcher, settings, db, limit: int = 15,
+             priority=None) -> tuple[list[Company], DiscoveryStats]:
     """Return up to `limit` qualifying companies not already in the database."""
     stats = DiscoveryStats()
     raw: dict[int, dict] = {}
@@ -192,7 +204,7 @@ def discover(fetcher: Fetcher, settings, db, limit: int = 15) -> tuple[list[Comp
         )
     for record in ordered:
         stats.considered += 1
-        ok, _reason = qualifies(record, settings, now_year)
+        ok, _reason = qualifies(record, settings, now_year, priority)
         if not ok:
             continue
         stats.qualified += 1

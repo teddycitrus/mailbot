@@ -46,6 +46,9 @@ class Company:
     is_hiring: bool = False
     yc_url: str = ""
     github_org: str = ""
+    # Named in config/priority.txt: skips the size and age gates, and sorts
+    # ahead of everything else from enrichment onward.
+    priority: int = 0
     source: str = "yc"
     status: str = NEW
     skip_reason: str = ""

@@ -13,6 +13,7 @@ from .config import ConfigError, Settings
 from .database import Database
 from .doctor import FAIL, run_checks, scan_build
 from .inbox import scan_inbox
+from .mirror import sync as mirror_sync
 from .pipeline import BAR, Pipeline, _print_table
 
 
@@ -34,8 +35,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=40)
     p = sub.add_parser("enrich", help="find a contact at each new company")
     p.add_argument("--limit", type=int, default=15)
+    p = sub.add_parser("priority", help="seed the companies named in priority.txt")
+    p.add_argument("--resolve", action="store_true",
+                   help="look up the domain for entries that have none, and "
+                        "write it back to the file")
+    p.add_argument("--limit", type=int, default=0,
+                   help="most domains to resolve in one pass (0 = all)")
     p = sub.add_parser("queue", help="render personalised drafts")
     p.add_argument("--limit", type=int, default=25)
+    p.add_argument("--target", type=int, default=0,
+                   help="stop once this many drafts are waiting "
+                        "(0 uses QUEUE_TARGET, which is what the drafting job "
+                        "runs on; pass --target -1 to render regardless)")
+    p = sub.add_parser("mirror", help="copy queued drafts into Gmail Drafts")
+    p.add_argument("--limit", type=int, default=50,
+                   help="most copies to push in one pass")
+    p.add_argument("--days", type=int, default=7,
+                   help="how far back to read Sent for drafts you sent by hand")
     p = sub.add_parser("send", help="send queued drafts")
     p.add_argument("--limit", type=int, default=25)
     p.add_argument("--ignore-window", action="store_true",
@@ -112,10 +128,26 @@ def main(argv: list[str] | None = None) -> int:
             pipeline.import_hn(args.limit, args.months)
         elif args.command == "gh":
             pipeline.discover_github(args.limit)
+        elif args.command == "priority":
+            pipeline.priority(args.resolve, args.limit)
         elif args.command == "enrich":
             pipeline.enrich(args.limit)
         elif args.command == "queue":
-            pipeline.queue(args.limit)
+            # 0 means "use the configured depth", which is what the drafting
+            # job wants. A negative target turns the check off, for rendering
+            # a batch by hand however deep the queue already is.
+            target = settings.queue_target if args.target == 0 else args.target
+            pipeline.queue(args.limit, max(0, target))
+        elif args.command == "mirror":
+            if not settings.mirror_to_drafts:
+                print("mirror: MIRROR_TO_DRAFTS is off, nothing to do")
+                return 0
+            report = mirror_sync(settings, pipeline.db, args.limit, args.days)
+            print(f"mirror: {len(report.pushed)} copied to Drafts, "
+                  f"{len(report.dropped)} cleared after sending, "
+                  f"{len(report.reconciled)} you had already sent by hand, "
+                  f"{len(report.skipped)} skipped")
+            _print_table(report.rows(), ("email", "state", "detail"))
         elif args.command == "send":
             pipeline.send(args.limit, args.ignore_window)
             pipeline.summary()

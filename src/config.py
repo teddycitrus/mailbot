@@ -134,6 +134,14 @@ class Settings:
     send_timezone: str
     per_recipient_timezone: bool
     min_confidence: int
+    # How deep the queue is kept. Drafting runs all day and stops once this
+    # many are waiting, so the morning never depends on a render having
+    # happened that morning, and a laptop that sleeps through a day costs
+    # nothing: the drafts were ready the night before.
+    queue_target: int
+    # Copy every queued draft into the Gmail Drafts folder, so a day is not
+    # lost when this machine is closed. See mirror.py.
+    mirror_to_drafts: bool
     followup_enabled: bool
     followup_after_days: int
     followup_max_total_sends: int
@@ -141,6 +149,9 @@ class Settings:
     # Answer drafted for each reply and left in Drafts, never sent. Drafting
     # is off when this file does not exist.
     reply_template_path: Path
+    # Companies named by hand, which skip the size and age gates and sort
+    # ahead of everything else. See priority.py.
+    priority_path: Path
 
     @classmethod
     def load(cls, env_file: str | os.PathLike[str] | None = ".env") -> "Settings":
@@ -201,12 +212,15 @@ class Settings:
             send_timezone=os.getenv("SEND_TIMEZONE", "America/Toronto").strip(),
             per_recipient_timezone=_bool("PER_RECIPIENT_TIMEZONE", True),
             min_confidence=_int("MIN_CONFIDENCE", 70),
+            queue_target=_int("QUEUE_TARGET", 60),
+            mirror_to_drafts=_bool("MIRROR_TO_DRAFTS", True),
             followup_enabled=_bool("FOLLOWUP_ENABLED", True),
             followup_after_days=_int("FOLLOWUP_AFTER_DAYS", 6),
             followup_max_total_sends=_int("FOLLOWUP_MAX_TOTAL_SENDS", 2),
             followup_template_path=_path(
                 "FOLLOWUP_TEMPLATE_PATH", "config/followup.txt"),
             reply_template_path=_path("REPLY_TEMPLATE_PATH", "config/reply.txt"),
+            priority_path=_path("PRIORITY_PATH", "config/priority.txt"),
         )
 
     def daily_cap(self, active_days: int, bounce_pct: float) -> tuple[int, str]:

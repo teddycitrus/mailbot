@@ -7,6 +7,7 @@ on its own before the next.
 
 from __future__ import annotations
 
+import imaplib
 import smtplib
 import time
 from datetime import datetime, timedelta, timezone
@@ -15,11 +16,13 @@ from pathlib import Path
 from .config import Settings
 from .database import Database
 from .emailer import (
-    greeting_name, has_resume_link, resume_link_line, with_resume_link,
+    draft_defect, greeting_name, has_resume_link, message_for_draft,
+    resume_link_line, with_resume_link,
     build_message, in_send_window, load_template, local_date, local_now,
     local_window_open, make_backend, pace_delay, unedited_markers,
     validate_template,
 )
+from .mirror import GmailDrafts
 from .finder import discover as discover_companies, enrich_company
 from .gh_discovery import discover as discover_orgs
 from .github_source import GitHubClient
@@ -28,11 +31,25 @@ from .llm import Personalizer
 from .models import (
     Company, Contact, ENRICHED, NO_CONTACTS, PENDING, SRC_SCRAPED,
 )
+from . import priority as priority_list
+from .priority import from_settings as priority_set
 from .scraper import Fetcher
 from .reporting import BAR, _print_table, build_digest, print_summary
 from .verifier import (
     Verifier, first_name_from_email, is_never_send, is_role_account,
 )
+
+_PRIORITY_HEADER = """\
+# Companies to treat as high priority: enriched, drafted and sent before
+# anything else, and exempt from the team-size and company-age gates that the
+# rest of the funnel applies. See src/priority.py for what is and is not
+# relaxed. Sending rules are not relaxed.
+#
+# One company per line. Add "= domain.com" to pin the domain; leave it off and
+#   mailbot priority --resolve
+# will work it out and write it back here, skipping any it cannot confirm.
+# Lines starting with # are ignored, so a name can be parked without deleting.
+"""
 
 class Pipeline:
     def __init__(self, settings: Settings):
@@ -63,8 +80,12 @@ class Pipeline:
     # ---------------- stages ----------------
 
     def discover(self, limit: int) -> int:
-        found, stats = discover_companies(self.fetcher, self.settings, self.db, limit=limit)
+        priority = priority_set(self.settings)
+        found, stats = discover_companies(self.fetcher, self.settings, self.db,
+                                          limit=limit, priority=priority)
         for company in found:
+            if priority.has(name=company.name, domain=company.domain):
+                company.priority = 1
             self.db.upsert_company(company)
         print(f"discovery: {stats.qualified} qualified of {stats.considered} scanned, "
               f"{stats.already_known} already known, {len(found)} added")
@@ -98,6 +119,89 @@ class Pipeline:
                 ("company", "domain", "location", "org", "since"),
             )
         return len(found)
+
+    def priority(self, resolve: bool = False, limit: int = 0) -> int:
+        """Seed the named companies and put them at the front of the queue.
+
+        Three things happen, in this order:
+
+          flag     companies already in the database whose name or domain is
+                   on the list, so a name that arrived through discovery gets
+                   its place without being inserted twice
+          resolve  work out the domain for any entry that has none, and write
+                   it back to the file so the next run costs nothing
+          seed     insert the rest as status=new, which is all enrich needs to
+                   pick them up on its next pass
+
+        Flags are cleared first, so deleting a name from the file actually
+        demotes the company rather than leaving it permanently ahead.
+        """
+        entries = priority_list.load(self.settings.priority_path)
+        if not entries:
+            print(f"priority: nothing in {self.settings.priority_path}")
+            return 0
+
+        known = priority_list.PrioritySet(entries)
+        cleared = self.db.clear_priorities()
+        flagged = 0
+        by_domain: dict[str, int] = {}
+        for row in self.db.all_companies():
+            if known.has(name=row["name"], domain=row["domain"]):
+                self.db.mark_priority(row["id"])
+                flagged += 1
+            by_domain[(row["domain"] or "").lower()] = row["id"]
+
+        rows: list[tuple] = []
+        resolved = seeded = 0
+        pending = [e for e in entries if not e.domain]
+        if resolve and pending:
+            print(f"priority: resolving {len(pending)} domain(s), "
+                  "this makes a DNS lookup per candidate and a fetch per "
+                  "domain that takes mail")
+        for entry in entries:
+            if not entry.domain:
+                if not resolve:
+                    rows.append((entry.name, "-", "no domain",
+                                 "run with --resolve"))
+                    continue
+                if limit and resolved >= limit:
+                    rows.append((entry.name, "-", "not tried",
+                                 f"--limit {limit} reached"))
+                    continue
+                entry.domain, entry.note = priority_list.resolve(
+                    entry.name, self.fetcher, self.verifier)
+                resolved += 1
+                if not entry.domain:
+                    rows.append((entry.name, "-", "unresolved", entry.note))
+                    continue
+            existing = by_domain.get(entry.domain.lower())
+            if existing:
+                self.db.mark_priority(existing)
+                rows.append((entry.name, entry.domain, "known", "flagged"))
+                continue
+            company_id = self.db.upsert_company(Company(
+                name=entry.name,
+                domain=entry.domain,
+                website=f"https://{entry.domain}",
+                source="priority",
+                priority=1,
+            ))
+            by_domain[entry.domain.lower()] = company_id
+            seeded += 1
+            rows.append((entry.name, entry.domain, "seeded", "queued for enrich"))
+
+        if resolve:
+            # Written back whatever happened, so a resolved domain is never
+            # looked up twice and an unresolved one carries its reason.
+            Path(self.settings.priority_path).write_text(
+                priority_list.render(entries, _PRIORITY_HEADER), encoding="utf-8")
+
+        print(f"priority: {len(entries)} listed, {seeded} seeded, "
+              f"{flagged} already known and flagged, {cleared} flag(s) cleared "
+              f"first, {sum(1 for e in entries if not e.domain)} still without "
+              "a domain")
+        _print_table(rows, ("company", "domain", "state", "detail"))
+        return seeded
 
     def enrich(self, limit: int) -> int:
         companies = self.db.companies_by_status("new", limit=limit)
@@ -202,7 +306,21 @@ class Pipeline:
         _print_table(rows, ("company", "email", "verify", "conf", "location"))
         return added
 
-    def queue(self, limit: int) -> int:
+    def queue(self, limit: int, target: int = 0) -> int:
+        """Render drafts. With a target, only enough to reach that depth.
+
+        Drafting runs all day rather than once in the morning, so most runs
+        find the queue already deep enough and should cost nothing. Rendering
+        calls the LLM once per draft, so "nothing to do" has to be decided
+        before that and not after.
+        """
+        if target:
+            have = self.db.queued_draft_count()
+            if have >= target:
+                print(f"queue: {have} already waiting, target {target}, "
+                      "nothing to render")
+                return 0
+            limit = min(limit, target - have)
         template = load_template(self.settings.template_path)
         validate_template(template)
         holes = unedited_markers(f"{template.subject}\n{template.body}")
@@ -288,27 +406,19 @@ class Pipeline:
         return queued
 
     def _split_incomplete(self, drafts: list) -> tuple[list, list[tuple[str, str]]]:
-        """Separate drafts that are safe to send from ones that are not finished."""
+        """Separate drafts that are safe to send from ones that are not finished.
+
+        The rule itself lives in emailer.draft_defect, because the Gmail
+        mirror has to apply exactly the same one before a copy lands somewhere
+        a human can send it by hand.
+        """
         ready, blocked = [], []
-        want_resume = bool(str(self.settings.resume_path))
         for draft in drafts:
-            holes = unedited_markers(f"{draft['subject']}\n{draft['body']}")
-            if holes:
-                blocked.append((draft["email"],
-                                f"unedited template: {', '.join(holes[:2])}"))
-                continue
-            attachments = [a for a in (draft["attachments"] or "").split("|") if a]
-            # A draft carrying the hosted link instead of the PDF is complete:
-            # that is the fallback the queue applies when there is nothing to
-            # attach. One or the other must be there, never neither.
-            if want_resume and not attachments and not has_resume_link(draft["body"]):
-                blocked.append((draft["email"], "no resume attached"))
-                continue
-            missing = [a for a in attachments if not Path(a).exists()]
-            if missing and not self.settings.resume_link:
-                blocked.append((draft["email"], "attachment file is missing"))
-                continue
-            ready.append(draft)
+            why = draft_defect(draft, self.settings)
+            if why:
+                blocked.append((draft["email"], why))
+            else:
+                ready.append(draft)
         return ready, blocked
 
     def _todays_cap(self, today: str) -> tuple[int, str]:
@@ -538,6 +648,7 @@ class Pipeline:
     def _deliver(self, backend, drafts: list, today: str) -> int:
         settings = self.settings
         sent = 0
+        delivered_mirrors: list[tuple[int, str]] = []
         with backend:
             for index, draft in enumerate(drafts):
                 allowed, why = self.db.can_send_to(draft["email"])
@@ -545,30 +656,16 @@ class Pipeline:
                     print(f"  skip {draft['email']}: {why}")
                     self.db.mark_draft(draft["id"], "skipped")
                     continue
-                attachments = [a for a in (draft["attachments"] or "").split("|") if a]
-                body = draft["body"]
                 try:
-                    message = build_message(
-                        draft["subject"], body, draft["email"],
-                        " ".join(p for p in (draft["first_name"], draft["last_name"]) if p),
-                        settings.from_email, settings.from_name,
-                        settings.reply_to, settings.unsubscribe_mailto, attachments,
-                    )
+                    message, note = message_for_draft(settings, draft)
                 except FileNotFoundError as exc:
-                    # The PDF moved between queueing and sending. Send the link
-                    # instead of dropping the resume from the message entirely.
-                    if not settings.resume_link:
-                        print(f"  BLOCKED {draft['email']}: {exc}")
-                        self.db.mark_draft(draft["id"], "failed")
-                        continue
-                    print(f"  {draft['email']}: {exc}, using the resume link")
-                    body = with_resume_link(body, settings.resume_link)
-                    message = build_message(
-                        draft["subject"], body, draft["email"],
-                        " ".join(p for p in (draft["first_name"], draft["last_name"]) if p),
-                        settings.from_email, settings.from_name,
-                        settings.reply_to, settings.unsubscribe_mailto,
-                    )
+                    # The PDF moved between queueing and sending, and there is
+                    # no hosted link to fall back to.
+                    print(f"  BLOCKED {draft['email']}: {exc}")
+                    self.db.mark_draft(draft["id"], "failed")
+                    continue
+                if note:
+                    print(f"  {draft['email']}: {note}, using the resume link")
                 result = backend.send(message)
                 self.db.record_send(
                     draft["contact_id"], draft["email"], draft["subject"],
@@ -578,12 +675,39 @@ class Pipeline:
                 self.db.mark_draft(draft["id"], "sent" if result.ok else "failed")
                 if result.ok:
                     sent += 1
+                    mirrored = (draft["gmail_message_id"]
+                                if "gmail_message_id" in draft.keys() else "")
+                    if mirrored:
+                        delivered_mirrors.append((draft["id"], mirrored))
                     print(f"  sent {draft['email']} ({draft['company_name']})")
                 else:
                     print(f"  FAILED {draft['email']}: {result.error}")
                 if index < len(drafts) - 1:
                     time.sleep(pace_delay(settings.send_delay_seconds))
+        self._drop_mirrors(delivered_mirrors)
         return sent
+
+    def _drop_mirrors(self, mirrored: list[tuple[int, str]]) -> None:
+        """Delete the Gmail copies of drafts SMTP has just accepted.
+
+        Straight after the send loop rather than on the next sync: the window
+        in which a copy sits in Drafts for a message that has already gone out
+        is exactly the window in which it can be sent a second time by hand.
+
+        A failure here is not fatal and must not fail the run, which has
+        already delivered real mail. The copy stays recorded as mirrored and
+        the next mirror sync drops it.
+        """
+        if not mirrored or not self.settings.mirror_to_drafts:
+            return
+        try:
+            with GmailDrafts(self.settings) as gmail:
+                for draft_id, message_id in mirrored:
+                    if gmail.drop(message_id):
+                        self.db.clear_draft_mirror(draft_id)
+        except (imaplib.IMAP4.error, OSError) as exc:
+            print(f"  note: {len(mirrored)} Gmail draft(s) left to the next "
+                  f"sync ({type(exc).__name__}: {exc})")
 
     def digest(self, days: int = 7, send_it: bool = True) -> str:
         return build_digest(self.db, self.settings, days, send_it)

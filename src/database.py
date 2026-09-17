@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS companies (
     is_hiring     INTEGER DEFAULT 0,
     yc_url        TEXT DEFAULT '',
     github_org    TEXT DEFAULT '',
+    -- Named in config/priority.txt. Sorts ahead of everything else at every
+    -- stage after discovery, and exempt from the size and age gates. See
+    -- priority.py.
+    priority      INTEGER DEFAULT 0,
     source        TEXT DEFAULT 'yc',
     status        TEXT DEFAULT 'new',
     skip_reason   TEXT DEFAULT '',
@@ -70,6 +74,11 @@ CREATE TABLE IF NOT EXISTS drafts (
     body        TEXT NOT NULL,
     attachments TEXT DEFAULT '',
     status      TEXT DEFAULT 'queued',
+    -- Message-ID of this draft's copy in the Gmail Drafts folder, empty when
+    -- there is no copy. It is how the copy is found again and deleted once
+    -- the message has gone out, so that it cannot be sent a second time by
+    -- hand. See mirror.py.
+    gmail_message_id TEXT DEFAULT '',
     created_at  TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_contact ON drafts(contact_id);
@@ -167,12 +176,17 @@ class Database:
         new column has to be added explicitly or every read of it raises on the
         databases that matter, the ones already carrying live send history.
         """
-        have = {row[1] for row in self.conn.execute("PRAGMA table_info(companies)")}
-        if "github_org" not in have:
-            self.conn.execute(
-                "ALTER TABLE companies ADD COLUMN github_org TEXT DEFAULT ''"
-            )
-            self.conn.commit()
+        for table, column, ddl in (
+            ("companies", "github_org", "TEXT DEFAULT ''"),
+            ("companies", "priority", "INTEGER DEFAULT 0"),
+            ("drafts", "gmail_message_id", "TEXT DEFAULT ''"),
+        ):
+            have = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            if column not in have:
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"
+                )
+        self.conn.commit()
 
     def upsert_company(self, c: Company) -> int:
         """Insert, or return the existing id. Domain is the identity key."""
@@ -185,11 +199,12 @@ class Database:
             """INSERT INTO companies
                (name, domain, website, location, industry, one_liner, description,
                 batch, founded_year, employees, is_hiring, yc_url, github_org,
-                source, status, skip_reason, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                priority, source, status, skip_reason, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (c.name, c.domain, c.website, c.location, c.industry, c.one_liner,
              c.description, c.batch, c.founded_year, c.employees, int(c.is_hiring),
-             c.yc_url, c.github_org, c.source, c.status, c.skip_reason, _now()),
+             c.yc_url, c.github_org, int(getattr(c, "priority", 0)), c.source,
+             c.status, c.skip_reason, _now()),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -208,9 +223,27 @@ class Database:
 
     def companies_by_status(self, status: str, limit: int = 100) -> list[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT * FROM companies WHERE status = ? ORDER BY is_hiring DESC, id LIMIT ?",
+            """SELECT * FROM companies WHERE status = ?
+               ORDER BY priority DESC, is_hiring DESC, id LIMIT ?""",
             (status, limit),
         ).fetchall()
+
+    def mark_priority(self, company_id: int, priority: int = 1) -> None:
+        self.conn.execute(
+            "UPDATE companies SET priority = ? WHERE id = ?", (priority, company_id)
+        )
+        self.conn.commit()
+
+    def clear_priorities(self) -> int:
+        """Reset every flag, so a name dropped from the file loses its place."""
+        cur = self.conn.execute(
+            "UPDATE companies SET priority = 0 WHERE priority != 0")
+        self.conn.commit()
+        return cur.rowcount
+
+    def all_companies(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT id, name, domain, priority FROM companies").fetchall()
 
     def get_company(self, company_id: int) -> Optional[sqlite3.Row]:
         return self.conn.execute(
@@ -284,7 +317,9 @@ class Database:
             """SELECT c.*, co.name AS company_name, co.domain AS company_domain,
                       co.one_liner, co.description, co.location, co.batch, co.website
                FROM contacts c LEFT JOIN companies co ON co.id = c.company_id
-               WHERE c.status = ? ORDER BY c.confidence DESC, c.id LIMIT ?""",
+               WHERE c.status = ?
+               ORDER BY COALESCE(co.priority, 0) DESC, c.confidence DESC, c.id
+               LIMIT ?""",
             (status, limit),
         ).fetchall()
 
@@ -377,12 +412,64 @@ class Database:
                JOIN contacts c ON c.id = d.contact_id
                LEFT JOIN companies co ON co.id = c.company_id
                WHERE d.status = 'queued' AND c.status = ?
-               ORDER BY c.confidence DESC, d.id LIMIT ?""",
+               ORDER BY COALESCE(co.priority, 0) DESC, c.confidence DESC, d.id
+               LIMIT ?""",
             (QUEUED, limit),
         ).fetchall()
 
     def mark_draft(self, draft_id: int, status: str) -> None:
         self.conn.execute("UPDATE drafts SET status = ? WHERE id = ?", (status, draft_id))
+        self.conn.commit()
+
+    def queued_draft_count(self) -> int:
+        """How deep the queue is, for the top-up target in queue()."""
+        return int(self.conn.execute(
+            """SELECT COUNT(*) FROM drafts d JOIN contacts c ON c.id = d.contact_id
+               WHERE d.status = 'queued' AND c.status = ?""",
+            (QUEUED,),
+        ).fetchone()[0])
+
+    # ---------- Gmail Drafts mirror ----------
+
+    def drafts_to_mirror(self, limit: int = 50) -> list[sqlite3.Row]:
+        """Queued drafts that have no copy in the Gmail Drafts folder yet."""
+        return self.conn.execute(
+            """SELECT d.*, c.email, c.first_name, c.last_name, c.role,
+                      co.name AS company_name, co.location AS company_location
+               FROM drafts d
+               JOIN contacts c ON c.id = d.contact_id
+               LEFT JOIN companies co ON co.id = c.company_id
+               WHERE d.status = 'queued' AND c.status = ?
+                 AND COALESCE(d.gmail_message_id, '') = ''
+               ORDER BY COALESCE(co.priority, 0) DESC, c.confidence DESC, d.id
+               LIMIT ?""",
+            (QUEUED, limit),
+        ).fetchall()
+
+    def stale_mirrors(self) -> list[sqlite3.Row]:
+        """Copies in Gmail whose draft is no longer waiting to be sent.
+
+        Either this bot has sent it, or it was skipped or failed. In every
+        case the copy in Drafts is now something that must not be sent by
+        hand, so it has to go.
+        """
+        return self.conn.execute(
+            """SELECT d.id, d.gmail_message_id, c.email
+               FROM drafts d JOIN contacts c ON c.id = d.contact_id
+               WHERE COALESCE(d.gmail_message_id, '') != '' AND d.status != 'queued'"""
+        ).fetchall()
+
+    def set_draft_mirror(self, draft_id: int, message_id: str) -> None:
+        self.conn.execute(
+            "UPDATE drafts SET gmail_message_id = ? WHERE id = ?",
+            (message_id, draft_id),
+        )
+        self.conn.commit()
+
+    def clear_draft_mirror(self, draft_id: int) -> None:
+        self.conn.execute(
+            "UPDATE drafts SET gmail_message_id = '' WHERE id = ?", (draft_id,)
+        )
         self.conn.commit()
 
     # ---------- follow-ups ----------

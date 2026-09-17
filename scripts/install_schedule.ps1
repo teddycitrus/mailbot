@@ -1,11 +1,20 @@
 # Registers every scheduled job. Run once from the project root:
 #   powershell -ExecutionPolicy Bypass -File scripts\install_schedule.ps1
 #
-# Four jobs, deliberately separated:
-#   mailbot-prep    weekday 08:25              scan mailbox, render drafts
-#   mailbot-send    weekday 08:30-13:30 /15m   send one message per tick
+# Five jobs, deliberately separated:
+#   mailbot-draft   every day 06:00-23:00 /2h  render drafts, copy to Gmail
+#   mailbot-prep    weekday 08:25              full mailbox scan
+#   mailbot-send    weekday 08:30-13:30 /15m   send two messages per tick
 #   mailbot-build   every day 19:30            slow, discover + enrich
 #   mailbot-digest  Friday  17:00              weekly summary email
+#
+# The split that matters is draft from send. Drafting has no deadline and runs
+# whenever the machine happens to be on; sending is the only job that has to
+# land in a particular hour. A laptop asleep at 08:25 used to cost the day.
+#
+# draft and send also carry two event triggers apiece -- resume-from-sleep and
+# session unlock -- because on a Modern Standby machine the clock triggers
+# above are missed outright while it idles in low power. See -CatchUpOnWake.
 #
 # Triggers fire on this machine's local clock. The bot separately refuses to
 # send outside SEND_WINDOW_START..SEND_WINDOW_END in the recipient's own zone,
@@ -46,7 +55,8 @@ function Install-MailbotTask {
         [double]$RepeatForHours = 0,
         [int]$TimeLimitMinutes = 120,
         [int]$RestartCount = 0,
-        [int]$RestartMinutes = 5
+        [int]$RestartMinutes = 5,
+        [switch]$CatchUpOnWake
     )
 
     $path = Join-Path $root $Script
@@ -71,6 +81,48 @@ function Install-MailbotTask {
                 -RepetitionDuration (New-TimeSpan -Hours $RepeatForHours)).Repetition
         }
         $triggers += $trigger
+    }
+
+    if ($CatchUpOnWake) {
+        # A clock trigger is only as good as the machine being awake to hear
+        # it. This one is an S0 Modern Standby laptop: it has no S3 to wake
+        # from, desktop tasks stay frozen while it idles in low power, and
+        # WakeToRun does not reliably thaw them. On 2026-09-17 it slept from
+        # 16:53 the previous day until 10:25, re-entered standby at 10:58 and
+        # again at 12:15, and so missed every one of the day's twenty ticks --
+        # StartWhenAvailable never made up the 08:30 occurrence either. Zero
+        # mail went out on a day with 35 drafts queued and the window open.
+        #
+        # So do not rely on the clock alone. Fire on the two events that mean
+        # "this machine is awake again", and let the bot decide whether anyone
+        # is actually inside their window. That check lives in src/emailer.py
+        # and covers the weekend too, so a tick at a useless moment costs a
+        # few seconds and sends nothing -- which makes these triggers free to
+        # add and the day's sends no longer a bet on the lid being open.
+        $ns = "Root/Microsoft/Windows/TaskScheduler"
+
+        # Kernel-Power 107: the system has resumed from a low power state.
+        # One minute of delay so the network is back before we try SMTP.
+        $resumeQuery = "<QueryList><Query Id='0' Path='System'><Select " +
+            "Path='System'>*[System[Provider[@Name='Microsoft-Windows-Kernel-Power']" +
+            " and EventID=107]]</Select></Query></QueryList>"
+        $triggers += New-CimInstance -ClassName MSFT_TaskEventTrigger `
+            -Namespace $ns -ClientOnly -Property @{
+                Enabled      = $true
+                Subscription = $resumeQuery
+                Delay        = "PT1M"
+            }
+
+        # And on unlock, which is what a lid opened on a locked session looks
+        # like. Belt and braces: whichever of the two arrives first wins, and
+        # the second one no-ops because the first already sent this tick's two.
+        $triggers += New-CimInstance -ClassName MSFT_TaskSessionStateChangeTrigger `
+            -Namespace $ns -ClientOnly -Property @{
+                Enabled     = $true
+                StateChange = 8
+                UserId      = "$env:USERDOMAIN\$env:USERNAME"
+                Delay       = "PT1M"
+            }
     }
 
     # WakeToRun is set here, but it is inert unless the machine's power scheme
@@ -110,14 +162,28 @@ function Install-MailbotTask {
     Write-Host "registered '$Name' at $when"
 }
 
-# Render the day's drafts just before the first window opens. This one runs
-# once a day, so a single failed launch costs every draft for that day and
-# there is no later trigger to make it up; the ticks need no such retry
-# because another one follows 15 minutes behind.
+# Drafting, every two hours, seven days a week, from early to late. Nothing
+# here has a deadline, which is the entire point: a slot missed to a sleeping
+# laptop is picked up by the next one, or by StartWhenAvailable on wake, and
+# a run that finds the queue already at QUEUE_TARGET does nothing and costs
+# seconds. Sending is what has to happen at a particular hour, and it is a
+# separate job below.
+#
+# This deliberately runs at the weekend too. Sending stays weekday-only, so
+# a Saturday draft simply waits in the queue, and Monday opens on a full one.
+Install-MailbotTask -Name "mailbot-draft" -Script "scripts\draft_run.ps1" `
+    -At "6:00am" -DaysOfWeek $alldays -CatchUpOnWake `
+    -RepeatEveryMinutes 120 -RepeatForHours 17 -TimeLimitMinutes 45 `
+    -Description "Mailbot: render drafts and copy them to Gmail Drafts"
+
+# A full mailbox scan before the first window opens. Renders nothing now that
+# drafting is its own job, but it still runs once a day, so a failed launch
+# has no later trigger to make it up; the ticks need no such retry because
+# another one follows 15 minutes behind.
 Install-MailbotTask -Name "mailbot-prep" -Script "scripts\daily_run.ps1" `
     -Arguments "-Mode prep" -At "8:25am" -TimeLimitMinutes 30 `
     -RestartCount 2 -RestartMinutes 5 `
-    -Description "Mailbot: scan mailbox and render drafts"
+    -Description "Mailbot: full mailbox scan before the send window"
 
 # One tick every 15 minutes from 08:30 to 13:30, each sending at most one
 # message. 08:30-10:30 covers Eastern recipients in their own morning and
@@ -125,7 +191,7 @@ Install-MailbotTask -Name "mailbot-prep" -Script "scripts\daily_run.ps1" `
 # ticks no-op. Spreading the cap this way means the day's sends arrive across
 # each recipient's 08:30-10:30 rather than all inside four minutes.
 Install-MailbotTask -Name "mailbot-send" -Script "scripts\daily_run.ps1" `
-    -Arguments "-Mode tick" -At "8:30am" `
+    -Arguments "-Mode tick" -At "8:30am" -CatchUpOnWake `
     -RepeatEveryMinutes 15 -RepeatForHours 5 -TimeLimitMinutes 10 `
     -Description "Mailbot: send queued outreach, paced"
 

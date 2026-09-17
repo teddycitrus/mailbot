@@ -1,16 +1,19 @@
-# Morning job: send from the queue the nightly build already prepared.
+# Morning job: send drafts that were already written, hours or days ago.
 #
-# Deliberately does no discovery or enrichment. Those involve slow third-party
-# network calls, and a single hung scrape would otherwise burn the send window.
-# This script only touches the local queue plus SMTP and IMAP, so it finishes
-# in seconds.
+# This script does no discovery, no enrichment and, since 2026-09-17, no
+# rendering either. All of those are slow or depend on a third party, and
+# anything slow on this path burns the send window it is standing in.
+# Drafting moved to draft_run.ps1, which runs all day and has no deadline;
+# see the note at the top of that file for why. What is left here is the one
+# job that genuinely has to happen at a particular hour: sending.
 #
 # Two modes, because the two halves have very different costs:
 #
-#   prep   once at 08:25. Scans the mailbox and renders drafts. Rendering calls
-#          Groq, so it must not run on every tick or it burns the LLM budget.
-#   tick   every 15 minutes from 08:30 to 13:30. Sends at most one message, so
-#          the day's cap dribbles out across each recipient's own morning
+#   prep   once at 08:25. A full mailbox scan, which is the slow half: every
+#          examined message is a full body fetch, so it must not run on every
+#          tick. Renders nothing.
+#   tick   every 15 minutes from 08:30 to 13:30. Sends at most two messages,
+#          so the day's cap dribbles out across each recipient's own morning
 #          instead of landing as one burst four minutes wide.
 #
 # The bot itself decides who is eligible on any given tick: with
@@ -61,11 +64,18 @@ function Write-Mailbot {
     $out = (& $script:python -m src.main @MailbotArgs *>&1) | Out-String
     $code = $LASTEXITCODE
     Write-Log $out.TrimEnd()
+    # Remember the worst code any step returned, so the exit at the bottom can
+    # tell the scheduler the truth. Without it the script's own exit code was
+    # whatever powershell.exe felt like, and prep reported task result 0x1 on
+    # 2026-09-14 after a run whose every step had in fact succeeded -- which
+    # then burned both of its RestartCount attempts re-running a clean pass.
+    if ($code -and $code -gt $script:worst) { $script:worst = $code }
     # The footer reports $LASTEXITCODE, and the retry loop above runs after
     # the python call, so put it back rather than trusting it to survive.
     $global:LASTEXITCODE = $code
 }
 
+$script:worst = 0
 $script:python = "python"
 $venv = Join-Path $root ".venv\Scripts\python.exe"
 if (Test-Path $venv) { $script:python = $venv }
@@ -81,11 +91,16 @@ Write-Log "=== $Mode run $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ==="
 # send past the end of the window it was meant to land in.
 if ($Mode -eq "prep") {
     Write-Mailbot inbox
-    # Rendering is the expensive half. Once a day is enough.
-    Write-Mailbot queue --limit 25
 }
 else {
     Write-Mailbot inbox --days 1 --limit 40
+
+    # Before sending, not after: this is what notices a draft sent by hand
+    # from the phone, marks it sent here, and takes it out of the queue the
+    # next line is about to send from. It also clears the Gmail copy of
+    # anything the previous tick sent. Two days of Sent is plenty at this
+    # cadence and keeps the fetch small.
+    Write-Mailbot mirror --limit 25 --days 2
 
     # Two messages per tick. The tick count, not the cap, used to be what ended
     # the day: ticks run 08:30-13:30, but a recipient is only eligible during
@@ -100,4 +115,5 @@ else {
     Write-Mailbot followup --limit 1
 }
 
-Write-Log "=== finished $(Get-Date -Format 'HH:mm:ss') exit=$LASTEXITCODE ==="
+Write-Log "=== finished $(Get-Date -Format 'HH:mm:ss') exit=$script:worst ==="
+exit $script:worst

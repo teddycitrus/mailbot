@@ -34,5 +34,11 @@ Write-Mailbot hn --limit 60 --months 3
 Write-Mailbot discover --limit 60
 Write-Mailbot gh       --limit 60
 Write-Mailbot enrich   --limit 90
+# Draft immediately, while the contacts this run just found are fresh, rather
+# than leaving it to the morning. By the time anyone is awake the queue is
+# already deep and already copied to Gmail Drafts, so the morning has nothing
+# left to do but send. draft_run.ps1 tops the same queue up through the day.
+Write-Mailbot queue    --limit 40
+Write-Mailbot mirror   --limit 60
 Write-Mailbot stats
 "=== finished $(Get-Date -Format 'HH:mm:ss') exit=$LASTEXITCODE ===" | Out-File -Append -Encoding utf8 $script:log
