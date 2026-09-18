@@ -14,6 +14,7 @@ dist/
 build/
 *.spec.bak
 config/aspects.txt
+config/priority.txt
 config/template.txt
 config/followup.txt
 config/reply.txt

@@ -1,0 +1,17 @@
+# Companies to treat as high priority: enriched, drafted and sent before
+# anything else, and exempt from the team-size and company-age gates that the
+# rest of the funnel applies. See src/priority.py for what is and is not
+# relaxed. Sending rules are not relaxed.
+#
+# One company per line. Add "= domain.com" to pin the domain; leave it off and
+#   mailbot priority --resolve
+# will work it out and write it back here, skipping any it cannot confirm.
+# Lines starting with # are ignored, so a name can be parked without deleting.
+#
+# Copy this file to config/priority.txt and put your own list in it. The real
+# file is gitignored: it is a list of who you are about to mail, which is
+# nobody else's business.
+Temporal   = temporal.io
+Normal     = normal.dev
+Some Startup =   # left blank for --resolve to fill in
+# Parked Co =   # kept for later, ignored for now
