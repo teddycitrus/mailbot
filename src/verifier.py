@@ -41,10 +41,22 @@ DISPOSABLE = {
 
 # Never write to these even if scraped; they are not people and some are traps.
 NEVER_SEND = {
-    "abuse", "postmaster", "noreply", "no-reply", "donotreply", "do-not-reply",
-    "security", "privacy", "legal", "dmarc", "spam", "unsubscribe", "bounce",
-    "mailer-daemon", "webmaster", "root",
+    "abuse", "postmaster", "security", "privacy", "legal", "dmarc", "spam",
+    "webmaster", "root",
 }
+
+# Matched as substrings of the local part instead of whole mailbox names. A
+# mailbox that says in its own name that nobody reads it is dead however the
+# name is dressed up: noreply-jobs@, jobs.no-reply@, bounces+7a1f@.
+NEVER_SEND_TOKENS = (
+    "noreply", "donotreply", "mailerdaemon", "unsubscribe", "bounce",
+)
+
+# The same idea applied to subdomains, since @users.noreply.github.com and
+# @reply.acme.com route to a robot no matter what the local part says. Only
+# labels above the registrable domain are checked, so a company that is really
+# called reply.io stays reachable.
+NEVER_SEND_HOSTS = ("noreply", "donotreply", "reply", "bounce", "mailer")
 
 
 @dataclass
@@ -70,8 +82,19 @@ def domain_of(email: str) -> str:
     return email.split("@", 1)[1].lower() if "@" in email else ""
 
 
+def _squash(text: str) -> str:
+    """Reduce to letters and digits so no-reply, no_reply and NoReply agree."""
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
 def is_never_send(email: str) -> bool:
-    return local_part(email) in NEVER_SEND
+    local = _squash(local_part(email))
+    if local in NEVER_SEND:
+        return True
+    if any(token in local for token in NEVER_SEND_TOKENS):
+        return True
+    subdomains = _squash("".join(domain_of(email).split(".")[:-2]))
+    return any(token in subdomains for token in NEVER_SEND_HOSTS)
 
 
 def is_role_account(email: str) -> bool:

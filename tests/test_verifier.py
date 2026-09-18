@@ -34,6 +34,35 @@ def test_role_and_never_send_classification():
     assert not is_never_send("hello@acme.ai")
 
 
+@pytest.mark.parametrize("email", [
+    "noreply@acme.ai",
+    "no_reply@acme.ai",
+    "NoReply@acme.ai",
+    "noreply-jobs@acme.ai",
+    "jobs.no-reply@acme.ai",
+    "do-not-reply@acme.ai",
+    "bounces+7a1f@acme.ai",
+    "mailer-daemon@acme.ai",
+    "1234+bob@users.noreply.github.com",
+    "ticket-88@reply.acme.ai",
+    "campaign@mailer.acme.ai",
+])
+def test_addresses_that_nobody_reads_are_never_sent_to(email):
+    assert is_never_send(email)
+
+
+@pytest.mark.parametrize("email", [
+    "stefan@acme.ai",
+    "hello@acme.ai",
+    "careers@acme.ai",
+    # reply.io is a real company, so the host check stops at the registrable
+    # domain and leaves its people reachable.
+    "stefan@reply.io",
+])
+def test_real_mailboxes_survive_the_never_send_check(email):
+    assert not is_never_send(email)
+
+
 def test_candidate_patterns_are_ordered_and_unique():
     cands = candidate_addresses("Stefan", "Seltz-Axmacher", "acme.ai")
     assert cands[0] == "stefan@acme.ai"

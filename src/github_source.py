@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 
 from .patterns import apply_pattern, detect as local_pattern, name_parts
 from .ratelimit import Budget, RateLimiter
+from .verifier import is_never_send
 
 API = "https://api.github.com"
 ORG_RE = re.compile(r"github\.com/([A-Za-z0-9][A-Za-z0-9\-_.]{0,38})/?", re.I)
@@ -35,8 +36,6 @@ NOT_ORGS = {
     "collections", "trending", "events", "sponsors", "readme", "orgs", "apps",
     "marketplace", "security", "enterprise", "customer-stories", "site",
 }
-
-NOREPLY = ("noreply", "users.noreply.github.com", "no-reply")
 
 
 @dataclass
@@ -131,7 +130,7 @@ class GitHubClient:
                 author = (entry.get("commit") or {}).get("author") or {}
                 email = (author.get("email") or "").lower().strip()
                 who = author.get("name") or ""
-                if not email or any(bad in email for bad in NOREPLY):
+                if not email or is_never_send(email):
                     continue
                 if not email.endswith("@" + domain):
                     continue
