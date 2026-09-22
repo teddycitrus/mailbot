@@ -7,14 +7,30 @@ themselves live in pipeline.py.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 
+from .alerts import bounce_check, health_check, print_bounce_report, print_report
 from .config import ConfigError, Settings
 from .database import Database
 from .doctor import FAIL, run_checks, scan_build
 from .inbox import scan_inbox
+from .locking import Busy, default_lock_path, single_run
 from .mirror import sync as mirror_sync
 from .pipeline import BAR, Pipeline, _print_table
+from .reverify import recover
+
+# Commands that only read, or that run something long-lived of their own. The
+# rest take the install-wide lock, because the scheduled jobs overlap and two
+# of them writing at once is how a draft ends up mirrored to Gmail twice.
+# See locking.py.
+# bounce-report is here deliberately. It writes only a single log row, and an
+# alert about a bad day must never be the thing that gets skipped because a
+# drafting run happened to hold the lock.
+LOCK_EXEMPT = frozenset({
+    "dashboard", "verify-build", "doctor", "stats", "preview", "health",
+    "bounce-report",
+})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -80,6 +96,23 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("suppress", help="never contact an address")
     p.add_argument("email")
     sub.add_parser("stats", help="print the summary tables")
+    p = sub.add_parser("health", help="check everything and alert if it is broken")
+    p.add_argument("--no-email", dest="email", action="store_false",
+                   help="print the report without mailing it")
+    p = sub.add_parser(
+        "bounce-report",
+        help="email a warning if today's bounce rate went over the threshold")
+    p.add_argument("--day", default="",
+                   help="the local date to judge (default: today)")
+    p.add_argument("--no-email", dest="email", action="store_false",
+                   help="print the report without mailing it")
+    p = sub.add_parser(
+        "reverify",
+        help="re-probe contacts whose verdict recorded a failed probe")
+    p.add_argument("--limit", type=int, default=0,
+                   help="most contacts to re-probe in one pass (0 = all)")
+    p.add_argument("--no-reopen", dest="reopen", action="store_false",
+                   help="leave parked companies alone instead of re-enriching")
     sub.add_parser("doctor", help="check everything the scheduled jobs rely on")
     p = sub.add_parser("verify-build", help="check a built exe carries no private data")
     p.add_argument("exe", nargs="?", default="dist/mailbot.exe")
@@ -115,10 +148,38 @@ def main(argv: list[str] | None = None) -> int:
         serve(args.host, args.port, open_browser=not args.no_browser)
         return 0
 
+    if args.command == "health":
+        report = health_check(settings, notify=args.email)
+        print_report(report)
+        return 1 if report.failures else 0
+
+    if args.command == "bounce-report":
+        db = Database(settings.db_path)
+        try:
+            report = bounce_check(settings, db, args.day, notify=args.email)
+        finally:
+            db.close()
+        print_bounce_report(report)
+        # Non-zero so the scheduled task shows it and the wrapper can raise a
+        # desktop notification without having to parse the output.
+        return 1 if report.over else 0
+
     if args.command == "init":
         Database(settings.db_path).close()
         print(f"initialised {settings.db_path}")
         return 0
+
+    # Held for the whole run, released by the finally below. A job that cannot
+    # get it stands down rather than queueing: every one of these runs again
+    # within a couple of hours, and a skipped tick costs nothing next to two
+    # runs writing over each other.
+    stack = contextlib.ExitStack()
+    if args.command not in LOCK_EXEMPT:
+        try:
+            stack.enter_context(single_run(default_lock_path(settings.db_path)))
+        except Busy as exc:
+            print(f"{args.command}: {exc}, skipping this run")
+            return 0
 
     pipeline = Pipeline(settings)
     try:
@@ -180,6 +241,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"suppressed {args.email}")
         elif args.command == "stats":
             pipeline.summary()
+        elif args.command == "reverify":
+            report = recover(pipeline.db, pipeline.verifier, args.limit,
+                             reopen=args.reopen)
+            print(f"reverify: {report.examined} re-probed, "
+                  f"{len(report.improved)} improved, "
+                  f"{len(report.unchanged)} unchanged, "
+                  f"{len(report.dropped)} suppressed as undeliverable "
+                  f"({report.drafts_pulled} queued draft(s) pulled); "
+                  f"{report.cache_cleared} stale domain(s) cleared, "
+                  f"{report.companies_reopened} company(s) back in the enrich queue")
+            _print_table(report.rows(), ("email", "confidence", "state", "detail"))
         elif args.command == "doctor":
             checks = run_checks(settings)
             _print_table([(c.name, c.state, c.detail) for c in checks],
@@ -207,6 +279,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     finally:
         pipeline.close()
+        stack.close()
     return 0
 
 

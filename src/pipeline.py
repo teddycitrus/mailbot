@@ -10,15 +10,14 @@ from __future__ import annotations
 import imaplib
 import smtplib
 import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import Settings
 from .database import Database
 from .emailer import (
-    draft_defect, greeting_name, has_resume_link, message_for_draft,
-    resume_link_line, with_resume_link,
-    build_message, in_send_window, load_template, local_date, local_now,
+    draft_defect, greeting_name, message_for_draft, resume_link_line,
+    strip_re_prefix, with_resume_link,
+    build_message, in_send_window, load_template, local_date,
     local_window_open, make_backend, pace_delay, unedited_markers,
     validate_template,
 )
@@ -450,6 +449,29 @@ class Pipeline:
         settings.require_for_send()
         template = load_template(settings.followup_template_path)
         validate_template(template)
+        # The same rule the first email gets. validate_template only checks
+        # that placeholder names are fillable; an unedited [BRACKET] is a hole
+        # the author left, and send() blocks those for queued drafts. Nothing
+        # blocked them here, so the follow-up was the one path an unfinished
+        # template could still leave by.
+        holes = unedited_markers(f"{template.subject}\n{template.body}")
+        if holes:
+            print(f"followup: refusing to send, {settings.followup_template_path} "
+                  f"still has unedited placeholder(s): {', '.join(holes[:3])}")
+            return 0
+
+        # With per-recipient windows each nudge is gated on the recipient's own
+        # morning further down. Without them there is a single clock, and it is
+        # the one send() refuses against; until this check existed a follow-up
+        # was the only way the bot could deliver at 3am.
+        if not settings.per_recipient_timezone:
+            ok, why = in_send_window(
+                settings.send_timezone, settings.send_window_start,
+                settings.send_window_end,
+            )
+            if not ok and not ignore_window:
+                print(f"followup: refused, {why}")
+                return 0
 
         today = local_date(settings.send_timezone)
         already = self.db.sent_count_on(today)
@@ -504,7 +526,7 @@ class Pipeline:
                         continue
                     subject, body = template.render({
                         "first_name": first,
-                        "original_subject": (row["first_subject"] or "").lstrip("Re: "),
+                        "original_subject": strip_re_prefix(row["first_subject"] or ""),
                         "company": row["company_name"] or "",
                         "sender_name": settings.from_name,
                         "sender_email": settings.from_email,
@@ -536,7 +558,11 @@ class Pipeline:
                         print(f"  followed up {row['email']} ({row['company_name']})")
                     else:
                         print(f"  FAILED {row['email']}: {result.error}")
-                    time.sleep(pace_delay(settings.send_delay_seconds))
+                    # Pacing separates messages; there is nothing to separate
+                    # the last one from, and a tick that sends its single
+                    # allowance should not then sit idle for twenty seconds.
+                    if sent < min(limit, remaining):
+                        time.sleep(pace_delay(settings.send_delay_seconds))
         except smtplib.SMTPAuthenticationError:
             print("followup: SMTP login rejected, see send for details")
             return 0
@@ -604,20 +630,25 @@ class Pipeline:
                 print("send: nobody is inside their local send window right now")
                 return 0
 
-        budget = min(limit, remaining)
-        drafts = pool[:budget]
-
-        # Last line of defence. A draft that still shows [BRACKETS], or that
-        # lost its resume attachment, is incomplete and must not go out however
-        # it came to be queued.
-        drafts, blocked = self._split_incomplete(drafts)
+        # Last line of defence, and it screens the whole pool before the
+        # budget is taken rather than after. A draft that still shows
+        # [BRACKETS], or that lost its resume, must not go out however it came
+        # to be queued -- but it must not consume a send slot either. Screening
+        # the truncated list meant two defective drafts at the head of the
+        # queue sent nothing on every tick, all day, for as long as they sat
+        # there, and nothing marks them, so they sat there forever.
+        pool, blocked = self._split_incomplete(pool)
         for email, why in blocked:
             print(f"  BLOCKED {email}: {why}")
         if blocked:
-            print(f"send: {len(blocked)} draft(s) blocked as incomplete")
-        if not drafts:
+            print(f"send: {len(blocked)} draft(s) blocked as incomplete, "
+                  f"passing over them for the next ready draft")
+        if not pool:
             print("send: no complete drafts to send")
             return 0
+
+        budget = min(limit, remaining)
+        drafts = pool[:budget]
 
         if settings.dry_run:
             print(f"send: DRY RUN, {len(drafts)} message(s) would go out")

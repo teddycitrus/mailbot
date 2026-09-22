@@ -61,3 +61,35 @@ def test_an_unusable_template_is_refused_before_anything_is_written(install, bad
         webapp.apply_setup({"REPLY_TEMPLATE": bad, "FROM_NAME": "Ada Lovelace"})
     assert not (install / "config" / "reply.txt").exists()
     assert not (install / ".env").exists()
+
+
+# ------------------------------------------------- who may call the API
+
+@pytest.mark.parametrize("hostname,ok", [
+    ("127.0.0.1", True),
+    ("localhost", True),
+    ("[::1]", True),
+    ("evil.example", False),
+    # A rebinding host resolves to loopback but names itself something else,
+    # which is the whole trick, so the name is what gets checked.
+    ("127.0.0.1.evil.example", False),
+    ("", False),
+])
+def test_only_loopback_names_may_reach_the_api(hostname, ok):
+    """The console binds to loopback, which does not stop a local web page.
+
+    A page cannot read a cross-origin reply, but POST /api/setup writes the
+    SMTP password and takes effect whether or not the attacker sees the
+    response.
+    """
+    assert webapp._is_loopback(hostname) is ok
+
+
+def test_a_sibling_directory_cannot_be_served(tmp_path):
+    """The old check was a string prefix, so dist_evil passed against dist."""
+    root = (tmp_path / "dist").resolve()
+    root.mkdir()
+    sibling = (tmp_path / "dist_evil" / "secret.js").resolve()
+    assert not sibling.is_relative_to(root)
+    assert (root / "app.js").resolve().is_relative_to(root)
+

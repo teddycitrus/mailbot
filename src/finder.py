@@ -19,14 +19,13 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 from .models import (
-    CATCHALL, Company, Contact, ENRICHED, NO_CONTACTS, PENDING, SRC_INFERRED,
-    SRC_SCRAPED, VERIFIED,
+    CATCHALL, Company, Contact, PENDING, SRC_INFERRED, SRC_SCRAPED,
 )
 from . import patterns
 from .github_source import find_org_for
 from .patterns import apply_pattern
 from .scraper import Fetcher, Person, parse_yc_founders, scrape_site
-from .verifier import Verifier, candidate_addresses, is_never_send, is_role_account
+from .verifier import Verifier, is_never_send, is_role_account
 
 YC_TAG_URL = "https://yc-oss.github.io/api/tags/{tag}.json"
 

@@ -23,7 +23,12 @@ import urllib.request
 from collections import Counter
 from dataclasses import dataclass, field
 
-from .patterns import apply_pattern, detect as local_pattern, name_parts
+# apply_pattern and name_parts are re-exported: this module is where the
+# address-pattern work is exercised from, so they are part of its surface
+# even though the code below reaches for local_pattern directly.
+from .patterns import (  # noqa: F401
+    apply_pattern, detect as local_pattern, name_parts,
+)
 from .ratelimit import Budget, RateLimiter
 from .verifier import is_never_send
 

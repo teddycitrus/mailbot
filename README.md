@@ -179,7 +179,7 @@ cd mailbot
 pip install -r requirements.txt
 
 cd dashboard && npm install && npm run build && cd ..
-python -m src.main dashboard
+python -m dash
 ```
 
 To produce the executable:
@@ -205,7 +205,8 @@ rates, bounce rates, queue depth and the full contact table.
 Every stage is also a command, which is what the scheduled jobs call:
 
 ```sh
-python -m src.main dashboard      # setup and progress console
+python -m dash                    # setup and progress console
+                                  # (same as: python -m src.main dashboard)
 python -m src.main discover       # find qualifying companies (Y Combinator)
 python -m src.main gh             # find companies via GitHub org search
 python -m src.main hn             # import the Hacker News hiring threads
@@ -219,6 +220,9 @@ python -m src.main followup       # one nudge to people who never replied
 python -m src.main inbox          # scan for bounces, replies and opt-outs, draft answers
 python -m src.main digest         # email yourself a weekly summary
 python -m src.main doctor         # check everything the scheduled jobs rely on
+python -m src.main health         # same checks, but email you if any of them fail
+python -m src.main bounce-report  # email you if the day's bounce rate went over
+python -m src.main reverify       # re-probe contacts whose verdict was a failed probe
 ```
 
 Sending stays off until you set `DRY_RUN=false`. Run `preview` first and read
@@ -273,13 +277,15 @@ Three files hold your own words:
 powershell -ExecutionPolicy Bypass -File scripts\install_schedule.ps1
 ```
 
-Registers five Windows tasks:
+Registers seven Windows tasks:
 
 | Task | When | What |
 | --- | --- | --- |
+| `mailbot-health` | Every day 07:45 | Check everything, alert if anything is broken |
 | `mailbot-draft` | Every day, 06:00 to 23:00, every 2h | Render drafts, copy them to Gmail Drafts |
 | `mailbot-prep` | Weekdays 08:25 | Full mailbox scan before the window opens |
 | `mailbot-send` | Weekdays 08:30 to 13:30, every 15m | Send two messages per tick |
+| `mailbot-bounce` | Weekdays 13:45 | Judge the day's bounce rate, alert if over |
 | `mailbot-build` | Every day 19:30 | Discover and enrich new companies |
 | `mailbot-digest` | Fridays 17:00 | Email you a weekly summary |
 
@@ -292,6 +298,39 @@ That ordering is the fix for a real failure. Drafting used to happen at 08:25
 on weekdays, so a laptop asleep at 08:25 produced no drafts, and a laptop
 asleep until 10:25 also missed every send tick before then. One closed lid
 cost the whole day.
+
+Only one job runs at a time. They overlap on the hour and both wake triggers
+fire at the same instant, so each takes a lock beside the database; a job that
+cannot get it says so and exits, because every one of them runs again soon.
+Without it, two `mirror` passes could put two copies of the same draft in
+Gmail, and only one would be cleared after sending.
+
+### Knowing when it breaks
+
+Everything here fails silently. The check that matters most is `verification`,
+which reads the verdicts themselves: a verdict of "no SMTP answer" records a
+probe that never completed, not a fact about a mailbox, and a pool made mostly
+of those means address verification has stopped working while every other
+check still looks healthy. That is not hypothetical. It ran that way for weeks,
+capping good addresses at guessed confidence and filing reachable companies as
+unreachable, and nothing said a word.
+
+`mailbot-health` runs before the first window opens and announces a failure
+three ways, because the thing being reported on may be the thing that is
+broken: an email, a desktop notification raised from the exit code, and
+`logs/ALERT.txt` on disk.
+
+`mailbot-bounce` runs fifteen minutes after the last send tick and judges the
+day on its own. The warmup ramp already brakes on bounces, but it reads the
+last hundred sends: two bounces in twenty-one is 9.5% for the day and moves a
+hundred-send average by two points, so the brake stays off and a bad morning
+looks identical to a good one. This mails you when a single day crosses
+`DAILY_BOUNCE_ALERT_PCT`, and names what each bounced address was believed to
+be worth when it was drafted, because a verdict reading "no SMTP answer" means
+that address was never actually proved. Once probing is healthy again, `mailbot reverify`
+re-probes everything whose verdict was a failed probe, suppresses any address
+that turns out to be dead, and puts companies parked during the outage back in
+the enrich queue. It never touches anyone who has already been written to.
 
 Enrichment stays separate for its own reason: it makes slow calls to third
 parties, and a single hung request should never eat the send window.

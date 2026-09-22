@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 from .models import (
-    BOUNCED, CATCHALL, Company, Contact, ENRICHED, NO_CONTACTS,
+    BOUNCED, CATCHALL, Company, Contact, ENRICHED, NO_CONTACTS, PENDING,
     QUEUED, REPLIED, SENT, SUPPRESSED, VERIFIED,
 )
 
@@ -141,9 +141,18 @@ def _now() -> str:
 
 
 class Database:
+    # Scheduled jobs overlap by design: drafting runs every two hours, sending
+    # every fifteen minutes, and both carry a wake trigger that fires them at
+    # the same instant. WAL keeps readers out of the way, but two writers still
+    # collide, and the stdlib default of five seconds is short enough that a
+    # run could die on a lock held by a sibling doing IMAP work.
+    BUSY_TIMEOUT_SECONDS = 30
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
-        self.conn = sqlite3.connect(self.path)
+        self.conn = sqlite3.connect(self.path, timeout=self.BUSY_TIMEOUT_SECONDS)
+        self.conn.execute(
+            f"PRAGMA busy_timeout = {self.BUSY_TIMEOUT_SECONDS * 1000}")
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self._migrate()
@@ -565,6 +574,31 @@ class Database:
             return 0.0
         return 100.0 * int(row["bounced"] or 0) / total
 
+    def bounces_on(self, local_date: str) -> tuple[int, list[sqlite3.Row]]:
+        """How many went out on a day, and which of them have since bounced.
+
+        Attributed to the day the message was sent rather than the day the
+        failure notice arrived, because the question being asked is "was
+        anything wrong with what we sent that day". Notices normally land
+        within seconds, so by the time the window closes the picture is
+        complete; one that arrives later simply lands in the next day's count.
+        """
+        total = int(self.conn.execute(
+            "SELECT COUNT(*) FROM sends WHERE local_date = ? AND status = 'sent'",
+            (local_date,),
+        ).fetchone()[0])
+        rows = self.conn.execute(
+            """SELECT DISTINCT s.email, c.confidence, c.verify_status,
+                      c.verify_detail, co.name AS company_name
+               FROM sends s
+               JOIN contacts c ON c.id = s.contact_id
+               LEFT JOIN companies co ON co.id = c.company_id
+               WHERE s.local_date = ? AND s.status = 'sent' AND c.status = ?
+               ORDER BY s.id""",
+            (local_date, BOUNCED),
+        ).fetchall()
+        return total, rows
+
     def sends_on(self, local_date: str) -> list[sqlite3.Row]:
         return self.conn.execute(
             """SELECT s.*, co.name AS company_name, c.first_name, c.role
@@ -594,6 +628,94 @@ class Database:
         return self.conn.execute(
             "SELECT * FROM domain_cache WHERE domain = ?", (domain.lower(),)
         ).fetchone()
+
+    def clear_unproven_catchall(self) -> int:
+        """Drop cached "not a catch-all" verdicts so they get proved again.
+
+        A catch-all verdict needed a real 250 to be recorded, so those rows are
+        evidence. The opposite verdict used to be written even when the probe
+        got no answer at all, which is a guess, and mx_host reloads it forever.
+        There is no way to tell the sound rows from the poisoned ones after the
+        fact, so every negative is dropped and re-probed on demand.
+        """
+        cur = self.conn.execute("DELETE FROM domain_cache WHERE catchall = 0")
+        self.conn.commit()
+        return cur.rowcount
+
+    # ---------- recovery ----------
+
+    # Verdicts that mean "the mailbox server never actually answered". They are
+    # not findings about the address, only a record of a probe that failed, so
+    # they are worth retrying once probing works again.
+    #
+    # Unanchored on purpose. The HN importer prefixes its own provenance, so
+    # the verdict reads "published on HN: no SMTP answer (0); ...", and a
+    # pattern anchored at the start of the string skipped every one of them.
+    UNPROVEN_DETAILS = ("%no SMTP answer%", "%inconclusive%", "%probing paused%")
+
+    # Both states carry outage-era verdicts. A queued contact already has a
+    # rendered draft waiting to be sent, which makes it the more urgent of the
+    # two: leaving those unchecked is what put two dead addresses on the wire.
+    REVERIFY_STATES = (PENDING, QUEUED)
+
+    def contacts_needing_reverify(self, limit: int = 0) -> list[sqlite3.Row]:
+        """Contacts whose verdict records a failed probe rather than a mailbox.
+
+        Queued first, because a draft already exists for those and the next
+        send tick will put it on the wire.
+        """
+        clauses = " OR ".join("c.verify_detail LIKE ?" for _ in self.UNPROVEN_DETAILS)
+        states = ",".join("?" for _ in self.REVERIFY_STATES)
+        sql = (
+            "SELECT c.*, co.name AS company_name FROM contacts c "
+            "LEFT JOIN companies co ON co.id = c.company_id "
+            f"WHERE c.status IN ({states}) AND ({clauses}) "
+            "ORDER BY (c.status = ?) DESC, COALESCE(co.priority, 0) DESC, "
+            "c.confidence DESC, c.id"
+        )
+        args: list = [*self.REVERIFY_STATES, *self.UNPROVEN_DETAILS, QUEUED]
+        if limit:
+            sql += " LIMIT ?"
+            args.append(limit)
+        return self.conn.execute(sql, tuple(args)).fetchall()
+
+    # Failures that were really the prober giving up rather than the company
+    # being unreachable. A company parked for one of these deserves another
+    # pass now that probing works; "no MX record" is a genuine finding and is
+    # deliberately absent.
+    RETRYABLE_SKIPS = (
+        "no candidate address accepted",
+        "catch-all domain, guesses unprovable",
+    )
+
+    def drop_draft_for_contact(self, contact_id: int) -> int:
+        """Take a rendered draft out of play after its address proved dead.
+
+        Suppression alone already stops the scheduled send, because
+        queued_drafts joins on the contact still being queued. This also marks
+        the draft itself, which is what makes stale_mirrors pick it up so the
+        copy sitting in Gmail Drafts is deleted too. Without that the copy
+        stays on the phone, one tap from being sent by hand.
+        """
+        cur = self.conn.execute(
+            "UPDATE drafts SET status = 'skipped' WHERE contact_id = ? "
+            "AND status = 'queued'",
+            (contact_id,),
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def reopen_for_enrich(self, reasons: Iterable[str] = ()) -> int:
+        """Put companies parked on a retryable reason back into the enrich queue."""
+        reasons = tuple(reasons) or self.RETRYABLE_SKIPS
+        marks = ",".join("?" for _ in reasons)
+        cur = self.conn.execute(
+            f"""UPDATE companies SET status = 'new', skip_reason = ''
+                WHERE status = ? AND skip_reason IN ({marks})""",
+            (NO_CONTACTS, *reasons),
+        )
+        self.conn.commit()
+        return cur.rowcount
 
     # ---------- misc ----------
 

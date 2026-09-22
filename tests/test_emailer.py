@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from src.emailer import (
-    greeting_name,
+    greeting_name, strip_re_prefix,
     Template, build_message, extract_bounced_addresses, in_send_window,
     is_hard_bounce, load_template, pace_delay, unedited_markers,
     validate_template,
@@ -339,3 +339,26 @@ def test_recipient_window_still_refuses_weekends():
 ])
 def test_greeting_name(company, expected):
     assert greeting_name(company) == expected
+
+
+# ------------------------------------------- reply prefixes on a follow-up
+
+@pytest.mark.parametrize("subject,expected", [
+    ("Re: Research internship", "Research internship"),
+    ("RE: re: Re: Hi", "Hi"),
+    ("re:Summer 2027", "Summer 2027"),
+    ("Research internship at Acme", "Research internship at Acme"),
+    ("Reaching out about an internship", "Reaching out about an internship"),
+    ("Regarding your team", "Regarding your team"),
+    ("", ""),
+])
+def test_only_a_real_reply_prefix_is_stripped(subject, expected):
+    """A prefix, not a bag of characters.
+
+    Every follow-up subject is rebuilt as "Re: " plus the original. The old
+    version used str.lstrip("Re: "), which strips any leading R, e, colon or
+    space, so a first email titled "Research internship" came back to the
+    recipient as "Re: search internship".
+    """
+    assert strip_re_prefix(subject) == expected
+

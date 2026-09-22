@@ -127,6 +127,12 @@ class Settings:
     send_ramp_start: int
     send_ramp_step: int
     send_ramp_max_bounce_pct: int
+    # A single day's bounce rate, checked once the window has closed. The ramp
+    # brake above reads the last hundred sends, which is the right measure for
+    # sender reputation but far too slow to notice one bad day: two bounces in
+    # twenty-one sends is 9.5% today and barely moves a hundred-send average.
+    daily_bounce_alert_pct: int
+    daily_bounce_alert_min_sends: int
     send_delay_seconds: int
     dry_run: bool
     send_window_start: dtime
@@ -205,6 +211,8 @@ class Settings:
             send_ramp_start=_int("SEND_RAMP_START", 8),
             send_ramp_step=_int("SEND_RAMP_STEP", 2),
             send_ramp_max_bounce_pct=_int("SEND_RAMP_MAX_BOUNCE_PCT", 5),
+            daily_bounce_alert_pct=_int("DAILY_BOUNCE_ALERT_PCT", 15),
+            daily_bounce_alert_min_sends=_int("DAILY_BOUNCE_ALERT_MIN_SENDS", 3),
             send_delay_seconds=_int("SEND_DELAY_SECONDS", 20),
             dry_run=_bool("DRY_RUN", True),
             send_window_start=_clock("SEND_WINDOW_START", "08:30"),

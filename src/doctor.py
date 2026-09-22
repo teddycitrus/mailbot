@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import imaplib
 import smtplib
+import socket
 import ssl
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,16 +107,71 @@ def _github(settings) -> Check:
         return Check("github token", WARN, f"{type(exc).__name__}: {exc}")
 
 
-def _template(settings) -> Check:
+def _one_template(label: str, path, required: bool) -> Check:
+    """Load, validate, and refuse anything still carrying an unedited hole."""
+    if not Path(path).exists():
+        return (Check(label, FAIL, f"missing at {path}") if required
+                else Check(label, WARN, f"no {path}, that feature is off"))
     try:
-        tpl = load_template(settings.template_path)
+        tpl = load_template(path)
         validate_template(tpl)
-    except (ValueError, FileNotFoundError, OSError) as exc:
-        return Check("template", FAIL, str(exc)[:120])
-    holes = unedited_markers(f"{tpl.subject}\n{tpl.body}")
+    except (ValueError, OSError) as exc:
+        return Check(label, FAIL, str(exc)[:120])
+    holes = unedited_markers(tpl.subject + chr(10) + tpl.body)
     if holes:
-        return Check("template", FAIL, f"unedited placeholders: {holes[:2]}")
-    return Check("template", OK, str(settings.template_path))
+        return Check(label, FAIL, f"unedited placeholders: {holes[:2]}")
+    return Check(label, OK, str(path))
+
+
+def _templates(settings) -> list[Check]:
+    """Every template that can reach a real person, held to the same standard.
+
+    Only the first-contact template used to be checked. An unedited [BRACKET]
+    in the follow-up or reply file went out unchallenged, because the send
+    path's own guard covers queued drafts and neither of those is one.
+    """
+    return [
+        _one_template("template", settings.template_path, required=True),
+        _one_template("followup template", settings.followup_template_path,
+                      required=bool(getattr(settings, "followup_enabled", False))),
+        _one_template("reply template", settings.reply_template_path,
+                      required=False),
+    ]
+
+
+# Any mail exchanger will do: the question is whether this machine can open an
+# outbound connection on port 25 at all, not whether one host is up.
+PORT25_FALLBACK = "gmail-smtp-in.l.google.com"
+
+
+def _port25(settings) -> Check:
+    """Can we still reach port 25 outbound? Verification is nothing without it.
+
+    Worth its own check because losing it is invisible. Probes simply stop
+    answering, every address falls back to "trusting published source" at a
+    lower confidence, and companies that were perfectly reachable get filed as
+    "no candidate address accepted". Nothing fails; the funnel quietly drains.
+    Residential ISPs and hotel networks block this port as a matter of course.
+    """
+    host = PORT25_FALLBACK
+    domain = settings.from_email.split("@")[-1] if settings.from_email else ""
+    if domain:
+        try:
+            from .verifier import Verifier
+            host = Verifier().mx_host(domain) or PORT25_FALLBACK
+        except Exception:
+            host = PORT25_FALLBACK
+    try:
+        with socket.create_connection((host, 25), timeout=10) as sock:
+            banner = sock.recv(120).decode("utf-8", "replace").strip()
+        if not banner.startswith("220"):
+            return Check("smtp probe port 25", WARN, f"{host} said {banner[:40]!r}")
+        return Check("smtp probe port 25", OK, f"{host} reachable")
+    except Exception as exc:
+        return Check("smtp probe port 25", FAIL,
+                     f"cannot reach {host}:25 ({type(exc).__name__}). Address "
+                     "verification cannot work; every contact drops to guessed "
+                     "confidence and enrichment silently loses companies")
 
 
 def _resume(settings) -> Check:
@@ -148,6 +204,38 @@ def _queue(settings, db) -> Check:
                      f"{queued} queued, below the daily limit of "
                      f"{settings.daily_send_limit}; {pool} companies still to enrich")
     return Check("queue", OK, f"{queued} queued, {pool} companies still to enrich")
+
+
+def _verification(db) -> Check:
+    """Is the prober proving anything, or only recording its own failures?
+
+    Reads the verdicts themselves. "no SMTP answer" is not a finding about a
+    mailbox, it is a record of a probe that never completed, and a pool made
+    mostly of those means verification has stopped working however healthy
+    every other check looks. This is the check that would have caught the
+    throttle latch on the day it started instead of months later.
+    """
+    row = db.conn.execute(
+        """SELECT COUNT(*) AS total,
+                  SUM(CASE WHEN verify_detail LIKE 'no SMTP answer%'
+                            OR verify_detail LIKE 'inconclusive%'
+                            OR verify_detail LIKE '%probing paused%'
+                           THEN 1 ELSE 0 END) AS unproven
+           FROM (SELECT verify_detail FROM contacts ORDER BY id DESC LIMIT 200)"""
+    ).fetchone()
+    total = int(row["total"] or 0)
+    if total < 20:
+        return Check("verification", WARN, f"only {total} contacts, too few to judge")
+    unproven = int(row["unproven"] or 0)
+    pct = 100.0 * unproven / total
+    detail = f"{unproven}/{total} newest contacts never got an SMTP answer"
+    if pct >= 60:
+        return Check("verification", FAIL, detail +
+                     ". Probing is broken or blocked; once it is fixed, run "
+                     "'mailbot reverify' to recover the pool")
+    if pct >= 25:
+        return Check("verification", WARN, detail)
+    return Check("verification", OK, f"{100 - pct:.0f}% of recent probes answered")
 
 
 def _mirror(settings) -> Check:
@@ -195,17 +283,19 @@ def _priority(settings) -> Check:
 
 
 def run_checks(settings: Settings) -> list[Check]:
-    checks = [_template(settings), _resume(settings)]
+    checks = [*_templates(settings), _resume(settings)]
     try:
         settings.require_for_send()
         checks.append(Check("send config", OK, f"backend={settings.email_backend}"))
     except ConfigError as exc:
         checks.append(Check("send config", FAIL, str(exc)))
     checks += [_smtp(settings), _imap(settings), _mirror(settings),
-               _priority(settings), _groq(settings), _github(settings)]
+               _port25(settings), _priority(settings), _groq(settings),
+               _github(settings)]
     try:
         db = Database(settings.db_path)
         checks.append(_queue(settings, db))
+        checks.append(_verification(db))
         db.close()
     except Exception as exc:
         checks.append(Check("database", FAIL, f"{type(exc).__name__}: {exc}"))

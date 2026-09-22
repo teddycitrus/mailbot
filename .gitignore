@@ -2,6 +2,7 @@
 *.db
 *.db-wal
 *.db-shm
+*.lock
 assets/*.pdf
 __pycache__/
 *.pyc

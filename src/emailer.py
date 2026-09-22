@@ -17,7 +17,6 @@ import random
 import re
 import smtplib
 import ssl
-import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -99,6 +98,18 @@ def with_resume_link(body: str, url: str) -> str:
     if not url or has_resume_link(body, url):
         return body
     return body.rstrip("\n") + f"\n{resume_link_line(url)}\n"
+
+
+# "Re: " repeated any number of times, as a prefix. str.lstrip("Re: ") looks
+# like it does this but strips a character *set*, so it ate the front of any
+# subject that merely began with one of those letters: "Research internship"
+# came back as "search internship".
+RE_PREFIX = re.compile(r"(?i)^\s*(re\s*:\s*)+")
+
+
+def strip_re_prefix(subject: str) -> str:
+    """The subject without its reply prefixes, for rebuilding one."""
+    return RE_PREFIX.sub("", subject or "").strip()
 
 
 UNEDITED_MARKER = re.compile(r"\[[A-Z][A-Z0-9 ,.'-]{3,}\]")
@@ -396,7 +407,7 @@ def draft_defect(draft, settings) -> str:
     # A draft carrying the hosted link instead of the PDF is complete: that is
     # the fallback the queue applies when there is nothing to attach. One or
     # the other must be there, never neither.
-    if str(settings.resume_path) and not attachments and not has_resume_link(draft["body"]):
+    if not attachments and not has_resume_link(draft["body"], settings.resume_link):
         return "no resume attached"
     if any(not Path(a).exists() for a in attachments) and not settings.resume_link:
         return "attachment file is missing"
@@ -507,7 +518,6 @@ def make_backend(settings):
 
 # --------------------------------------------------------------- bounces
 
-BOUNCE_SENDERS = ("mailer-daemon", "postmaster", "mail delivery subsystem")
 HARD_BOUNCE_CODES = ("5.1.1", "5.1.2", "5.1.10", "5.2.1", "5.4.1", "550", "553")
 ADDR_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 FAILURE_WORDS = re.compile(
@@ -538,43 +548,3 @@ def extract_bounced_addresses(raw_message: str, own_domain: str = "") -> set[str
 def is_hard_bounce(raw_message: str) -> bool:
     lowered = raw_message.lower()
     return any(code in lowered for code in HARD_BOUNCE_CODES)
-
-
-def scan_bounces(settings, db, limit: int = 200) -> list[tuple[str, bool]]:
-    """Read the mailbox for delivery failures and suppress the addresses."""
-    import imaplib
-    import email as email_lib
-
-    results: list[tuple[str, bool]] = []
-    own_domain = settings.from_email.split("@")[-1] if settings.from_email else ""
-    conn = imaplib.IMAP4_SSL(settings.imap_host, settings.imap_port)
-    try:
-        conn.login(settings.imap_user, settings.imap_pass)
-        conn.select("INBOX")
-        seen: set[str] = set()
-        for term in ('(FROM "mailer-daemon")', '(FROM "postmaster")',
-                     '(SUBJECT "Undelivered")', '(SUBJECT "Delivery Status")'):
-            typ, data = conn.search(None, term)
-            if typ != "OK" or not data or not data[0]:
-                continue
-            for uid in data[0].split()[-limit:]:
-                if uid in seen:
-                    continue
-                seen.add(uid)
-                typ, payload = conn.fetch(uid, "(RFC822)")
-                if typ != "OK" or not payload or not isinstance(payload[0], tuple):
-                    continue
-                raw = payload[0][1].decode("utf-8", errors="replace")
-                hard = is_hard_bounce(raw)
-                for addr in extract_bounced_addresses(raw, own_domain):
-                    if db.find_contact_by_email(addr) is None:
-                        continue
-                    db.suppress(addr, "hard bounce" if hard else "soft bounce")
-                    db.log("bounce", addr, "hard" if hard else "soft")
-                    results.append((addr, hard))
-    finally:
-        try:
-            conn.logout()
-        except Exception:
-            pass
-    return results

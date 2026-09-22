@@ -2,9 +2,11 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\install_schedule.ps1
 #
 # Five jobs, deliberately separated:
+#   mailbot-health  every day 07:45            check everything, alert if broken
 #   mailbot-draft   every day 06:00-23:00 /2h  render drafts, copy to Gmail
 #   mailbot-prep    weekday 08:25              full mailbox scan
 #   mailbot-send    weekday 08:30-13:30 /15m   send two messages per tick
+#   mailbot-bounce  weekday 13:45             judge the day's bounce rate
 #   mailbot-build   every day 19:30            slow, discover + enrich
 #   mailbot-digest  Friday  17:00              weekly summary email
 #
@@ -19,6 +21,8 @@
 # Triggers fire on this machine's local clock. The bot separately refuses to
 # send outside SEND_WINDOW_START..SEND_WINDOW_END in the recipient's own zone,
 # so a tick that fires when nobody's window is open simply sends nothing.
+
+$ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 $weekdays = @("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
@@ -99,30 +103,37 @@ function Install-MailbotTask {
         # and covers the weekend too, so a tick at a useless moment costs a
         # few seconds and sends nothing -- which makes these triggers free to
         # add and the day's sends no longer a bet on the lid being open.
+        # New-CimInstance -ClassName builds an object whose PSTypeName is
+        # plain MSFT_TaskEventTrigger, and Register-ScheduledTask -Trigger
+        # will not bind that: it wants the MSFT_TaskTrigger name too. Only an
+        # instance built from the CimClass itself carries both. The -ClassName
+        # form fails at registration time, which is exactly how every task
+        # carrying a wake trigger silently failed to register.
         $ns = "Root/Microsoft/Windows/TaskScheduler"
+        $eventClass = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace $ns
+        $sessionClass = Get-CimClass -ClassName MSFT_TaskSessionStateChangeTrigger `
+            -Namespace $ns
 
         # Kernel-Power 107: the system has resumed from a low power state.
         # One minute of delay so the network is back before we try SMTP.
         $resumeQuery = "<QueryList><Query Id='0' Path='System'><Select " +
             "Path='System'>*[System[Provider[@Name='Microsoft-Windows-Kernel-Power']" +
             " and EventID=107]]</Select></Query></QueryList>"
-        $triggers += New-CimInstance -ClassName MSFT_TaskEventTrigger `
-            -Namespace $ns -ClientOnly -Property @{
-                Enabled      = $true
-                Subscription = $resumeQuery
-                Delay        = "PT1M"
-            }
+        $resume = New-CimInstance -CimClass $eventClass -ClientOnly
+        $resume.Enabled = $true
+        $resume.Subscription = $resumeQuery
+        $resume.Delay = "PT1M"
+        $triggers += $resume
 
         # And on unlock, which is what a lid opened on a locked session looks
         # like. Belt and braces: whichever of the two arrives first wins, and
         # the second one no-ops because the first already sent this tick's two.
-        $triggers += New-CimInstance -ClassName MSFT_TaskSessionStateChangeTrigger `
-            -Namespace $ns -ClientOnly -Property @{
-                Enabled     = $true
-                StateChange = 8
-                UserId      = "$env:USERDOMAIN\$env:USERNAME"
-                Delay       = "PT1M"
-            }
+        $unlock = New-CimInstance -CimClass $sessionClass -ClientOnly
+        $unlock.Enabled = $true
+        $unlock.StateChange = 8
+        $unlock.UserId = "$env:USERDOMAIN\$env:USERNAME"
+        $unlock.Delay = "PT1M"
+        $triggers += $unlock
     }
 
     # WakeToRun is set here, but it is inert unless the machine's power scheme
@@ -131,6 +142,11 @@ function Install-MailbotTask {
     #   powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1
     #   powercfg /setactive SCHEME_CURRENT
     $settingArgs = @{
+        # A run that overruns its slot must not be joined by the next one. The
+        # jobs also serialise against each other through the lock in
+        # src/locking.py; this stops a task racing itself, which that lock
+        # would otherwise turn into a skipped run rather than a queued one.
+        MultipleInstances          = "IgnoreNew"
         StartWhenAvailable         = $true
         WakeToRun                  = $true
         DontStopIfGoingOnBatteries = $true
@@ -194,6 +210,23 @@ Install-MailbotTask -Name "mailbot-send" -Script "scripts\daily_run.ps1" `
     -Arguments "-Mode tick" -At "8:30am" -CatchUpOnWake `
     -RepeatEveryMinutes 15 -RepeatForHours 5 -TimeLimitMinutes 10 `
     -Description "Mailbot: send queued outreach, paced"
+
+# Before the first window opens, every day including weekends: a credential
+# that died on Saturday should not be discovered by Monday's silence. Carries
+# the wake trigger for the same reason the send job does, so a laptop that
+# slept through 07:45 still checks in when it comes back.
+Install-MailbotTask -Name "mailbot-health" -Script "scripts\health_run.ps1" `
+    -At "7:45am" -DaysOfWeek $alldays -CatchUpOnWake -TimeLimitMinutes 15 `
+    -RestartCount 2 -RestartMinutes 5 `
+    -Description "Mailbot: daily health check, alerts if anything is broken"
+
+# Fifteen minutes after the last send tick of the day. The ramp brake reads
+# the last hundred sends and cannot see one bad day inside that; this judges
+# the day on its own and mails you when it crosses DAILY_BOUNCE_ALERT_PCT.
+# Weekday only, because sending is weekday only.
+Install-MailbotTask -Name "mailbot-bounce" -Script "scripts\bounce_report.ps1" `
+    -At "1:45pm" -TimeLimitMinutes 20 -RestartCount 2 -RestartMinutes 5 `
+    -Description "Mailbot: alert if the day bounced too much"
 
 Install-MailbotTask -Name "mailbot-build" -Script "scripts\nightly_build.ps1" `
     -At "7:30pm" -DaysOfWeek $alldays `

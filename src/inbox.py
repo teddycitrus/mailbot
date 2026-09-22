@@ -31,7 +31,7 @@ from typing import Optional
 
 from .emailer import (
     Template, build_message, extract_bounced_addresses, is_hard_bounce,
-    load_template, validate_template,
+    load_template, strip_re_prefix, validate_template,
 )
 from .models import BOUNCED, REPLIED
 from .verifier import first_name_from_email
@@ -55,8 +55,6 @@ QUOTE_MARKERS = (
 AUTO_REPLY_SUBJECT = re.compile(
     r"(?i)^\s*(automatic reply|auto[- ]?reply|autoreply|auto:|out of (the )?office)"
 )
-
-RE_PREFIX = re.compile(r"(?i)^\s*(re\s*:\s*)+")
 
 # One LIST response line: flags, hierarchy delimiter, mailbox name.
 LIST_LINE = re.compile(rb'^\((?P<flags>[^)]*)\)\s+(?:"[^"]*"|NIL)\s+(?P<name>.+)$')
@@ -173,7 +171,7 @@ def build_reply_draft(template: Template, settings, incoming, first_name: str,
         # The name as stored. greeting_name would cut "Acme Data Co." down to
         # "Acme Data", which is not what the company is called.
         "company": company.strip() or "[company]",
-        "original_subject": RE_PREFIX.sub("", header_text(incoming.get("Subject", ""))),
+        "original_subject": strip_re_prefix(header_text(incoming.get("Subject", ""))),
         "sender_name": settings.from_name,
         "sender_email": settings.from_email,
     })

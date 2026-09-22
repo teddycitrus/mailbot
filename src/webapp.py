@@ -318,6 +318,19 @@ def static_root() -> Path:
 
 FILENAME_RE = re.compile(rb'filename="([^"]*)"')
 
+# The console binds to loopback, which stops another machine reaching it but
+# not a web page open in this one. A page cannot read a cross-origin reply, but
+# it does not need to: POST /api/setup writes the SMTP password and POST
+# /api/resume writes a file, and both take effect whether or not the attacker
+# ever sees the response. DNS rebinding gets past the bind the same way. So the
+# API answers only requests that name loopback in Host, and refuses any Origin
+# that is not loopback.
+LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
+
+
+def _is_loopback(hostname: str) -> bool:
+    return hostname.strip("[]").strip().lower() in LOOPBACK_NAMES
+
 
 def uploaded_filename(part: bytes) -> str:
     """The client's own name for an uploaded file, reduced to a safe PDF name.
@@ -364,10 +377,22 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(length) if length else b""
 
+    def _from_loopback(self) -> bool:
+        """Is this API call coming from a page served by this console?"""
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
+        if host and not _is_loopback(host):
+            return False
+        origin = self.headers.get("Origin") or ""
+        if origin and not _is_loopback(urlparse(origin).hostname or ""):
+            return False
+        return True
+
     # ---------- routes ----------
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        if path.startswith("/api/") and not self._from_loopback():
+            return self._error("forbidden", 403)
         try:
             if path == "/api/setup":
                 return self._json(setup_state())
@@ -394,6 +419,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        if not self._from_loopback():
+            return self._error("forbidden", 403)
         try:
             if path == "/api/setup":
                 payload = json.loads(self._body() or b"{}")
@@ -419,7 +446,7 @@ class Handler(BaseHTTPRequestHandler):
                 500)
         rel = path.lstrip("/") or "index.html"
         target = (root / rel).resolve()
-        if not str(target).startswith(str(root.resolve())):
+        if not target.is_relative_to(root.resolve()):
             return self._error("forbidden", 403)   # no traversal out of the bundle
         if not target.is_file():
             target = root / "index.html"           # single page app fallback

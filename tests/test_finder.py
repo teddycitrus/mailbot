@@ -148,6 +148,23 @@ def test_strips_mailto_query_and_trailing_punctuation():
     assert extract_emails(html, "acme.ai") == {"hello@acme.ai"}
 
 
+def test_an_address_escaped_inside_a_json_blob_is_decoded_first():
+    """A real address found in the wild, and the bounce it was headed for.
+
+    Sites that ship their content in a __NEXT_DATA__ payload escape the
+    punctuation around a mailto. Matching the raw source swallowed the escape
+    into the local part and stored u003elegal@example.com, which scores like
+    any other published address and is addressed to nobody.
+    """
+    blob = '{"html":"\\\\u003ca href=\\\\u003emailto:legal@acme.ai\\\\u003c/a"}'
+    assert extract_emails(blob, "acme.ai") == {"legal@acme.ai"}
+
+
+def test_html_entities_around_an_address_are_decoded():
+    assert extract_emails("write to &lt;sam@acme.ai&gt; today",
+                          "acme.ai") == {"sam@acme.ai"}
+
+
 def test_enrich_handles_a_company_with_no_yc_url(tmp_path):
     """html is reused for GitHub org detection, so it must always be bound."""
     from src.database import Database

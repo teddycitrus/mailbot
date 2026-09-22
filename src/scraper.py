@@ -9,6 +9,7 @@ Requests are rate limited and capped, identify themselves honestly in the User
 from __future__ import annotations
 
 import re
+from html import unescape as html_unescape
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
@@ -19,6 +20,14 @@ from bs4 import BeautifulSoup
 from .ratelimit import Budget, RateLimiter
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+# Punctuation inside an embedded JSON blob arrives escaped. A site that
+# ships its content in a __NEXT_DATA__ payload writes ">" as a >
+# sequence, so a mailto written that way matched the address pattern
+# starting at the "u003e" and produced u003elegal@acme.ai: a local part
+# that does not exist, scored like any other published address, and
+# bound for a bounce.
+JSON_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
 IMAGE_SUFFIX = (".png", ".jpg", ".jpeg", ".svg", ".webp", ".gif", ".ico")
 
 # Pages most likely to carry a human address, cheapest guesses first.
@@ -191,6 +200,17 @@ def _fallback_founders(soup: BeautifulSoup) -> list[Person]:
     return people
 
 
+def decode_escapes(text: str) -> str:
+    """Undo JSON and HTML escaping so an address is readable before matching.
+
+    Decoding first is the whole point. Running the pattern over the raw
+    source lets an escape sequence become part of the local part, and the
+    result looks like a perfectly ordinary address right up to the bounce.
+    """
+    text = JSON_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), text)
+    return html_unescape(text)
+
+
 def extract_emails(html: str, domain: str) -> set[str]:
     """On-domain addresses only. Third-party addresses are noise or trackers."""
     found: set[str] = set()
@@ -199,7 +219,7 @@ def extract_emails(html: str, domain: str) -> set[str]:
         raw = anchor.get("href", "")[7:].split("?")[0].strip().rstrip(").,;")
         if raw:
             found.add(raw.lower())
-    for match in EMAIL_RE.findall(html):
+    for match in EMAIL_RE.findall(decode_escapes(html)):
         found.add(match.lower().rstrip(").,;"))
     domain = domain.lower()
     return {

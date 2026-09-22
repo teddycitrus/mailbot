@@ -28,8 +28,8 @@ except ImportError:  # pragma: no cover - dnspython is in requirements
     dns = None  # type: ignore
 
 from .models import (
-    CATCHALL, NO_MX, ROLE_LOCALS, SRC_INFERRED, SRC_SCRAPED, UNDELIVERABLE,
-    UNVERIFIED, VERIFIED,
+    CATCHALL, NO_MX, ROLE_LOCALS, SRC_SCRAPED, UNDELIVERABLE, UNVERIFIED,
+    VERIFIED,
 )
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
@@ -139,7 +139,11 @@ def first_name_from_email(email: str) -> str:
 class Verifier:
     """MX and SMTP checks with a per-domain cache to avoid re-probing."""
 
-    # Consecutive connection failures before we accept we are being throttled.
+    # Connection failures *in a row* before we accept we are being throttled.
+    # In a row, not in total: a run that probes ninety companies meets a
+    # handful of dead hosts in the ordinary course of things, and counting
+    # those against one lifetime budget silently turned verification off
+    # partway through every long run. The reset lives in _rcpt.
     TIMEOUT_BUDGET = 5
 
     def __init__(self, db=None, helo_domain: str = "example.com",
@@ -194,6 +198,12 @@ class Verifier:
             return False
         probe = f"zz{uuid.uuid4().hex[:12]}@{domain}"
         code = self._rcpt(host, [probe]).get(probe, (0, b""))[0]
+        if not code:
+            # The server never answered, so we learned nothing. Recording
+            # "not a catch-all" here would be a guess written down as fact,
+            # and mx_host reloads it on every later run, so the guess would
+            # outlive the outage that caused it. Answer for this call only.
+            return False
         result = code == 250
         self._catchall[domain] = result
         if self.db is not None:
@@ -334,6 +344,11 @@ class Verifier:
             server = smtplib.SMTP(host, 25, timeout=self.timeout)
             server.ehlo(self.helo_domain)
             server.mail(self.mail_from)
+            # A completed handshake proves we are not being throttled, so the
+            # failure streak starts again from zero. Without this the budget
+            # was a lifetime allowance rather than a streak, and five dead
+            # hosts scattered across a long run stopped all further probing.
+            self.timeouts = 0
             for addr in addresses:
                 try:
                     results[addr] = server.rcpt(addr)
