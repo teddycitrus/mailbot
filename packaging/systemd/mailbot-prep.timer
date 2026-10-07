@@ -1,0 +1,10 @@
+[Unit]
+Description=mailbot prep, the full mailbox scan before the send window
+
+[Timer]
+Unit=mailbot@prep.service
+OnCalendar=Mon-Fri *-*-* 08:25:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

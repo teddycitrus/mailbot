@@ -1,0 +1,10 @@
+[Unit]
+Description=mailbot weekly digest
+
+[Timer]
+Unit=mailbot@digest.service
+OnCalendar=Fri *-*-* 17:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

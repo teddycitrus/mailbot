@@ -1,0 +1,10 @@
+[Unit]
+Description=mailbot bounce report
+
+[Timer]
+Unit=mailbot@bounce.service
+OnCalendar=Mon-Fri *-*-* 13:45:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

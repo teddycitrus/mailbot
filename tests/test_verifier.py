@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+import socket
+import threading
+from types import SimpleNamespace
+
+import dns.exception
+import dns.resolver
 import pytest
 
+from src.database import Database
+from src.finder import _why_empty
 from src.models import (
-    CATCHALL, NO_MX, SRC_INFERRED, SRC_SCRAPED, UNDELIVERABLE, UNVERIFIED,
-    VERIFIED,
+    CATCHALL, NO_MX, SKIP_MX_UNRESOLVED, SKIP_NO_MX, SKIP_PROBE_UNAVAILABLE,
+    SRC_INFERRED, SRC_SCRAPED, UNDELIVERABLE, UNVERIFIED, VERIFIED,
 )
 from src.verifier import (
-    Verifier, candidate_addresses, first_name_from_email, is_never_send,
-    is_role_account, valid_syntax,
+    RelayDown, Verifier, candidate_addresses, first_name_from_email,
+    is_never_send, is_role_account, parse_relay, port25_reachable,
+    socks5_connect, valid_syntax,
 )
 
 
@@ -42,6 +51,11 @@ def test_role_and_never_send_classification():
     "jobs.no-reply@acme.ai",
     "do-not-reply@acme.ai",
     "bounces+7a1f@acme.ai",
+    # Reaches a person, but a ticket queue is never the right person.
+    "support@acme.ai",
+    "Support@acme.ai",
+    "product-support@acme.ai",
+    "support.eu@acme.ai",
     "mailer-daemon@acme.ai",
     "1234+bob@users.noreply.github.com",
     "ticket-88@reply.acme.ai",
@@ -344,3 +358,177 @@ def test_first_name_recovered_from_address(email, expected):
 ])
 def test_first_name_declines_when_not_a_person(email):
     assert first_name_from_email(email) == ""
+
+
+# ------------------------------- a lookup that failed is not a fact about the
+# domain. On 2026-09-22 the machine lost DNS at 09:00, every MX query raised,
+# and the enrich pass retired ninety companies as "domain has no MX record" --
+# a reason deliberately kept out of RETRYABLE_SKIPS, so none of them would ever
+# have been looked at again.
+
+def _raising(exc):
+    def boom(_domain, _rdtype):
+        raise exc
+    return boom
+
+
+@pytest.mark.parametrize("exc", [
+    dns.resolver.NXDOMAIN(),
+    dns.resolver.NoAnswer(),
+])
+def test_a_domain_that_answers_for_itself_is_a_finding(monkeypatch, exc):
+    """No such domain, or no MX on it: the resolver told us something."""
+    monkeypatch.setattr(dns.resolver, "resolve", _raising(exc))
+    assert Verifier(db=None).mx_lookup("acme.ai") == (None, True)
+
+
+@pytest.mark.parametrize("exc", [
+    dns.resolver.NoNameservers(),
+    dns.exception.Timeout(timeout=2.0),
+    OSError("[Errno 11001] getaddrinfo failed"),
+])
+def test_a_lookup_that_never_came_back_is_not(monkeypatch, exc):
+    """SERVFAIL, timeout, no network: nothing was learned about the domain."""
+    monkeypatch.setattr(dns.resolver, "resolve", _raising(exc))
+    assert Verifier(db=None).mx_lookup("acme.ai") == (None, False)
+
+
+def test_a_failed_lookup_is_not_remembered(monkeypatch):
+    """One bad minute must not stand in for the domain for the whole run.
+
+    The outage lasted eighty minutes and the run that met it kept going. A
+    memoised None would have answered for every later company on that domain
+    long after DNS came back.
+    """
+    v = Verifier(db=None)
+    monkeypatch.setattr(dns.resolver, "resolve", _raising(dns.resolver.NoNameservers()))
+    assert v.mx_lookup("acme.ai") == (None, False)
+    assert "acme.ai" not in v._mx
+
+    monkeypatch.setattr(dns.resolver, "resolve", lambda *_: [
+        SimpleNamespace(preference=10, exchange="mx.acme.ai.")
+    ])
+    assert v.mx_lookup("acme.ai") == ("mx.acme.ai", True)
+
+
+def test_the_reason_a_company_is_parked_follows_the_lookup():
+    """The note must say which of the two happened, because one is retryable."""
+    answered = SimpleNamespace(mx_lookup=lambda _d: (None, True))
+    assert _why_empty([], [], answered, "acme.ai") == SKIP_NO_MX
+    assert SKIP_NO_MX not in Database.RETRYABLE_SKIPS
+
+    failed = SimpleNamespace(mx_lookup=lambda _d: (None, False))
+    assert _why_empty([], [], failed, "acme.ai") == SKIP_MX_UNRESOLVED
+    assert SKIP_MX_UNRESOLVED in Database.RETRYABLE_SKIPS
+
+
+# ------------------------------- probing through the laptop relay. The server
+# cannot open port 25 itself, so an SSH tunnel from the laptop hands it a
+# SOCKS5 proxy on loopback. These run a real one-shot SOCKS5 server.
+
+def _fake_relay(banner=b"220 mx.acme.ai ESMTP ready\r\n", reply_code=0):
+    """Serve one SOCKS5 CONNECT, then speak as the mail host. Returns the port."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    seen = {}
+
+    def serve():
+        conn, _ = listener.accept()
+        with conn, listener:
+            conn.recv(3)                                   # greeting
+            conn.sendall(b"\x05\x00")
+            head = conn.recv(5)                            # VER CMD RSV ATYP LEN
+            name = conn.recv(head[4])
+            port = int.from_bytes(conn.recv(2), "big")
+            seen["target"] = (name.decode(), port)
+            conn.sendall(bytes([5, reply_code, 0, 1]) + b"\x00" * 6)
+            if reply_code == 0:
+                conn.sendall(banner)
+
+    threading.Thread(target=serve, daemon=True).start()
+    return listener.getsockname()[1], seen
+
+
+def _closed_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_relay_setting_is_parsed():
+    assert parse_relay("") is None
+    assert parse_relay("127.0.0.1:1080") == ("127.0.0.1", 1080)
+    with pytest.raises(ValueError):
+        parse_relay("1080")
+
+
+def test_a_probe_goes_through_the_relay_by_name():
+    """The laptop resolves the mail host, so the name is passed through."""
+    port, seen = _fake_relay()
+    ok, detail = port25_reachable(("127.0.0.1", port), host="mx.acme.ai", timeout=3)
+    assert ok, detail
+    assert "through the relay" in detail
+    assert seen["target"] == ("mx.acme.ai", 25)
+
+
+def test_a_relay_that_cannot_reach_the_host_is_not_a_dead_relay():
+    """One unreachable mail host says nothing about whether the laptop is on."""
+    port, _ = _fake_relay(reply_code=5)
+    with pytest.raises(OSError) as info:
+        socks5_connect(("127.0.0.1", port), "mx.acme.ai", 25, timeout=3)
+    assert not isinstance(info.value, RelayDown)
+
+
+def test_a_laptop_that_is_off_reads_as_relay_offline():
+    ok, detail = port25_reachable(("127.0.0.1", _closed_port()), timeout=3)
+    assert not ok
+    assert detail.startswith("relay offline")
+
+
+def test_a_dead_relay_pauses_probing_at_once():
+    """No five-timeout streak: every probe after the first would fail the same way.
+
+    Waiting out the streak would park the first few companies of every run as
+    if their guesses had been refused.
+    """
+    v = Verifier(db=None, relay=("127.0.0.1", _closed_port()), timeout=3)
+    v.mx_host = lambda _domain: "mx.acme.ai"
+    verdict = v.verify("aidan@acme.ai", source=SRC_INFERRED)
+    assert verdict.status == UNVERIFIED
+    assert v.throttled
+
+
+def test_a_refused_sender_never_reads_as_a_dead_mailbox(monkeypatch):
+    """A blocklisted network gets 550 on everything. That is about us, not them."""
+    class RefusingSMTP:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def ehlo(self, *_a):
+            return (250, b"ok")
+
+        def mail(self, *_a):
+            return (550, b"5.7.1 client host blocked")
+
+        def rcpt(self, _addr):
+            return (550, b"5.7.1 client host blocked")
+
+        def quit(self):
+            return None
+
+    monkeypatch.setattr("src.verifier.smtplib.SMTP", RefusingSMTP)
+    v = Verifier(db=None)
+    v.mx_host = lambda _domain: "mx.acme.ai"
+    verdict = v.verify("ada@acme.ai", source=SRC_SCRAPED)
+    assert verdict.status != UNDELIVERABLE
+    assert verdict.status == UNVERIFIED
+
+
+def test_a_company_nobody_could_probe_is_parked_as_retryable():
+    """Founders found, no server asked: the guesses were never tested."""
+    answered = SimpleNamespace(mx_lookup=lambda _d: ("mx.acme.ai", True))
+    founders = [SimpleNamespace(first_name="Ada", last_name="Lovelace")]
+    assert _why_empty(founders, [], answered, "acme.ai",
+                      unprobed=True) == SKIP_PROBE_UNAVAILABLE
+    assert SKIP_PROBE_UNAVAILABLE in Database.UNANSWERED_SKIPS

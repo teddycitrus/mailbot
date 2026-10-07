@@ -158,6 +158,9 @@ class Settings:
     # Companies named by hand, which skip the size and age gates and sort
     # ahead of everything else. See priority.py.
     priority_path: Path
+    # host:port of a SOCKS5 relay for SMTP probes, empty to probe directly.
+    # On the server this is the laptop's SSH tunnel; see verifier.py.
+    smtp_probe_relay: str = ""
 
     @classmethod
     def load(cls, env_file: str | os.PathLike[str] | None = ".env") -> "Settings":
@@ -229,6 +232,7 @@ class Settings:
                 "FOLLOWUP_TEMPLATE_PATH", "config/followup.txt"),
             reply_template_path=_path("REPLY_TEMPLATE_PATH", "config/reply.txt"),
             priority_path=_path("PRIORITY_PATH", "config/priority.txt"),
+            smtp_probe_relay=os.getenv("SMTP_PROBE_RELAY", "").strip(),
         )
 
     def daily_cap(self, active_days: int, bounce_pct: float) -> tuple[int, str]:

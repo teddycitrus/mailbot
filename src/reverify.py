@@ -13,7 +13,9 @@ The damage runs two ways, so the repair does too:
              to them.
   companies  a company parked as "no candidate address accepted" during an
              outage was never actually tested. Those go back to status=new for
-             the ordinary enrich stage to try again.
+             the ordinary enrich stage to try again, and so do the ones parked
+             as having no MX record whose domain resolves again now, which is
+             how a morning without DNS gets undone.
 
 Only contacts that have never been written to are touched. Anyone already
 mailed keeps their status untouched, and nothing here can put a second message
@@ -24,7 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .models import UNDELIVERABLE
+from .models import SKIP_NO_MX, UNDELIVERABLE
 from .verifier import Verifier
 
 
@@ -37,6 +39,8 @@ class ReverifyReport:
     cache_cleared: int = 0
     companies_reopened: int = 0
     drafts_pulled: int = 0
+    mx_rechecked: int = 0
+    mx_reopened: int = 0
 
     def rows(self) -> list[tuple]:
         return ([(e, f"{was} -> {now}", "improved", why[:40])
@@ -84,6 +88,41 @@ def reverify_contacts(db, verifier: Verifier, limit: int = 0) -> ReverifyReport:
     return report
 
 
+def recheck_parked_mx(db, verifier: Verifier) -> tuple[int, int]:
+    """Re-resolve companies retired as having no MX, and free the ones that do.
+
+    The verdict is sound when the resolver answered and worthless when it did
+    not, and the parked row does not record which happened. A live lookup
+    settles it: a domain that names a mail host today was never the no-MX
+    case, and whatever outage wrote that row took the company out of the
+    pipeline for good. One DNS query each, and no fetch budget at all.
+
+    A domain that still will not resolve is left where it is. Reopening it
+    would only park it again on the next enrich pass, at the cost of a scrape.
+    """
+    rows = db.companies_parked_on(SKIP_NO_MX)
+    reopened = 0
+    for row in rows:
+        host, answered = verifier.mx_lookup(row["domain"])
+        if answered and host:
+            db.reopen_company(row["id"])
+            reopened += 1
+    return len(rows), reopened
+
+
+def catch_up(db, verifier: Verifier, limit: int = 0) -> ReverifyReport:
+    """Everything that waited for probing, run while probing works.
+
+    The relay job's half of recover. It skips the cache purge, which was a
+    one-off repair, and reopens only companies parked on a probe or lookup
+    that never answered. The findings in RETRYABLE_SKIPS would come straight
+    back to the same verdict and cost a scrape each time, every half hour.
+    """
+    report = reverify_contacts(db, verifier, limit)
+    report.companies_reopened = db.reopen_for_enrich(db.UNANSWERED_SKIPS)
+    return report
+
+
 def recover(db, verifier: Verifier, limit: int = 0,
             reopen: bool = True) -> ReverifyReport:
     """The whole repair: clear poisoned cache, re-probe, reopen companies.
@@ -97,4 +136,5 @@ def recover(db, verifier: Verifier, limit: int = 0,
     report.cache_cleared = cleared
     if reopen:
         report.companies_reopened = db.reopen_for_enrich()
+        report.mx_rechecked, report.mx_reopened = recheck_parked_mx(db, verifier)
     return report

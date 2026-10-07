@@ -15,8 +15,14 @@ from typing import Iterable, Iterator, Optional
 
 from .models import (
     BOUNCED, CATCHALL, Company, Contact, ENRICHED, NO_CONTACTS, PENDING,
-    QUEUED, REPLIED, SENT, SUPPRESSED, VERIFIED,
+    QUEUED, REPLIED, SENT, SKIP_MX_UNRESOLVED, SKIP_PROBE_UNAVAILABLE,
+    SUPPRESSED, VERIFIED,
 )
+from .verifier import is_personal_mailbox
+
+# A named person first, everyone else after. Sorting on priority alone let a
+# verified hello@ tie with a founder's own address and fill half of each day.
+NAMED_FIRST = "(COALESCE(c.first_name, '') <> '') DESC"
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -327,7 +333,8 @@ class Database:
                       co.one_liner, co.description, co.location, co.batch, co.website
                FROM contacts c LEFT JOIN companies co ON co.id = c.company_id
                WHERE c.status = ?
-               ORDER BY COALESCE(co.priority, 0) DESC, c.confidence DESC, c.id
+               ORDER BY """ + NAMED_FIRST + """,
+                        COALESCE(co.priority, 0) DESC, c.confidence DESC, c.id
                LIMIT ?""",
             (status, limit),
         ).fetchall()
@@ -345,6 +352,8 @@ class Database:
     def can_send_to(self, email: str) -> tuple[bool, str]:
         """Single source of truth for whether an address may receive mail."""
         email = email.lower().strip()
+        if not is_personal_mailbox(email):
+            return False, "shared or blocked inbox"
         if self.is_suppressed(email):
             return False, "suppressed"
         row = self.conn.execute(
@@ -367,6 +376,8 @@ class Database:
         status is still exactly SENT.
         """
         email = email.lower().strip()
+        if not is_personal_mailbox(email):
+            return False, "shared or blocked inbox"
         if self.is_suppressed(email):
             return False, "suppressed"
         row = self.conn.execute(
@@ -421,7 +432,8 @@ class Database:
                JOIN contacts c ON c.id = d.contact_id
                LEFT JOIN companies co ON co.id = c.company_id
                WHERE d.status = 'queued' AND c.status = ?
-               ORDER BY COALESCE(co.priority, 0) DESC, c.confidence DESC, d.id
+               ORDER BY """ + NAMED_FIRST + """,
+                        COALESCE(co.priority, 0) DESC, c.confidence DESC, d.id
                LIMIT ?""",
             (QUEUED, limit),
         ).fetchall()
@@ -450,7 +462,8 @@ class Database:
                LEFT JOIN companies co ON co.id = c.company_id
                WHERE d.status = 'queued' AND c.status = ?
                  AND COALESCE(d.gmail_message_id, '') = ''
-               ORDER BY COALESCE(co.priority, 0) DESC, c.confidence DESC, d.id
+               ORDER BY """ + NAMED_FIRST + """,
+                        COALESCE(co.priority, 0) DESC, c.confidence DESC, d.id
                LIMIT ?""",
             (QUEUED, limit),
         ).fetchall()
@@ -681,12 +694,23 @@ class Database:
 
     # Failures that were really the prober giving up rather than the company
     # being unreachable. A company parked for one of these deserves another
-    # pass now that probing works; "no MX record" is a genuine finding and is
-    # deliberately absent.
+    # pass now that probing works.
+    #
+    # SKIP_NO_MX stays out: a domain that answers for itself and names no mail
+    # host is a finding, and reopening those every run would spend the daily
+    # fetch budget re-proving it. SKIP_MX_UNRESOLVED is the opposite case, a
+    # lookup that never came back, so it belongs here.
     RETRYABLE_SKIPS = (
         "no candidate address accepted",
         "catch-all domain, guesses unprovable",
+        SKIP_MX_UNRESOLVED,
+        SKIP_PROBE_UNAVAILABLE,
     )
+
+    # The subset that says nothing at all about the company, only that a
+    # lookup or probe went unanswered. Cheap to reopen on every relay run,
+    # unlike the two findings above, which would churn the fetch budget.
+    UNANSWERED_SKIPS = (SKIP_MX_UNRESOLVED, SKIP_PROBE_UNAVAILABLE)
 
     def drop_draft_for_contact(self, contact_id: int) -> int:
         """Take a rendered draft out of play after its address proved dead.
@@ -716,6 +740,22 @@ class Database:
         )
         self.conn.commit()
         return cur.rowcount
+
+    def companies_parked_on(self, reason: str) -> list[sqlite3.Row]:
+        """Companies retired for one exact reason, most promising first."""
+        return self.conn.execute(
+            """SELECT * FROM companies WHERE status = ? AND skip_reason = ?
+               ORDER BY priority DESC, is_hiring DESC, id""",
+            (NO_CONTACTS, reason),
+        ).fetchall()
+
+    def reopen_company(self, company_id: int) -> None:
+        """Put one company back in the enrich queue, its reason cleared."""
+        self.conn.execute(
+            "UPDATE companies SET status = 'new', skip_reason = '' WHERE id = ?",
+            (company_id,),
+        )
+        self.conn.commit()
 
     # ---------- misc ----------
 

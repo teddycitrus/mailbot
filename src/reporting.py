@@ -49,9 +49,14 @@ def build_digest(db, settings, days: int = 7, send_it: bool = True) -> str:
     queued = stats["queued"]
     pool = con.execute(
         "SELECT COUNT(*) FROM companies WHERE status = 'new'").fetchone()[0]
-    replies = [e for e in events if e["kind"] == "reply"]
-    opt_outs = [e for e in events if e["kind"] == "opt_out"]
-    bounces = [e for e in events if e["kind"] == "bounce"]
+    # One line per address. Older databases hold a bounce event per inbox
+    # scan rather than per bounce, so repeats are collapsed here too.
+    def refs(kind: str) -> list[str]:
+        return list(dict.fromkeys(e["ref"] for e in events if e["kind"] == kind))
+
+    replies = refs("reply")
+    opt_outs = refs("opt_out")
+    bounces = refs("bounce")
 
     rate = (len(replies) / len(sent) * 100) if sent else 0.0
     bounce_rate = (len(bounces) / len(sent) * 100) if sent else 0.0
@@ -71,11 +76,11 @@ def build_digest(db, settings, days: int = 7, send_it: bool = True) -> str:
         f"  suppressed    {stats['suppressed']}",
     ]
     if replies:
-        lines += ["", "Replies:"] + [f"  {e['ref']}" for e in replies]
+        lines += ["", "Replies:"] + [f"  {ref}" for ref in replies]
     if bounces:
-        lines += ["", "Bounces:"] + [f"  {e['ref']}" for e in bounces]
+        lines += ["", "Bounces:"] + [f"  {ref}" for ref in bounces]
     if opt_outs:
-        lines += ["", "Opted out:"] + [f"  {e['ref']}" for e in opt_outs]
+        lines += ["", "Opted out:"] + [f"  {ref}" for ref in opt_outs]
     if sent:
         lines += ["", "Sent to:"] + [
             f"  {r['sent_at'][:10]}  {r['email']}  ({r['company'] or '?'})"

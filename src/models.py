@@ -26,6 +26,16 @@ CATCHALL = "catchall"          # domain accepts everything; cannot confirm
 UNDELIVERABLE = "undeliverable"
 NO_MX = "no_mx"
 
+# Company.skip_reason. Only the ones the rest of the code has to match on: the
+# first is a finding about the domain, the others record a lookup or probe
+# that never answered, and telling them apart is what keeps an outage from
+# retiring a company for good. See Database.RETRYABLE_SKIPS.
+SKIP_NO_MX = "domain has no MX record, cannot receive mail"
+SKIP_MX_UNRESOLVED = "MX lookup failed, DNS did not answer"
+# Founders were found but no mail server answered a single probe, usually
+# because the laptop relay was off. Nothing was learned about the addresses.
+SKIP_PROBE_UNAVAILABLE = "SMTP probing unavailable, retry when it is back"
+
 # Where an address came from, best first.
 SRC_SCRAPED = "scraped"        # literally published on the site or YC page
 SRC_INFERRED = "inferred"      # built from a founder name plus a domain pattern

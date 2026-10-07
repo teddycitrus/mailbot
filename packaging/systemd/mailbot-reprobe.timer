@@ -1,0 +1,13 @@
+[Unit]
+Description=mailbot SMTP probing through the laptop relay, whenever it is up
+
+[Timer]
+Unit=mailbot@reprobe.service
+# Every half hour, except weekday 08:00-13:59 so a slow enrich never holds
+# the lock over a send tick. Off the hour, so it rarely meets a draft run.
+OnCalendar=Sat,Sun *-*-* *:20,50:00
+OnCalendar=Mon-Fri *-*-* 00..07,14..23:20,50:00
+# Not Persistent: a missed slot is worth nothing, the next is 30 minutes off.
+
+[Install]
+WantedBy=timers.target

@@ -262,7 +262,10 @@ def scan_inbox(settings, db, days: int = 30, limit: int = 500) -> InboxScan:
             if is_bounce(sender, subject):
                 hard = is_hard_bounce(raw)
                 for addr in extract_bounced_addresses(raw, own_domain):
-                    if db.find_contact_by_email(addr) is None:
+                    # Each scan rereads every notice still in the inbox, so
+                    # one already recorded must not be logged again.
+                    row = db.find_contact_by_email(addr)
+                    if row is None or row["status"] == BOUNCED:
                         continue
                     db.suppress(addr, "hard bounce" if hard else "soft bounce")
                     db.conn.execute(
@@ -280,9 +283,10 @@ def scan_inbox(settings, db, days: int = 30, limit: int = 500) -> InboxScan:
             body = plain_body(message)
             row = db.find_contact_by_email(sender)
             if wants_out(body):
-                db.suppress(sender, "opt-out reply")
-                db.log("opt_out", sender, subject[:120])
-                result.opted_out.append(sender)
+                if not db.is_suppressed(sender):
+                    db.suppress(sender, "opt-out reply")
+                    db.log("opt_out", sender, subject[:120])
+                    result.opted_out.append(sender)
             else:
                 if row is not None and row["status"] != REPLIED:
                     db.set_contact_status(row["id"], REPLIED)

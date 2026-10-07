@@ -36,6 +36,7 @@ from .scraper import Fetcher
 from .reporting import BAR, _print_table, build_digest, print_summary
 from .verifier import (
     Verifier, first_name_from_email, is_never_send, is_role_account,
+    parse_relay,
 )
 
 _PRIORITY_HEADER = """\
@@ -64,6 +65,7 @@ class Pipeline:
             db=self.db,
             helo_domain=helo,
             mail_from=settings.from_email or "verify@example.com",
+            relay=parse_relay(settings.smtp_probe_relay),
         )
         self.personalizer = Personalizer(
             settings.groq_api_key, settings.groq_model,
@@ -518,11 +520,13 @@ class Pipeline:
                         )
                         if not open_now:
                             continue
+                    # A bump shares the daily cap with first emails, so it is
+                    # spent only on a known person. Nudging an unnamed address
+                    # twice drew opt-outs, never answers.
                     first = (row["first_name"]
-                             or first_name_from_email(row["email"])
-                             or greeting_name(row["company_name"] or ""))
+                             or first_name_from_email(row["email"]))
                     if not first:
-                        print(f"  skip {row['email']}: no name and no company")
+                        print(f"  skip {row['email']}: no person's name to follow up with")
                         continue
                     subject, body = template.render({
                         "first_name": first,

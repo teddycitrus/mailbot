@@ -14,9 +14,10 @@ from src.database import Database
 from src.doctor import FAIL, OK, WARN, _verification
 from src.locking import Busy, single_run
 from src.models import (
-    CATCHALL, Company, Contact, NO_CONTACTS, SRC_SCRAPED, VERIFIED,
+    CATCHALL, Company, Contact, NO_CONTACTS, SKIP_MX_UNRESOLVED, SKIP_NO_MX,
+    SKIP_PROBE_UNAVAILABLE, SRC_SCRAPED, VERIFIED,
 )
-from src.reverify import recover, reverify_contacts
+from src.reverify import catch_up, recheck_parked_mx, recover, reverify_contacts
 from src.verifier import Verifier
 
 
@@ -373,3 +374,104 @@ def test_the_lock_is_released_even_when_the_run_raises(tmp_path):
             raise ValueError("boom")
     with single_run(lock, wait_seconds=0.05):
         pass
+
+
+# ------------------------------------------ the morning the DNS went, and the
+# ninety companies it retired
+
+class MxStub:
+    """A resolver with a fixed opinion, so the repair can be run offline."""
+
+    def __init__(self, hosts: dict[str, str], answered: bool = True):
+        self.hosts = hosts
+        self.answered = answered
+        self.asked: list[str] = []
+
+    def mx_lookup(self, domain):
+        self.asked.append(domain)
+        if not self.answered:
+            return None, False
+        return self.hosts.get(domain), True
+
+
+def _parked(db, name, reason):
+    cid = db.upsert_company(Company(name=name, domain=f"{name.lower()}.ai"))
+    db.set_company_status(cid, NO_CONTACTS, reason)
+    return cid
+
+
+def test_a_domain_that_resolves_again_goes_back_in_the_queue(db):
+    """The repair for the outage: prove the verdict wrong, then undo it."""
+    alive = _parked(db, "Alive", SKIP_NO_MX)
+    dead = _parked(db, "Dead", SKIP_NO_MX)
+    verifier = MxStub({"alive.ai": "mx.alive.ai"})
+
+    checked, reopened = recheck_parked_mx(db, verifier)
+
+    assert (checked, reopened) == (2, 1)
+    assert db.conn.execute(
+        "SELECT status FROM companies WHERE id = ?", (alive,)).fetchone()[0] == "new"
+    assert db.conn.execute(
+        "SELECT status FROM companies WHERE id = ?", (dead,)).fetchone()[0] == NO_CONTACTS
+
+
+def test_a_repair_run_during_the_outage_changes_nothing(db):
+    """Re-checking while DNS is still down must not park anything harder.
+
+    The obvious repair -- reopen every no-MX company -- would have put all of
+    them through a scrape each, at the price of the day's fetch budget, only to
+    retire them again on the same broken lookup.
+    """
+    parked = _parked(db, "Acme", SKIP_NO_MX)
+    verifier = MxStub({"acme.ai": "mx.acme.ai"}, answered=False)
+
+    assert recheck_parked_mx(db, verifier) == (1, 0)
+    assert db.conn.execute(
+        "SELECT status FROM companies WHERE id = ?", (parked,)).fetchone()[0] == NO_CONTACTS
+
+
+def test_the_repair_leaves_other_parked_reasons_alone(db):
+    """Only the no-MX verdict is in question here; the rest have their own path."""
+    other = _parked(db, "Other", "no founders listed and no published address")
+    verifier = MxStub({"other.ai": "mx.other.ai"})
+
+    assert recheck_parked_mx(db, verifier) == (0, 0)
+    assert verifier.asked == []
+    assert db.conn.execute(
+        "SELECT status FROM companies WHERE id = ?", (other,)).fetchone()[0] == NO_CONTACTS
+
+
+def test_a_lookup_that_failed_during_enrich_is_retryable(db):
+    """The other half: the reason written today must reopen on its own.
+
+    recheck_parked_mx is the one-off for rows already written. From now on the
+    enrich pass records the failure as a failure, and the ordinary reopen path
+    picks it up without anyone having to re-resolve anything.
+    """
+    company = _parked(db, "Acme", SKIP_MX_UNRESOLVED)
+    assert db.reopen_for_enrich() == 1
+    row = db.conn.execute(
+        "SELECT status, skip_reason FROM companies WHERE id = ?", (company,)).fetchone()
+    assert (row["status"], row["skip_reason"]) == ("new", "")
+
+
+# ------------------------------- the laptop relay, which is only sometimes on
+
+def test_the_relay_run_reopens_only_what_was_never_asked(db):
+    """Runs every half hour, so it must not re-scrape settled findings.
+
+    A catch-all or an exhausted pattern list comes back the same every time,
+    and reopening them on each run would spend the fetch budget in circles.
+    """
+    unprobed = _parked(db, "Unprobed", SKIP_PROBE_UNAVAILABLE)
+    unresolved = _parked(db, "Unresolved", SKIP_MX_UNRESOLVED)
+    _parked(db, "Catchall", "catch-all domain, guesses unprovable")
+    _parked(db, "Refused", "no candidate address accepted")
+    _pending(db, "silent@acme.ai", SILENT, 70)
+
+    report = catch_up(db, AnsweringProbe(250, db=db))
+
+    assert report.examined == 1
+    assert report.companies_reopened == 2
+    assert {r["id"] for r in db.companies_by_status("new")} == {unprobed, unresolved}
+    assert SKIP_PROBE_UNAVAILABLE in Database.RETRYABLE_SKIPS

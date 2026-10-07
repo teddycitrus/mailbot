@@ -186,3 +186,34 @@ def test_can_send_to_again_gate(db, company_id):
 
 def test_unknown_address_cannot_be_followed_up(db):
     assert db.can_send_to_again("nobody@nowhere.ai") == (False, "unknown contact")
+
+
+# ---------- who is worth writing to ----------
+
+@pytest.mark.parametrize("email", [
+    "hello@acme.ai", "info@acme.ai", "founders@acme.ai", "careers@acme.ai",
+    "ryan@ycombinator.com", "jobs@workatastartup.com",
+])
+def test_shared_and_blocked_inboxes_are_refused(db, company_id, email):
+    db.upsert_contact(Contact(email=email, company_id=company_id))
+    allowed, why = db.can_send_to(email)
+    assert not allowed and why == "shared or blocked inbox"
+
+
+def test_shared_inbox_is_never_followed_up(db, company_id):
+    cid = db.upsert_contact(Contact(email="team@acme.ai", company_id=company_id))
+    _sent_days_ago(db, cid, "team@acme.ai", days=9)
+    assert db.can_send_to_again("team@acme.ai") == (False, "shared or blocked inbox")
+
+
+def test_named_people_are_drafted_and_sent_before_unnamed(db):
+    rich = db.upsert_company(Company(name="Rich", domain="rich.ai", priority=10))
+    plain = db.upsert_company(Company(name="Plain", domain="plain.ai"))
+    db.upsert_contact(Contact(email="sam@rich.ai", company_id=rich, confidence=95))
+    db.upsert_contact(Contact(email="ana@plain.ai", company_id=plain,
+                              first_name="Ana", confidence=90))
+    order = [r["email"] for r in db.contacts_by_status("pending")]
+    assert order == ["ana@plain.ai", "sam@rich.ai"]
+    for row in db.contacts_by_status("pending"):
+        db.queue_draft(row["id"], "s", "b")
+    assert [d["email"] for d in db.queued_drafts()] == ["ana@plain.ai", "sam@rich.ai"]

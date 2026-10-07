@@ -152,7 +152,22 @@ def _port25(settings) -> Check:
     lower confidence, and companies that were perfectly reachable get filed as
     "no candidate address accepted". Nothing fails; the funnel quietly drains.
     Residential ISPs and hotel networks block this port as a matter of course.
+
+    With a relay configured the question becomes whether the laptop is holding
+    the tunnel open right now. It being off is the normal state for part of
+    every day, and the relay job catches up when it returns, so that is a
+    warning rather than a failure.
     """
+    relay_setting = getattr(settings, "smtp_probe_relay", "")
+    if relay_setting:
+        from .verifier import parse_relay, port25_reachable
+        try:
+            relay = parse_relay(relay_setting)
+        except ValueError as exc:
+            return Check("smtp probe port 25", FAIL, str(exc))
+        ok, detail = port25_reachable(relay)
+        return Check("smtp probe port 25", OK if ok else WARN,
+                     detail if ok else f"{detail}; probes wait for the laptop")
     host = PORT25_FALLBACK
     domain = settings.from_email.split("@")[-1] if settings.from_email else ""
     if domain:

@@ -18,7 +18,8 @@ from .inbox import scan_inbox
 from .locking import Busy, default_lock_path, single_run
 from .mirror import sync as mirror_sync
 from .pipeline import BAR, Pipeline, _print_table
-from .reverify import recover
+from .reverify import catch_up, recover
+from .verifier import port25_reachable
 
 # Commands that only read, or that run something long-lived of their own. The
 # rest take the install-wide lock, because the scheduled jobs overlap and two
@@ -113,6 +114,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="most contacts to re-probe in one pass (0 = all)")
     p.add_argument("--no-reopen", dest="reopen", action="store_false",
                    help="leave parked companies alone instead of re-enriching")
+    p = sub.add_parser(
+        "reprobe",
+        help="if port 25 works right now, verify whatever waited for it")
+    p.add_argument("--limit", type=int, default=25,
+                   help="most contacts to re-probe in one pass")
+    p.add_argument("--enrich", type=int, default=10,
+                   help="then enrich up to this many companies (0 = none)")
     sub.add_parser("doctor", help="check everything the scheduled jobs rely on")
     p = sub.add_parser("verify-build", help="check a built exe carries no private data")
     p.add_argument("exe", nargs="?", default="dist/mailbot.exe")
@@ -250,8 +258,26 @@ def main(argv: list[str] | None = None) -> int:
                   f"{len(report.dropped)} suppressed as undeliverable "
                   f"({report.drafts_pulled} queued draft(s) pulled); "
                   f"{report.cache_cleared} stale domain(s) cleared, "
-                  f"{report.companies_reopened} company(s) back in the enrich queue")
+                  f"{report.companies_reopened} company(s) back in the enrich "
+                  f"queue, {report.mx_reopened} of {report.mx_rechecked} parked "
+                  "no-MX domain(s) resolve again and were reopened")
             _print_table(report.rows(), ("email", "confidence", "state", "detail"))
+        elif args.command == "reprobe":
+            # Runs every half hour whether or not the laptop is on, so the
+            # common outcome is this early exit, and it must cost nothing.
+            ok, detail = port25_reachable(pipeline.verifier.relay)
+            if not ok:
+                print(f"reprobe: {detail}, nothing to do until it is back")
+                return 0
+            report = catch_up(pipeline.db, pipeline.verifier, args.limit)
+            print(f"reprobe: {detail}; {report.examined} re-probed, "
+                  f"{len(report.improved)} improved, "
+                  f"{len(report.dropped)} suppressed as undeliverable, "
+                  f"{report.companies_reopened} company(s) back in the "
+                  "enrich queue")
+            _print_table(report.rows(), ("email", "confidence", "state", "detail"))
+            if args.enrich and not pipeline.verifier.throttled:
+                pipeline.enrich(args.enrich)
         elif args.command == "doctor":
             checks = run_checks(settings)
             _print_table([(c.name, c.state, c.detail) for c in checks],

@@ -1,0 +1,10 @@
+[Unit]
+Description=mailbot nightly mining and enrichment
+
+[Timer]
+Unit=mailbot@build.service
+OnCalendar=*-*-* 19:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

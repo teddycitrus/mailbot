@@ -1,0 +1,16 @@
+[Unit]
+Description=mailbot send tick, every 15 minutes across the morning
+
+[Timer]
+Unit=mailbot@tick.service
+# 08:30 to 13:30 inclusive, which is 08:30 Toronto through 10:30 Pacific: the
+# union of every recipient local window. Written out rather than as one
+# range so it starts at :30 and stops at 13:30 exactly.
+OnCalendar=Mon-Fri *-*-* 08:30,45:00
+OnCalendar=Mon-Fri *-*-* 09..12:00/15:00
+OnCalendar=Mon-Fri *-*-* 13:00,15,30:00
+# Deliberately not Persistent: a tick is worth nothing once its quarter hour
+# has passed, and the next one is fifteen minutes away.
+
+[Install]
+WantedBy=timers.target

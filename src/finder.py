@@ -19,7 +19,8 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 from .models import (
-    CATCHALL, Company, Contact, PENDING, SRC_INFERRED, SRC_SCRAPED,
+    CATCHALL, Company, Contact, PENDING, SKIP_MX_UNRESOLVED, SKIP_NO_MX,
+    SKIP_PROBE_UNAVAILABLE, SRC_INFERRED, SRC_SCRAPED, UNVERIFIED,
 )
 from . import patterns
 from .github_source import find_org_for
@@ -319,6 +320,7 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
     # first_verified folds the catch-all test into the same SMTP session, so we
     # deliberately do not pre-check is_catchall here; that would cost an extra
     # connection per company, which is the slowest thing in the pipeline.
+    unprobed = False
     if not contacts and targeted:
         for person in targeted[:3]:
             # Ordered by what we have learned: this domain's own convention
@@ -330,6 +332,9 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
             found, verdict = verifier.first_verified(candidates, domain)
             if verdict.status == CATCHALL:
                 break  # unprovable for everyone at this domain, not just this person
+            if not found and verdict.status == UNVERIFIED:
+                # No server answered at all, so these guesses were never tested.
+                unprobed = True
             if found:
                 patterns.learn(verifier.db, found, person.first_name,
                                person.last_name, "verified")
@@ -367,32 +372,32 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
             ))
             break
 
-    # 5. Last resort: a published role address such as hello@ or founders@.
-    if not contacts:
-        for email in sorted(published):
-            if not is_role_account(email):
-                continue
-            verdict = verifier.verify(email, source=SRC_SCRAPED)
-            if verdict.confidence <= 0:
-                continue
-            contacts.append(Contact(
-                email=email, company_id=company_id, source=SRC_SCRAPED,
-                role="team inbox", verify_status=verdict.status,
-                verify_detail=verdict.detail, confidence=verdict.confidence,
-                status=PENDING,
-            ))
-            break
+    # No shared-inbox fallback: hello@ and founders@ are refused at the send
+    # gate, so a company with no person to write to is left without a contact.
 
     contacts.sort(key=lambda c: -c.confidence)
-    note = "" if contacts else _why_empty(people, published, verifier, domain)
+    note = "" if contacts else _why_empty(people, published, verifier, domain,
+                                          unprobed)
     return EnrichResult(contacts=contacts[:1], note=note)
 
 
-def _why_empty(people, published, verifier: Verifier, domain: str) -> str:
+def _why_empty(people, published, verifier: Verifier, domain: str,
+               unprobed: bool = False) -> str:
     # Check MX first: a domain with no MX cannot receive mail at all, and
     # reporting that as "no pattern accepted" hides the real reason.
-    if not verifier.mx_host(domain):
-        return "domain has no MX record, cannot receive mail"
+    #
+    # Only when the resolver answered, though. A lookup that failed is not a
+    # fact about the domain, and recording it as one retires the company
+    # permanently over a minute of bad DNS.
+    host, answered = verifier.mx_lookup(domain)
+    if not answered:
+        return SKIP_MX_UNRESOLVED
+    if not host:
+        return SKIP_NO_MX
+    # Before the "no candidate accepted" verdict below, which would claim the
+    # guesses were refused when in fact nobody was asked.
+    if unprobed:
+        return SKIP_PROBE_UNAVAILABLE
     if not people and not published:
         return "no founders listed and no published address"
     if people and verifier.is_catchall(domain):

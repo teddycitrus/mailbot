@@ -12,12 +12,20 @@ garbage, so a 250 there proves nothing. We detect that per domain by probing a
 random address first: if the domain accepts it, the domain is a catch-all and
 no address on it can be confirmed. Guessed addresses on catch-all domains are
 therefore never treated as verified.
+
+Step 3 needs outbound port 25, which the server's cloud provider blocks. So
+the probe can go through a relay instead: an SSH tunnel the laptop holds open
+to the server (scripts/probe_relay.ps1), which the server sees as a SOCKS5
+proxy on a loopback port. Whenever the laptop is on, probes leave from the
+laptop's own connection; whenever it is off, the relay refuses and probing
+pauses instead of recording failures as findings. SMTP_PROBE_RELAY turns it on.
 """
 
 from __future__ import annotations
 
 import re
 import smtplib
+import socket
 import uuid
 from dataclasses import dataclass
 from typing import Optional
@@ -48,8 +56,14 @@ NEVER_SEND = {
 # Matched as substrings of the local part instead of whole mailbox names. A
 # mailbox that says in its own name that nobody reads it is dead however the
 # name is dressed up: noreply-jobs@, jobs.no-reply@, bounces+7a1f@.
+#
+# "support" is here for a different reason: it reaches a real person, just
+# never the right one. A ticket queue answers questions about the product, so
+# an internship pitch landing in it is ignored at best, and at worst marked as
+# spam by someone whose whole job is clearing that queue.
 NEVER_SEND_TOKENS = (
     "noreply", "donotreply", "mailerdaemon", "unsubscribe", "bounce",
+    "support",
 )
 
 # The same idea applied to subdomains, since @users.noreply.github.com and
@@ -57,6 +71,11 @@ NEVER_SEND_TOKENS = (
 # labels above the registrable domain are checked, so a company that is really
 # called reply.io stays reachable.
 NEVER_SEND_HOSTS = ("noreply", "donotreply", "reply", "bounce", "mailer")
+
+# Organisations that turn up in hiring threads and company pages but are not
+# the startup itself: the accelerator and its job board. Mail there reaches
+# someone who cannot hire John and who talks to every founder he might write to.
+NEVER_SEND_DOMAINS = {"ycombinator.com", "workatastartup.com", "news.ycombinator.com"}
 
 
 @dataclass
@@ -93,12 +112,25 @@ def is_never_send(email: str) -> bool:
         return True
     if any(token in local for token in NEVER_SEND_TOKENS):
         return True
+    if ".".join(domain_of(email).split(".")[-2:]) in NEVER_SEND_DOMAINS:
+        return True
     subdomains = _squash("".join(domain_of(email).split(".")[:-2]))
     return any(token in subdomains for token in NEVER_SEND_HOSTS)
 
 
 def is_role_account(email: str) -> bool:
     return local_part(email) in ROLE_LOCALS
+
+
+def is_personal_mailbox(email: str) -> bool:
+    """True when the address belongs to one person rather than a queue.
+
+    Shared inboxes (hello@, info@, founders@) answered 1 in 35 cold emails
+    against roughly 1 in 15 for a named founder, and the ones that do not
+    answer are the likeliest to mark the message as spam, which costs every
+    later send. They are refused outright rather than ranked last.
+    """
+    return not (is_role_account(email) or is_never_send(email))
 
 
 # Tokens that mark a mailbox as functional rather than personal, matched as
@@ -136,6 +168,119 @@ def first_name_from_email(email: str) -> str:
     return part.capitalize()
 
 
+# ---------- probe relay ----------
+
+Relay = tuple[str, int]
+
+# Any mail exchanger will do for a reachability test; the question is whether
+# port 25 opens at all, not whether one host is up.
+REACHABILITY_HOST = "gmail-smtp-in.l.google.com"
+
+
+class RelayDown(OSError):
+    """The relay itself is not there, so no probe through it can run.
+
+    Distinct from a probe that failed, which may be one dead mail host. A
+    refused or silent relay means the laptop is off or asleep, and every probe
+    after this one would fail the same way.
+    """
+
+
+def parse_relay(value: str) -> Optional[Relay]:
+    """ "127.0.0.1:1080" -> ("127.0.0.1", 1080). Empty means probe directly."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    host, sep, port = value.rpartition(":")
+    if not sep or not host or not port.isdigit():
+        raise ValueError(f"SMTP_PROBE_RELAY must be host:port, got {value!r}")
+    return host, int(port)
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise OSError("relay closed the connection")
+        data += chunk
+    return data
+
+
+def socks5_connect(relay: Relay, host: str, port: int,
+                   timeout: float) -> socket.socket:
+    """Open host:port through a SOCKS5 relay, no authentication.
+
+    The hostname is passed through unresolved, so the laptop resolves it.
+    Anything that goes wrong before the relay has answered its greeting is
+    RelayDown: the greeting does not depend on the target, so a relay that
+    cannot manage it cannot manage anything.
+    """
+    try:
+        sock = socket.create_connection(relay, timeout=timeout)
+    except OSError as exc:
+        raise RelayDown(f"relay {relay[0]}:{relay[1]} refused ({exc})") from exc
+    try:
+        try:
+            sock.sendall(b"\x05\x01\x00")
+            greeting = _recv_exact(sock, 2)
+        except OSError as exc:
+            # A sleeping laptop leaves the server's end of the tunnel open
+            # until keepalives notice, so this is a timeout, not a refusal.
+            raise RelayDown(f"relay did not answer ({exc})") from exc
+        if greeting != b"\x05\x00":
+            raise RelayDown(f"relay spoke something other than SOCKS5 {greeting!r}")
+        name = host.encode("idna")
+        sock.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name
+                     + port.to_bytes(2, "big"))
+        head = _recv_exact(sock, 4)
+        if head[1] != 0:
+            raise OSError(f"relay could not reach {host}:{port} (SOCKS code {head[1]})")
+        size = {1: 4, 4: 16}.get(head[3])
+        if size is None:
+            size = _recv_exact(sock, 1)[0]
+        _recv_exact(sock, size + 2)   # the bound address, which we do not need
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
+class _RelayedSMTP(smtplib.SMTP):
+    """smtplib, with the TCP connection opened through the relay."""
+
+    def __init__(self, relay: Relay, *args, **kwargs):
+        self._relay = relay          # set first: SMTP.__init__ connects
+        super().__init__(*args, **kwargs)
+
+    def _get_socket(self, host, port, timeout):
+        return socks5_connect(self._relay, host, port, timeout)
+
+
+def port25_reachable(relay: Optional[Relay] = None, host: str = REACHABILITY_HOST,
+                     timeout: float = 10) -> tuple[bool, str]:
+    """Whether a probe could run right now, and what happened if not.
+
+    Opens port 25 on a real mail host, directly or through the relay, and
+    reads the banner. Cheap enough to call before every batch of probes.
+    """
+    try:
+        if relay:
+            sock = socks5_connect(relay, host, 25, timeout)
+        else:
+            sock = socket.create_connection((host, 25), timeout=timeout)
+        with sock:
+            sock.settimeout(timeout)
+            banner = sock.recv(120).decode("utf-8", "replace").strip()
+    except RelayDown as exc:
+        return False, f"relay offline: {exc}"
+    except Exception as exc:
+        return False, f"cannot reach {host}:25 ({type(exc).__name__}: {exc})"
+    if not banner.startswith("220"):
+        return False, f"{host} said {banner[:40]!r}"
+    return True, f"{host} reachable" + (" through the relay" if relay else "")
+
+
 class Verifier:
     """MX and SMTP checks with a per-domain cache to avoid re-probing."""
 
@@ -147,11 +292,13 @@ class Verifier:
     TIMEOUT_BUDGET = 5
 
     def __init__(self, db=None, helo_domain: str = "example.com",
-                 mail_from: str = "verify@example.com", timeout: int = 8):
+                 mail_from: str = "verify@example.com", timeout: int = 8,
+                 relay: Optional[Relay] = None):
         self.db = db
         self.helo_domain = helo_domain
         self.mail_from = mail_from
         self.timeout = timeout
+        self.relay = relay
         self._mx: dict[str, Optional[str]] = {}
         self._catchall: dict[str, bool] = {}
         # Mail servers throttle an address that probes too much. Once that
@@ -162,28 +309,49 @@ class Verifier:
 
     # ---------- MX ----------
 
-    def mx_host(self, domain: str) -> Optional[str]:
+    def mx_lookup(self, domain: str) -> tuple[Optional[str], bool]:
+        """The domain's mail host, and whether the resolver actually answered.
+
+        "Takes no mail" and "the lookup never came back" are the same None to
+        mx_host, and on 2026-09-22 that cost ninety companies: the morning's
+        DNS was down, every resolve raised, and each company was parked as
+        "domain has no MX record" -- a finding, deliberately absent from
+        RETRYABLE_SKIPS, written from a lookup that had proved nothing.
+
+        So report the two apart, and never memoise a failure: one bad minute
+        would otherwise stand in for the domain for the rest of the run.
+        """
         domain = domain.lower()
         if domain in self._mx:
-            return self._mx[domain]
+            return self._mx[domain], True
         if self.db is not None:
             row = self.db.cached_domain(domain)
             if row is not None:
                 self._mx[domain] = row["mx_host"] or None
                 self._catchall[domain] = bool(row["catchall"])
-                return self._mx[domain]
-        host = None
-        if dns is not None:
-            try:
-                answers = dns.resolver.resolve(domain, "MX")
-                ranked = sorted(
-                    (r.preference, str(r.exchange).rstrip(".")) for r in answers
-                )
-                host = ranked[0][1] if ranked else None
-            except Exception:
-                host = None
+                return self._mx[domain], True
+        if dns is None:
+            return None, False
+        try:
+            answers = dns.resolver.resolve(domain, "MX")
+            ranked = sorted(
+                (r.preference, str(r.exchange).rstrip(".")) for r in answers
+            )
+            host = ranked[0][1] if ranked else None
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            # The domain answered for itself: it does not exist, or it exists
+            # and publishes no mail host. Both are findings.
+            host = None
+        except Exception:
+            # SERVFAIL, timeout, no nameserver reachable, no network at all.
+            # Nothing was learned, so write nothing down.
+            return None, False
         self._mx[domain] = host
-        return host
+        return host, True
+
+    def mx_host(self, domain: str) -> Optional[str]:
+        """Just the host, for callers that cannot act on the difference."""
+        return self.mx_lookup(domain)[0]
 
     # ---------- catch-all detection ----------
 
@@ -341,9 +509,18 @@ class Verifier:
             return {addr: (0, b"probing paused, server throttling") for addr in addresses}
         server = None
         try:
-            server = smtplib.SMTP(host, 25, timeout=self.timeout)
+            if self.relay:
+                server = _RelayedSMTP(self.relay, host, 25, timeout=self.timeout)
+            else:
+                server = smtplib.SMTP(host, 25, timeout=self.timeout)
             server.ehlo(self.helo_domain)
-            server.mail(self.mail_from)
+            code, msg = server.mail(self.mail_from)
+            if code != 250:
+                # The server refused us, not a mailbox: a blocklisted network,
+                # or an IPv6 address with no reverse DNS. Any RCPT answer after
+                # this is about our IP, and a 550 read as "no such user" would
+                # suppress a real person for good.
+                raise OSError(f"sender refused {code} {msg[:40]!r}")
             # A completed handshake proves we are not being throttled, so the
             # failure streak starts again from zero. Without this the budget
             # was a lifetime allowance rather than a streak, and five dead
@@ -355,7 +532,11 @@ class Verifier:
                 except Exception as exc:
                     results[addr] = (0, str(exc).encode()[:80])
         except Exception as exc:
-            if isinstance(exc, (TimeoutError, OSError)):
+            if isinstance(exc, RelayDown):
+                # No streak needed: the laptop is off, and waiting out four
+                # more timeouts would only park four more companies wrongly.
+                self.throttled = True
+            elif isinstance(exc, (TimeoutError, OSError)):
                 self.timeouts += 1
                 if self.timeouts >= self.TIMEOUT_BUDGET:
                     self.throttled = True

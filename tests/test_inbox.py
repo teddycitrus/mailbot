@@ -297,6 +297,38 @@ def test_failed_save_is_retried_on_the_next_scan(tmp_path, monkeypatch, db_with_
     assert scan_inbox(settings, db_with_send).drafted == ["stefan@acme.ai"]
 
 
+BOUNCE_NOTICE = (
+    "From: Mail Delivery Subsystem <mailer-daemon@googlemail.com>\n"
+    "To: ada@example.com\nSubject: Delivery Status Notification (Failure)\n\n"
+    "Final-Recipient: rfc822; stefan@acme.ai\nStatus: 5.1.1\n"
+)
+
+
+def _events(db, kind):
+    return db.conn.execute(
+        "SELECT ref FROM events WHERE kind = ?", (kind,)).fetchall()
+
+
+def test_a_bounce_still_in_the_inbox_is_logged_once(tmp_path, monkeypatch,
+                                                     db_with_send):
+    monkeypatch.setattr(inbox.imaplib, "IMAP4_SSL", FakeIMAP([BOUNCE_NOTICE]))
+    settings = _settings(tmp_path)
+    first = scan_inbox(settings, db_with_send)
+    again = scan_inbox(settings, db_with_send)
+    assert first.bounced == [("stefan@acme.ai", True)] and again.bounced == []
+    assert len(_events(db_with_send, "bounce")) == 1
+
+
+def test_an_opt_out_still_in_the_inbox_is_logged_once(tmp_path, monkeypatch,
+                                                       db_with_send):
+    imap = FakeIMAP([_reply(body="Not interested, thanks.").as_string()])
+    monkeypatch.setattr(inbox.imaplib, "IMAP4_SSL", imap)
+    settings = _settings(tmp_path)
+    assert scan_inbox(settings, db_with_send).opted_out == ["stefan@acme.ai"]
+    assert scan_inbox(settings, db_with_send).opted_out == []
+    assert len(_events(db_with_send, "opt_out")) == 1
+
+
 def test_drafts_folder_falls_back_without_special_use():
     conn = SimpleNamespace(list=lambda: ("OK", [b'(\\HasNoChildren) "/" "INBOX"']))
     assert drafts_mailbox(conn) == "Drafts"

@@ -1,0 +1,10 @@
+[Unit]
+Description=mailbot health check
+
+[Timer]
+Unit=mailbot@health.service
+OnCalendar=*-*-* 07:45:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

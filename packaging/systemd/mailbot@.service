@@ -1,0 +1,13 @@
+[Unit]
+Description=mailbot %i job
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/mailbot
+ExecStart=/opt/mailbot/scripts/job.sh %i
+# The build pass scrapes a few hundred pages and is the only long one. Nothing
+# here should ever hang; a job still running at the limit is a job to kill.
+TimeoutStartSec=45min
