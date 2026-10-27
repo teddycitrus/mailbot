@@ -277,23 +277,36 @@ def scan_inbox(settings, db, days: int = 30, limit: int = 500) -> InboxScan:
                     result.bounced.append((addr, hard))
                 continue
 
-            if sender not in contacted:
-                continue
+            if sender in contacted:
+                row = db.find_contact_by_email(sender)
+                who = sender
+            else:
+                # Someone answering in a thread we started from an address we
+                # never wrote to: a CEO replying for the git@ or applications@
+                # mailbox. Missing these left the company open to a bump after
+                # it had already said no.
+                if sender == settings.from_email.lower():
+                    continue
+                row = db.contact_for_thread(
+                    header_text(message.get("In-Reply-To", "")).split()
+                    + header_text(message.get("References", "")).split())
+                if row is None:
+                    continue
+                who = row["email"]
 
             body = plain_body(message)
-            row = db.find_contact_by_email(sender)
             if wants_out(body):
-                if not db.is_suppressed(sender):
-                    db.suppress(sender, "opt-out reply")
-                    db.log("opt_out", sender, subject[:120])
-                    result.opted_out.append(sender)
+                if not db.is_suppressed(who):
+                    db.suppress(who, "opt-out reply")
+                    db.log("opt_out", who, subject[:120])
+                    result.opted_out.append(who)
             else:
                 if row is not None and row["status"] != REPLIED:
                     db.set_contact_status(row["id"], REPLIED)
-                    db.log("reply", sender, subject[:120])
-                    result.replied.append(sender)
+                    db.log("reply", who, subject[:120])
+                    result.replied.append(who)
 
-            if reply_template is None or sender in drafted or is_auto_reply(message):
+            if reply_template is None or who in drafted or is_auto_reply(message):
                 continue
             company = (db.get_company(row["company_id"])
                        if row is not None and row["company_id"] else None)

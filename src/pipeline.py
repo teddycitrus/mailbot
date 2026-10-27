@@ -15,7 +15,7 @@ from pathlib import Path
 from .config import Settings
 from .database import Database
 from .emailer import (
-    draft_defect, greeting_name, message_for_draft, resume_link_line,
+    draft_defect, message_for_draft, resume_link_line,
     strip_re_prefix, with_resume_link,
     build_message, in_send_window, load_template, local_date,
     local_window_open, make_backend, pace_delay, unedited_markers,
@@ -35,7 +35,7 @@ from .priority import from_settings as priority_set
 from .scraper import Fetcher
 from .reporting import BAR, _print_table, build_digest, print_summary
 from .verifier import (
-    Verifier, first_name_from_email, is_never_send, is_role_account,
+    Verifier, is_never_send, is_role_account,
     parse_relay,
 )
 
@@ -259,6 +259,7 @@ class Pipeline:
             print("hn: no qualifying posts in the threads read")
             return 0
         added, rows = 0, []
+        cap = settings.max_contacts_per_company
         for post in posts[:limit]:
             if not post.company or not post.domain:
                 continue
@@ -268,41 +269,42 @@ class Pipeline:
                 description=post.text[:1200], is_hiring=True, source="hn",
                 status=ENRICHED,
             ))
-            if self.db.company_has_contacted(company_id):
-                rows.append((post.company, "-", "skip", 0, "already contacted"))
+            open_, why = self.db.company_slot(company_id, cap)
+            if not open_:
+                rows.append((post.company, "-", "skip", 0, why))
                 continue
-            best = None
-            for address in post.emails:
+            slots = cap - self.db.company_contacted_count(company_id)
+            # Named addresses first: shared inboxes are refused at the send
+            # gate, so verifying them only spends probes.
+            usable = []
+            for address in sorted(post.emails, key=is_role_account):
+                if len(usable) >= slots:
+                    break
                 if is_never_send(address) or address.split("@")[1] != post.domain:
                     continue
                 verdict = self.verifier.verify(address, source=SRC_SCRAPED)
-                if verdict.confidence <= 0:
-                    continue
-                # A named address beats a shared inbox for a personal note.
-                if best is None or (verdict.confidence > best[1].confidence):
-                    best = (address, verdict)
-                if not is_role_account(address):
-                    break
-            if best is None:
+                if verdict.confidence > 0:
+                    usable.append((address, verdict))
+            if not usable:
                 rows.append((post.company, "-", "-", 0, "no usable address"))
                 continue
-            address, verdict = best
-            allowed, why = self.db.can_send_to(address)
-            if not allowed:
-                rows.append((post.company, address, "skip", 0, why))
-                continue
-            contact_id = self.db.upsert_contact(Contact(
-                email=address, company_id=company_id, source=SRC_SCRAPED,
-                role="posted the hiring ad", verify_status=verdict.status,
-                verify_detail=f"published on HN: {verdict.detail}",
-                confidence=verdict.confidence, status=PENDING,
-            ))
-            if contact_id is None:
-                rows.append((post.company, address, "skip", 0, "duplicate"))
-                continue
-            added += 1
-            rows.append((post.company, address, verdict.status,
-                         verdict.confidence, post.location))
+            for address, verdict in usable:
+                allowed, why = self.db.can_send_to(address)
+                if not allowed:
+                    rows.append((post.company, address, "skip", 0, why))
+                    continue
+                contact_id = self.db.upsert_contact(Contact(
+                    email=address, company_id=company_id, source=SRC_SCRAPED,
+                    role="posted the hiring ad", verify_status=verdict.status,
+                    verify_detail=f"published on HN: {verdict.detail}",
+                    confidence=verdict.confidence, status=PENDING,
+                ))
+                if contact_id is None:
+                    rows.append((post.company, address, "skip", 0, "duplicate"))
+                    continue
+                added += 1
+                rows.append((post.company, address, verdict.status,
+                             verdict.confidence, post.location))
         print(f"hn: {added} contacts added from {len(posts)} qualifying posts")
         _print_table(rows, ("company", "email", "verify", "conf", "location"))
         return added
@@ -329,17 +331,15 @@ class Pipeline:
             print(f"warning: template still has {len(holes)} unedited placeholder(s): "
                   f"{', '.join(holes[:3])}")
             print("         drafts will queue for preview but send() will refuse them")
-        # The resume is an attachment first. The hosted link only appears
-        # when there is no PDF to attach, because a message carrying both
-        # shows the recipient two resume chips and reads as sloppy.
+        # The hosted link wins when one is set, since a PDF from a stranger
+        # trips spam filters. The PDF is attached only when there is no link,
+        # never both: a message carrying both shows two resume chips.
         attachments = []
         resume_link = ""
-        if self.settings.resume_path.exists():
-            attachments.append(str(self.settings.resume_path))
-        elif self.settings.resume_link:
+        if self.settings.resume_link:
             resume_link = resume_link_line(self.settings.resume_link)
-            print(f"warning: resume not found at {self.settings.resume_path}, "
-                  "falling back to the resume link in the body")
+        elif self.settings.resume_path.exists():
+            attachments.append(str(self.settings.resume_path))
         else:
             print(f"warning: resume not found at {self.settings.resume_path} "
                   "and no RESUME_LINK is set; queuing without either, "
@@ -360,20 +360,20 @@ class Pipeline:
             if not allowed:
                 rows.append((row["email"], "skip", why))
                 continue
-            if row["company_id"] and self.db.company_has_contacted(row["company_id"]):
-                rows.append((row["email"], "skip", "company already contacted"))
-                continue
-            # The template opens "Dear {first_name}," so a missing name used to
-            # render "Dear there,". Recover a given name from the address where
-            # the local part is plainly one, and otherwise address the company:
-            # "Dear Datrics," is a fair greeting for a shared inbox, where
-            # guessing a person's name would not be. Resolved before
-            # personalising so a skip costs no LLM call.
-            first = (row["first_name"]
-                     or first_name_from_email(row["email"])
-                     or greeting_name(row["company_name"] or ""))
+            if row["company_id"]:
+                open_, why = self.db.company_slot(
+                    row["company_id"], self.settings.max_contacts_per_company)
+                if not open_:
+                    rows.append((row["email"], "skip", why))
+                    continue
+            # Only a name we actually found for this person. Reading one off the
+            # address sent "Dear Git," "Dear Future," and "Dear Pilot," and
+            # nameless addresses drew 1 reply in 190 against far better for
+            # named people. Checked before personalising so a skip costs no
+            # LLM call.
+            first = (row["first_name"] or "").strip()
             if not first:
-                rows.append((row["email"], "skip", "no name and no company"))
+                rows.append((row["email"], "skip", "no person's name"))
                 continue
             note = self.personalizer.line_for(
                 row["company_name"] or "", row["one_liner"] or "",
@@ -434,7 +434,7 @@ class Pipeline:
             return settings.daily_send_limit, "ramp off"
         return settings.daily_cap(
             self.db.active_send_days(today),
-            self.db.recent_bounce_pct(),
+            self.db.recent_bounce_pct(before_local_date=today),
         )
 
     def followup(self, limit: int, ignore_window: bool = False) -> int:
@@ -491,16 +491,14 @@ class Pipeline:
             print("followup: nobody due")
             return 0
 
-        # Same rule as the first email: attach the PDF, and only reach for
-        # the hosted link when there is no PDF to attach.
+        # Same rule as the first email: the hosted link when one is set,
+        # otherwise the PDF.
         attachments = ([str(settings.resume_path)]
-                       if settings.resume_path.exists() else [])
+                       if not settings.resume_link and settings.resume_path.exists()
+                       else [])
         if not attachments and not settings.resume_link:
             print("followup: resume missing and no RESUME_LINK set, refusing to send")
             return 0
-        if not attachments:
-            print(f"followup: resume missing at {settings.resume_path}, "
-                  "falling back to the resume link")
 
         sent = 0
         backend = make_backend(settings)
@@ -523,8 +521,7 @@ class Pipeline:
                     # A bump shares the daily cap with first emails, so it is
                     # spent only on a known person. Nudging an unnamed address
                     # twice drew opt-outs, never answers.
-                    first = (row["first_name"]
-                             or first_name_from_email(row["email"]))
+                    first = (row["first_name"] or "").strip()
                     if not first:
                         print(f"  skip {row['email']}: no person's name to follow up with")
                         continue
@@ -591,6 +588,34 @@ class Pipeline:
             )
         return now_here, waiting
 
+    def _space_by_company(self, drafts: list, today: str):
+        """At most one first email per company per day, none once it has spoken.
+
+        Two or three people at one company is a better shot than one, but
+        the same message landing on all of them in one morning reads as a
+        blast, and they will compare notes. A day apart, each arrives as its
+        own note, and a reply to the first stops the rest before they go.
+        """
+        seen = set(self.db.companies_sent_on(today))
+        ready, held = [], []
+        for draft in drafts:
+            company = draft["company_id"] if "company_id" in draft.keys() else None
+            if company is None:
+                ready.append(draft)
+                continue
+            closed = self.db.company_closed(company)
+            if closed:
+                held.append((draft, closed))
+                if not self.settings.dry_run:
+                    self.db.mark_draft(draft["id"], "skipped")
+                continue
+            if company in seen:
+                held.append((draft, "colleague mailed today"))
+                continue
+            seen.add(company)
+            ready.append(draft)
+        return ready, held
+
     def send(self, limit: int, ignore_window: bool = False) -> int:
         settings = self.settings
         settings.require_for_send()
@@ -649,6 +674,14 @@ class Pipeline:
                   f"passing over them for the next ready draft")
         if not pool:
             print("send: no complete drafts to send")
+            return 0
+
+        pool, held = self._space_by_company(pool, today)
+        if held:
+            print(f"send: {len(held)} held back so colleagues are not mailed "
+                  "the same day, or because their company has answered")
+        if not pool:
+            print("send: every ready draft is waiting on a colleague's send")
             return 0
 
         budget = min(limit, remaining)

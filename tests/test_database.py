@@ -87,11 +87,41 @@ def test_daily_count_only_counts_successful_sends(db, company_id):
     assert db.sent_count_on("2026-09-07") == 0
 
 
-def test_one_person_per_company(db, company_id):
-    first = db.upsert_contact(Contact(email="a@acme.ai", company_id=company_id))
-    assert not db.company_has_contacted(company_id)
-    db.queue_draft(first, "Subject", "Body")
-    assert db.company_has_contacted(company_id)
+def test_company_cap_counts_the_queue(db, company_id):
+    assert db.company_slot(company_id, 2) == (True, "")
+    for local in ("a", "b"):
+        cid = db.upsert_contact(Contact(email=f"{local}@acme.ai", company_id=company_id))
+        db.queue_draft(cid, "Subject", "Body")
+    assert db.company_contacted_count(company_id) == 2
+    ok, why = db.company_slot(company_id, 2)
+    assert not ok and "2 contacted" in why
+    assert db.company_slot(company_id, 3) == (True, "")
+
+
+def test_a_reply_closes_the_company(db, company_id):
+    cid = db.upsert_contact(Contact(email="a@acme.ai", company_id=company_id))
+    db.set_contact_status(cid, REPLIED)
+    ok, why = db.company_slot(company_id, 3)
+    assert not ok and "replied" in why
+
+
+@pytest.mark.parametrize("reason,closes", [
+    ("opt-out reply", True), ("hard bounce", True), ("soft bounce", False),
+])
+def test_suppression_reasons_that_close_the_company(db, company_id, reason, closes):
+    db.upsert_contact(Contact(email="a@acme.ai", company_id=company_id))
+    db.suppress("a@acme.ai", reason)
+    assert bool(db.company_closed(company_id)) is closes
+
+
+def test_companies_sent_on_a_date(db, company_id):
+    other = db.upsert_company(Company(name="Other", domain="other.ai"))
+    a = db.upsert_contact(Contact(email="a@acme.ai", company_id=company_id))
+    b = db.upsert_contact(Contact(email="b@other.ai", company_id=other))
+    db.record_send(a, "a@acme.ai", "s", "", "smtp", "2026-10-21")
+    db.record_send(b, "b@other.ai", "s", "", "smtp", "2026-10-21", status="failed")
+    assert db.companies_sent_on("2026-10-21") == {company_id}
+    assert db.companies_sent_on("2026-10-22") == set()
 
 
 def test_requeue_updates_rather_than_duplicates(db, company_id):
@@ -152,6 +182,16 @@ def test_someone_who_opted_out_is_never_followed_up(db, company_id):
     cid = db.upsert_contact(Contact(email="a@acme.ai", company_id=company_id))
     _sent_days_ago(db, cid, "a@acme.ai", days=30)
     db.suppress("a@acme.ai", "opt-out reply")
+    assert db.due_for_followup(6, 2) == []
+
+
+def test_no_followup_once_a_colleague_replied(db, company_id):
+    a = db.upsert_contact(Contact(email="a@acme.ai", company_id=company_id))
+    b = db.upsert_contact(Contact(email="b@acme.ai", company_id=company_id))
+    _sent_days_ago(db, a, "a@acme.ai", days=10)
+    _sent_days_ago(db, b, "b@acme.ai", days=9)
+    assert len(db.due_for_followup(6, 2)) == 2
+    db.set_contact_status(b, REPLIED)
     assert db.due_for_followup(6, 2) == []
 
 

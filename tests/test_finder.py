@@ -237,3 +237,78 @@ def test_hiring_flag_outweighs_one_batch_of_recency():
 
 def test_unknown_batch_sinks_to_the_bottom():
     assert funding_score(record(batch=""), NOW) < 0
+
+
+# ------------------------------------------------- several people per company
+
+def _team_company(tmp_path, monkeypatch, people):
+    from src import finder
+    from src.database import Database
+    from src.models import Company
+    from src.scraper import Person, SiteScrape
+
+    db = Database(tmp_path / "team.db")
+    cid = db.upsert_company(Company(name="Acme", domain="acme.ai",
+                                    website="https://acme.ai",
+                                    yc_url="https://yc/acme"))
+    monkeypatch.setattr(finder, "parse_yc_founders",
+                        lambda html: [Person(*p) for p in people])
+    monkeypatch.setattr(finder, "scrape_site", lambda *a, **k: SiteScrape())
+    return db, db.get_company(cid)
+
+
+class _FetchAnything:
+    def get(self, url, respect_robots=True):
+        return "<html></html>"
+
+
+class _AcceptFirst:
+    """Every person's first candidate verifies."""
+
+    def __init__(self, db):
+        self.db = db
+
+    def first_verified(self, candidates, domain):
+        from src.models import VERIFIED
+        from src.verifier import Verdict
+        return candidates[0], Verdict(VERIFIED, "250 ok", 90)
+
+    def is_catchall(self, domain):
+        return False
+
+
+def test_enrich_returns_up_to_the_per_company_cap(tmp_path, monkeypatch):
+    from src.finder import enrich_company
+    people = [("Ada", "Lane", "CEO"), ("Ben", "Ruiz", "CTO"),
+              ("Cy", "Moss", "Founder"), ("Di", "Park", "Founder")]
+    db, row = _team_company(tmp_path, monkeypatch, people)
+    settings = SimpleNamespace(**{**SETTINGS.__dict__, "max_contacts_per_company": 3})
+    result = enrich_company(row, _FetchAnything(), _AcceptFirst(db), settings)
+    assert len(result.contacts) == 3
+    assert len({c.email for c in result.contacts}) == 3
+    # Role matches go first, so the CTO and founders beat the CEO.
+    assert "Ada" not in {c.first_name for c in result.contacts}
+    db.close()
+
+
+def test_a_cap_of_one_keeps_the_old_behaviour(tmp_path, monkeypatch):
+    from src.finder import enrich_company
+    db, row = _team_company(tmp_path, monkeypatch,
+                            [("Ben", "Ruiz", "CTO"), ("Cy", "Moss", "Founder")])
+    settings = SimpleNamespace(**{**SETTINGS.__dict__, "max_contacts_per_company": 1})
+    result = enrich_company(row, _FetchAnything(), _AcceptFirst(db), settings)
+    assert len(result.contacts) == 1
+    db.close()
+
+
+@pytest.mark.parametrize("email, author, expected", [
+    ("justin.aharoni@acme.ai", "Justin Aharoni", ("Justin", "Aharoni")),
+    ("justin@acme.ai", "Justin Aharoni", ("Justin", "Aharoni")),
+    ("jaharoni@acme.ai", "Justin Aharoni", ("Justin", "Aharoni")),
+    ("jacob17@acme.ai", "jacob17", ("", "")),
+    ("merlin@acme.ai", "Someone Else", ("", "")),
+    ("dev@acme.ai", "", ("", "")),
+])
+def test_commit_author_names_an_address_only_when_it_fits(email, author, expected):
+    from src.finder import _name_from_commit
+    assert _name_from_commit(email, author) == expected

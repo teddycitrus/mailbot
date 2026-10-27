@@ -50,6 +50,18 @@ class PoolDB:
     def due_for_followup(self, after_days, max_total_sends, limit=50):
         return []
 
+    sent_companies: set = set()
+    closed_companies: dict = {}
+
+    def companies_sent_on(self, _date):
+        return self.sent_companies
+
+    def company_closed(self, company_id):
+        return self.closed_companies.get(company_id, "")
+
+    def mark_draft(self, draft_id, status):
+        pass
+
 
 def bare(pool, **over):
     """A Pipeline wired only as far as send()'s selection logic reaches."""
@@ -75,7 +87,7 @@ def bare(pool, **over):
 
 # A body carrying the hosted resume link counts as complete; one with an
 # unedited ALL-CAPS hole never does.
-LINKED = "Hello there\n[View my resume](https://drive.google.com/file/d/abc/view)"
+LINKED = "Hello there\n[my resume](https://drive.google.com/file/d/abc/view)"
 HOLE = "I work on [YOUR FOCUS AREA]\n"
 
 
@@ -122,6 +134,33 @@ def test_the_daily_cap_still_beats_the_per_tick_limit(capsys):
     bot = bare(pool, send_ramp_enabled=False, daily_send_limit=3)
     bot.send(limit=25, ignore_window=True)
     assert len(sent_in_dry_run(capsys.readouterr().out)) == 3
+
+
+def test_colleagues_are_not_mailed_on_the_same_day(capsys):
+    pool = [draft("a@acme.ai", body=LINKED), draft("b@acme.ai", body=LINKED),
+            draft("c@beta.ai", body=LINKED)]
+    pool[0]["company_id"] = pool[1]["company_id"] = 1
+    pool[2]["company_id"] = 2
+    bare(pool).send(limit=5, ignore_window=True)
+    assert sent_in_dry_run(capsys.readouterr().out) == ["a@acme.ai", "c@beta.ai"]
+
+
+def test_a_company_mailed_earlier_today_waits_until_tomorrow(capsys):
+    pool = [draft("b@acme.ai", body=LINKED), draft("c@beta.ai", body=LINKED)]
+    pool[0]["company_id"], pool[1]["company_id"] = 1, 2
+    bot = bare(pool)
+    bot.db.sent_companies = {1}
+    bot.send(limit=5, ignore_window=True)
+    assert sent_in_dry_run(capsys.readouterr().out) == ["c@beta.ai"]
+
+
+def test_a_company_that_replied_gets_nobody_else(capsys):
+    pool = [draft("b@acme.ai", body=LINKED)]
+    pool[0]["company_id"] = 1
+    bot = bare(pool)
+    bot.db.closed_companies = {1: "someone there already replied"}
+    assert bot.send(limit=5, ignore_window=True) == 0
+    assert sent_in_dry_run(capsys.readouterr().out) == []
 
 
 # ------------------------------------------------------- the follow-up gates

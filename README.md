@@ -122,7 +122,7 @@ This is a cold email tool, so the restraint is the point:
 
 - A hard daily cap, defaulting to a deliberately low number
 - An address is contacted at most once, enforced by a unique index and a send log
-- One person per company, so it never looks like a blast
+- Up to three people per company (MAX_CONTACTS_PER_COMPANY), never two on the same day, and nobody else once one of them replies or opts out
 - Sends only during the recipient's own local morning, on weekdays
 - Replies asking to stop are honoured automatically, before the next send
 - Answers to replies are only ever saved as drafts, never sent by the tool

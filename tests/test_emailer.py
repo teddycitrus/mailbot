@@ -170,19 +170,19 @@ def test_resume_link_is_a_template_field():
 
 def test_link_line_is_empty_when_no_link_is_configured():
     assert resume_link_line("") == ""
-    assert resume_link_line(DRIVE) == f"[View my resume]({DRIVE})"
+    assert resume_link_line(DRIVE) == f"[my resume]({DRIVE})"
 
 
 def test_fallback_appends_the_link_to_a_body_that_lost_its_attachment():
     body = with_resume_link("Best,\nJohn\n", DRIVE)
-    assert body.endswith(f"[View my resume]({DRIVE})\n")
+    assert body.endswith(f"[my resume]({DRIVE})\n")
     assert has_resume_link(body)
 
 
 def test_fallback_does_not_add_a_second_copy_of_the_link():
     once = with_resume_link("Best,\nJohn\n", DRIVE)
     assert with_resume_link(once, DRIVE) == once
-    assert once.count("View my resume") == 1
+    assert once.count("my resume") == 1
 
 
 def test_a_normal_send_carries_the_pdf_and_no_link(tmp_path):
@@ -273,7 +273,7 @@ def test_message_carries_both_plain_and_html_parts():
 def test_attachment_survives_the_html_alternative(tmp_path):
     pdf = tmp_path / "resume.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake")
-    body = "Hi\n\n[View my resume](https://drive.google.com/x)\n"
+    body = "Hi\n\n[my resume](https://drive.google.com/x)\n"
     msg = build_message("s", body, "a@b.com", "", "j@x.com", "J",
                         attachments=[str(pdf)])
     assert [p.get_filename() for p in msg.iter_attachments()] == ["resume.pdf"]
@@ -362,3 +362,33 @@ def test_only_a_real_reply_prefix_is_stripped(subject, expected):
     """
     assert strip_re_prefix(subject) == expected
 
+
+
+def test_a_set_link_replaces_an_attachment_queued_earlier(tmp_path):
+    """Drafts queued with the PDF before RESUME_LINK was set go out with the
+    link instead, so the whole queue follows the current rule."""
+    from types import SimpleNamespace
+    from src.emailer import message_for_draft
+    pdf = tmp_path / "john_mannully_resume.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    settings = SimpleNamespace(resume_link=DRIVE, from_email="j@x.com",
+                               from_name="J", reply_to="", unsubscribe_mailto="")
+    draft = {"subject": "s", "body": "Best,\nJohn\nhttps://github.com/x\n",
+             "email": "a@b.com", "first_name": "A", "last_name": "",
+             "attachments": str(pdf)}
+    msg, note = message_for_draft(settings, draft)
+    assert list(msg.iter_attachments()) == []
+    plain = msg.get_body(preferencelist=("plain",)).get_content()
+    assert "my resume" in plain and DRIVE in plain
+    assert note == ""
+
+
+@pytest.mark.parametrize("name, blocked", [("", True), ("  ", True), ("Leo", False)])
+def test_a_draft_without_a_persons_name_is_blocked(name, blocked):
+    """Older drafts greeted a word lifted from the address: "Dear Main,"."""
+    from types import SimpleNamespace
+    from src.emailer import draft_defect
+    settings = SimpleNamespace(resume_link=DRIVE)
+    draft = {"subject": "s", "body": f"Hi\n[my resume]({DRIVE})\n",
+             "first_name": name, "attachments": ""}
+    assert (draft_defect(draft, settings) == "no person's name") is blocked

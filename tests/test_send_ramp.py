@@ -134,3 +134,17 @@ def test_bounce_pct_counts_contacts_the_inbox_marked_bounced(db):
     )
     db.conn.commit()
     assert db.recent_bounce_pct() == pytest.approx(25.0)
+
+
+def test_bounce_pct_before_a_day_ignores_that_days_sends(db):
+    """Today's clean sends must not dilute the rate and lift the hold mid-day."""
+    _sent(db, "a@x.com", "2026-10-23")
+    _sent(db, "b@x.com", "2026-10-23")
+    db.conn.execute(
+        "UPDATE contacts SET status = ? WHERE email = ?", (BOUNCED, "a@x.com")
+    )
+    db.conn.commit()
+    for name in ("c", "d", "e", "f", "g", "h"):
+        _sent(db, f"{name}@x.com", "2026-10-26")
+    assert db.recent_bounce_pct(before_local_date="2026-10-26") == pytest.approx(50.0)
+    assert db.recent_bounce_pct() == pytest.approx(12.5)

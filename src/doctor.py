@@ -191,6 +191,8 @@ def _port25(settings) -> Check:
 
 def _resume(settings) -> Check:
     path = settings.resume_path
+    if settings.resume_link:
+        return Check("resume", OK, "sent as a link (RESUME_LINK), no attachment")
     if not path.exists():
         # The hosted link is the fallback, so a missing PDF degrades the email
         # rather than stopping it. Without either, nothing can go out.

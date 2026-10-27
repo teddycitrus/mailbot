@@ -259,11 +259,13 @@ def _row_get(row, key: str, default: str = "") -> str:
 
 def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
                    settings, github=None) -> EnrichResult:
-    """Find the best reachable person at one company."""
+    """Find up to MAX_CONTACTS_PER_COMPANY reachable people at one company."""
+    cap = max(1, getattr(settings, "max_contacts_per_company", 1))
     domain = company_row["domain"]
     company_id = company_row["id"]
     contacts: list[Contact] = []
     gh_pattern = ""
+    commit_names: dict[str, str] = {}  # address -> commit author name
 
     # 1. Founder names, roles and bios from the public YC page.
     people: list[Person] = []
@@ -273,6 +275,9 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
         if html:
             people = parse_yc_founders(html)
     targeted = [p for p in people if role_matches(p, settings.target_roles)] or people
+    # Role matches first, then the rest of the team, so a company with one
+    # CTO and two other founders still yields more than one person.
+    targeted = targeted + [p for p in people if p not in targeted]
 
     # 2. Addresses the company publishes itself.
     scrape = scrape_site(fetcher, company_row["website"], domain)
@@ -291,7 +296,9 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
         if org:
             findings = github.harvest(org, domain)
             gh_pattern = findings.pattern
-            published |= {e for e in findings.emails if not is_never_send(e)}
+            commit_names = {e: n for e, n in findings.emails.items()
+                            if not is_never_send(e)}
+            published |= set(commit_names)
 
     # 3. A published personal address is the single best outcome.
     for email in sorted(published):
@@ -301,6 +308,8 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
         if verdict.confidence <= 0:
             continue
         first, last = _match_person(email, targeted)
+        if not first:
+            first, last = _name_from_commit(email, commit_names.get(email, ""))
         if first:
             # Every address tied to a real name teaches us this domain's
             # convention, which is what makes later guesses cheap and safe.
@@ -316,13 +325,25 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
             bio=_bio_for(first, targeted),
         ))
 
-    # 4. Otherwise guess from a founder name, but only where a guess is provable.
+    # 4. Then guess for the rest of the team, but only where a guess is provable.
     # first_verified folds the catch-all test into the same SMTP session, so we
     # deliberately do not pre-check is_catchall here; that would cost an extra
     # connection per company, which is the slowest thing in the pipeline.
     unprobed = False
-    if not contacts and targeted:
-        for person in targeted[:3]:
+
+    def covered(person) -> bool:
+        return any(c.first_name == person.first_name
+                   and c.last_name == person.last_name for c in contacts)
+
+    def full() -> bool:
+        return len(contacts) >= cap
+
+    if not full() and targeted:
+        for person in targeted[:max(3, cap)]:
+            if full():
+                break
+            if covered(person):
+                continue
             # Ordered by what we have learned: this domain's own convention
             # first, then the corpus-wide ordering. Fewer probes per hit.
             candidates = patterns.ordered_candidates(
@@ -335,7 +356,7 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
             if not found and verdict.status == UNVERIFIED:
                 # No server answered at all, so these guesses were never tested.
                 unprobed = True
-            if found:
+            if found and found not in {c.email for c in contacts}:
                 patterns.learn(verifier.db, found, person.first_name,
                                person.last_name, "verified")
                 contacts.append(Contact(
@@ -346,7 +367,6 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
                     verify_detail=verdict.detail, confidence=verdict.confidence,
                     status=PENDING,
                 ))
-                break
 
     # 4b. On a catch-all domain a guess is normally unprovable, but if the
     # team's own commits show the house pattern we are applying observed
@@ -355,11 +375,17 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
     # fall back to whatever the commit history showed this run.
     learned, evidence = patterns.known_pattern(verifier.db, domain)
     house_pattern = learned or gh_pattern
-    if not contacts and house_pattern and targeted and verifier.is_catchall(domain):
+    if (not full() and house_pattern and targeted
+            and verifier.is_catchall(domain)):
         for person in targeted:
+            if full():
+                break
+            if covered(person):
+                continue
             built = apply_pattern(house_pattern, person.first_name,
                                   person.last_name, domain)
-            if not built or is_never_send(built):
+            if (not built or is_never_send(built)
+                    or built in {c.email for c in contacts}):
                 continue
             contacts.append(Contact(
                 email=built, company_id=company_id,
@@ -370,7 +396,6 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
                                f"on {domain}"),
                 confidence=75, status=PENDING,
             ))
-            break
 
     # No shared-inbox fallback: hello@ and founders@ are refused at the send
     # gate, so a company with no person to write to is left without a contact.
@@ -378,7 +403,7 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
     contacts.sort(key=lambda c: -c.confidence)
     note = "" if contacts else _why_empty(people, published, verifier, domain,
                                           unprobed)
-    return EnrichResult(contacts=contacts[:1], note=note)
+    return EnrichResult(contacts=contacts[:cap], note=note)
 
 
 def _why_empty(people, published, verifier: Verifier, domain: str,
@@ -420,6 +445,20 @@ def _match_person(email: str, people: list[Person]) -> tuple[str, str]:
         ):
             return person.first_name, person.last_name
     return "", ""
+
+
+def _name_from_commit(email: str, author: str) -> tuple[str, str]:
+    """The commit author's name, when it is a full name the address fits.
+
+    The send gate only writes to people whose name we found, and commit
+    authors outside the YC founder list were being kept nameless and then
+    refused. A single-token author ("jacob17", "bot") is a handle, not a name.
+    """
+    parts = patterns.name_parts(author, email.split("@", 1)[1].split(".")[0])
+    if len(parts) < 2:
+        return "", ""
+    person = Person(first_name=parts[0].capitalize(), last_name=parts[-1].capitalize())
+    return _match_person(email, [person])
 
 
 def _role_for(first: str, people: list[Person]) -> str:

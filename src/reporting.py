@@ -128,7 +128,7 @@ def print_summary(db, settings, fetcher, personalizer) -> None:
     stats = db.stats()
     used = db.sent_count_on(today)
     cap, why_cap = settings.daily_cap(
-        db.active_send_days(today), db.recent_bounce_pct()
+        db.active_send_days(today), db.recent_bounce_pct(before_local_date=today)
     )
     print(f"\n{BAR}\nQUOTAS AND PIPELINE\n{BAR}")
     _print_table(

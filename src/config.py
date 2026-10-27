@@ -107,9 +107,9 @@ class Settings:
     db_path: Path
     template_path: Path
     resume_path: Path
-    # Hosted copy of the same resume. Used only when the PDF cannot be
-    # attached, never alongside it: a recipient who sees an attachment and
-    # a Drive link in the same message reads it as two documents.
+    # Hosted copy of the same resume. When set, it goes under the signature
+    # and the PDF is not attached; never both, since a recipient who sees an
+    # attachment and a Drive link in the same message reads it as two.
     resume_link: str
 
     # Targeting
@@ -161,6 +161,10 @@ class Settings:
     # host:port of a SOCKS5 relay for SMTP probes, empty to probe directly.
     # On the server this is the laptop's SSH tunnel; see verifier.py.
     smtp_probe_relay: str = ""
+    # People written to at one company, counting the queue. Colleagues are
+    # sent on different days, and a reply, opt-out or hard bounce from any
+    # of them closes the company. See Database.company_slot.
+    max_contacts_per_company: int = 3
 
     @classmethod
     def load(cls, env_file: str | os.PathLike[str] | None = ".env") -> "Settings":
@@ -233,6 +237,7 @@ class Settings:
             reply_template_path=_path("REPLY_TEMPLATE_PATH", "config/reply.txt"),
             priority_path=_path("PRIORITY_PATH", "config/priority.txt"),
             smtp_probe_relay=os.getenv("SMTP_PROBE_RELAY", "").strip(),
+            max_contacts_per_company=max(1, _int("MAX_CONTACTS_PER_COMPANY", 3)),
         )
 
     def daily_cap(self, active_days: int, bounce_pct: float) -> tuple[int, str]:

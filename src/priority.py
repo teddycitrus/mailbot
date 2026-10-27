@@ -13,7 +13,7 @@ stage after discovery: enriched first, drafted first, sent first.
 
 Nothing else is relaxed. A priority company still needs a contact that
 verifies, still obeys the suppression list, the daily cap, the send window and
-the one-contact-per-company rule. Being on the list changes what we look at
+the per-company contact cap. Being on the list changes what we look at
 and in what order, never what we are willing to send.
 
 The file is config/priority.txt, one company per line:

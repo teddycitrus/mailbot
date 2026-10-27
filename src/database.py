@@ -339,13 +339,55 @@ class Database:
             (status, limit),
         ).fetchall()
 
-    def company_has_contacted(self, company_id: int) -> bool:
-        """One person per company keeps the outreach from looking like a blast."""
-        return self.conn.execute(
-            """SELECT 1 FROM contacts
+    def company_contacted_count(self, company_id: int) -> int:
+        """People at this company already written to or waiting in the queue."""
+        return int(self.conn.execute(
+            """SELECT COUNT(*) FROM contacts
                WHERE company_id = ? AND status IN (?,?,?,?)""",
             (company_id, SENT, REPLIED, BOUNCED, QUEUED),
-        ).fetchone() is not None
+        ).fetchone()[0])
+
+    def company_closed(self, company_id: int) -> str:
+        """Why nobody else at this company should be written to, or "".
+
+        A reply means the conversation is happening; writing to a colleague
+        after that reads as going around them. An opt-out or a hard bounce
+        closes it too: the first is a no for the company, the second usually
+        means the address pattern we used for everyone there is wrong.
+        """
+        row = self.conn.execute(
+            """SELECT c.status, s.reason FROM contacts c
+               LEFT JOIN suppression s ON s.email = c.email
+               WHERE c.company_id = ?
+                 AND (c.status = ? OR s.reason IN ('opt-out reply', 'hard bounce'))
+               LIMIT 1""",
+            (company_id, REPLIED),
+        ).fetchone()
+        if row is None:
+            return ""
+        if row["status"] == REPLIED:
+            return "someone there already replied"
+        return f"a colleague's {row['reason']}"
+
+    def company_slot(self, company_id: int, cap: int) -> tuple[bool, str]:
+        """Whether one more person at this company may be queued."""
+        closed = self.company_closed(company_id)
+        if closed:
+            return False, closed
+        have = self.company_contacted_count(company_id)
+        if have >= cap:
+            return False, f"company already has {have} contacted"
+        return True, ""
+
+    def companies_sent_on(self, local_date: str) -> set[int]:
+        """Companies that got a first email on this date."""
+        return {r[0] for r in self.conn.execute(
+            """SELECT DISTINCT c.company_id FROM sends s
+               JOIN contacts c ON c.id = s.contact_id
+               WHERE s.local_date = ? AND s.status = 'sent'
+                 AND c.company_id IS NOT NULL""",
+            (local_date,),
+        )}
 
     # ---------- the duplicate-send gate ----------
 
@@ -426,7 +468,7 @@ class Database:
 
     def queued_drafts(self, limit: int = 100) -> list[sqlite3.Row]:
         return self.conn.execute(
-            """SELECT d.*, c.email, c.first_name, c.last_name, c.role,
+            """SELECT d.*, c.email, c.first_name, c.last_name, c.role, c.company_id,
                       co.name AS company_name, co.location AS company_location
                FROM drafts d
                JOIN contacts c ON c.id = d.contact_id
@@ -455,7 +497,7 @@ class Database:
     def drafts_to_mirror(self, limit: int = 50) -> list[sqlite3.Row]:
         """Queued drafts that have no copy in the Gmail Drafts folder yet."""
         return self.conn.execute(
-            """SELECT d.*, c.email, c.first_name, c.last_name, c.role,
+            """SELECT d.*, c.email, c.first_name, c.last_name, c.role, c.company_id,
                       co.name AS company_name, co.location AS company_location
                FROM drafts d
                JOIN contacts c ON c.id = d.contact_id
@@ -522,10 +564,17 @@ class Database:
                LEFT JOIN companies co ON co.id = c.company_id
                WHERE c.status = ?
                  AND c.email NOT IN (SELECT email FROM suppression)
+                 -- A colleague answered or opted out, so the company has
+                 -- spoken and a bump to this person would talk over them.
+                 AND NOT EXISTS (
+                     SELECT 1 FROM contacts o
+                     LEFT JOIN suppression os ON os.email = o.email
+                     WHERE o.company_id = c.company_id AND o.id <> c.id
+                       AND (o.status = ? OR os.reason = 'opt-out reply'))
                GROUP BY c.id
                HAVING COUNT(s.id) < ? AND MAX(s.sent_at) <= ?
                ORDER BY MAX(s.sent_at) LIMIT ?""",
-            (SENT, max_total_sends, cutoff, limit),
+            (SENT, REPLIED, max_total_sends, cutoff, limit),
         ).fetchall()
 
     # ---------- sends ----------
@@ -568,19 +617,26 @@ class Database:
         ).fetchone()
         return int(row["n"])
 
-    def recent_bounce_pct(self, window: int = 100) -> float:
+    def recent_bounce_pct(self, window: int = 100,
+                          before_local_date: str = "") -> float:
         """Bounce rate over the most recent `window` sends, as a percentage.
 
         The inbox scan records a bounce on the contact rather than on the
         send row, so this joins back to contacts to count them.
+
+        With `before_local_date`, only sends from earlier days count, so the
+        figure holds still for the whole of that day. Counting today's sends
+        let each clean delivery dilute the rate under the limit and lift the
+        hold mid-morning: one day went 18 out against a cap of 8.
         """
         row = self.conn.execute(
             """SELECT COUNT(*) AS total,
                       SUM(CASE WHEN c.status = ? THEN 1 ELSE 0 END) AS bounced
                FROM (SELECT contact_id FROM sends
-                     WHERE status = 'sent' ORDER BY id DESC LIMIT ?) s
+                     WHERE status = 'sent' AND (? = '' OR local_date < ?)
+                     ORDER BY id DESC LIMIT ?) s
                JOIN contacts c ON c.id = s.contact_id""",
-            (BOUNCED, max(1, window)),
+            (BOUNCED, before_local_date, before_local_date, max(1, window)),
         ).fetchone()
         total = int(row["total"] or 0)
         if not total:
@@ -625,6 +681,22 @@ class Database:
     def find_contact_by_email(self, email: str) -> Optional[sqlite3.Row]:
         return self.conn.execute(
             "SELECT * FROM contacts WHERE email = ?", (email.lower(),)
+        ).fetchone()
+
+    def contact_for_thread(self, message_ids: list[str]) -> Optional[sqlite3.Row]:
+        """The contact whose sent message one of these Message-IDs names.
+
+        Lets a reply be recognised when it comes from a different address
+        than the one written to, as when gc@ answers the note sent to git@.
+        """
+        ids = [m.strip() for m in message_ids if m.strip()]
+        if not ids:
+            return None
+        marks = ",".join("?" * len(ids))
+        return self.conn.execute(
+            f"""SELECT c.* FROM sends s JOIN contacts c ON c.id = s.contact_id
+                WHERE s.message_id IN ({marks}) LIMIT 1""",
+            ids,
         ).fetchone()
 
     # ---------- domain cache ----------

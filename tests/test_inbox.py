@@ -332,3 +332,24 @@ def test_an_opt_out_still_in_the_inbox_is_logged_once(tmp_path, monkeypatch,
 def test_drafts_folder_falls_back_without_special_use():
     conn = SimpleNamespace(list=lambda: ("OK", [b'(\\HasNoChildren) "/" "INBOX"']))
     assert drafts_mailbox(conn) == "Drafts"
+
+
+def test_reply_from_a_colleague_in_our_thread_counts(tmp_path, monkeypatch,
+                                                      db_with_send):
+    """gc@ answering the note sent to git@ must close the company."""
+    imap = FakeIMAP([_reply(sender="Giuseppe <gc@acme.ai>").as_string()])
+    monkeypatch.setattr(inbox.imaplib, "IMAP4_SSL", imap)
+    scan = scan_inbox(_settings(tmp_path), db_with_send)
+    assert scan.replied == ["stefan@acme.ai"]
+    assert db_with_send.find_contact_by_email("stefan@acme.ai")["status"] == "replied"
+
+
+def test_unrelated_mail_from_a_stranger_is_ignored(tmp_path, monkeypatch,
+                                                   db_with_send):
+    msg = email_lib.message_from_string(
+        "From: news@other.com\nTo: ada@example.com\nSubject: Weekly\n"
+        "Message-ID: <n-1@other.com>\n\nHello\n")
+    imap = FakeIMAP([msg.as_string()])
+    monkeypatch.setattr(inbox.imaplib, "IMAP4_SSL", imap)
+    scan = scan_inbox(_settings(tmp_path), db_with_send)
+    assert scan.replied == [] and scan.drafted == []

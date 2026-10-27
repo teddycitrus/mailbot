@@ -74,7 +74,7 @@ def test_attachment_pointing_at_a_deleted_file_is_blocked(tmp_path):
 
 def test_draft_carrying_the_resume_link_instead_of_a_pdf_passes():
     """The link is the fallback, so a draft using it is complete, not broken."""
-    body = f"Hello Stefan\n[View my resume]({DRIVE_LINK})\n"
+    body = f"Hello Stefan\n[my resume]({DRIVE_LINK})\n"
     ready, blocked = pipeline(resume_link=DRIVE_LINK)._split_incomplete(
         [draft(body=body, attachments="")]
     )
@@ -134,7 +134,7 @@ def _pipeline_for_send(tmp_path, monkeypatch, raises):
     pdf.write_bytes(b"%PDF-1.4")
     obj.db = Database(tmp_path / "s.db")
     cid = obj.db.upsert_company(Company(name="Acme", domain="acme.ai"))
-    ct = obj.db.upsert_contact(Contact(email="a@acme.ai", company_id=cid))
+    ct = obj.db.upsert_contact(Contact(email="a@acme.ai", first_name="Ann", company_id=cid))
     obj.db.queue_draft(ct, "Subj", "Body\n", [str(pdf)])
 
     def boom(*_a, **_k):
@@ -197,7 +197,7 @@ def _deliverable(tmp_path, attachment, resume_link):
     )
     obj.db = Database(tmp_path / "d.db")
     cid = obj.db.upsert_company(Company(name="Acme", domain="acme.ai"))
-    ct = obj.db.upsert_contact(Contact(email="a@acme.ai", company_id=cid))
+    ct = obj.db.upsert_contact(Contact(email="a@acme.ai", first_name="Ann", company_id=cid))
     obj.db.queue_draft(ct, "Subj", "Best,\nJohn\n", [attachment])
     return obj, obj.db.queued_drafts(limit=1)
 
@@ -211,20 +211,31 @@ def test_delivery_falls_back_to_the_link_when_the_pdf_has_gone(tmp_path, capsys)
     assert list(msg.iter_attachments()) == []
     body = msg.get_body(preferencelist=("plain",)).get_content()
     assert DRIVE_LINK in body
-    assert "using the resume link" in capsys.readouterr().out
     obj.db.close()
 
 
-def test_a_present_pdf_is_attached_and_the_link_stays_out(tmp_path):
+def test_a_set_link_wins_over_a_present_pdf(tmp_path):
+    """Cold mail with a PDF from a stranger gets filtered; the link replaces it."""
     pdf = tmp_path / "john_mannully_resume.pdf"
     pdf.write_bytes(b"%PDF-1.4")
     obj, drafts = _deliverable(tmp_path, str(pdf), DRIVE_LINK)
     backend = _Recorder()
     assert obj._deliver(backend, drafts, "2026-09-10") == 1
     msg = backend.sent[0]
+    assert list(msg.iter_attachments()) == []
+    assert DRIVE_LINK in msg.get_body(preferencelist=("plain",)).get_content()
+    obj.db.close()
+
+
+def test_without_a_link_a_present_pdf_is_attached(tmp_path):
+    pdf = tmp_path / "john_mannully_resume.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    obj, drafts = _deliverable(tmp_path, str(pdf), "")
+    backend = _Recorder()
+    assert obj._deliver(backend, drafts, "2026-09-10") == 1
+    msg = backend.sent[0]
     assert [a.get_filename() for a in msg.iter_attachments()] == [
         "john_mannully_resume.pdf"]
-    assert DRIVE_LINK not in msg.as_string()
     obj.db.close()
 
 

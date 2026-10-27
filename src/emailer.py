@@ -73,11 +73,12 @@ KNOWN_FIELDS = frozenset({
 })
 
 
-# The resume travels as an attachment. The hosted link is the fallback for the
-# one case the attachment cannot cover, and the two never ship together: Gmail
+# The resume travels as a hosted link under the signature whenever RESUME_LINK
+# is set; the PDF is attached only when there is no link. A PDF from a stranger
+# is a strong spam signal for cold mail, and the two never ship together: Gmail
 # renders a Drive link as its own chip beside the attachment, so a message
 # carrying both looks like it holds two different resumes.
-RESUME_LINK_LABEL = "View my resume"
+RESUME_LINK_LABEL = "my resume"
 
 
 def resume_link_line(url: str) -> str:
@@ -365,7 +366,8 @@ def message_for_draft(settings, draft) -> tuple[EmailMessage, str]:
 
     Returns the message and a note, which is empty unless the resume PDF had
     gone missing since the draft was queued and the hosted link was used in
-    its place. Raises FileNotFoundError when there is no link to fall back to,
+    its place. A draft queued with the PDF before RESUME_LINK was set goes out
+    with the link instead, so the queue follows the current rule. Raises FileNotFoundError when there is no link to fall back to,
     because a draft that promises a resume and carries neither is not a draft
     worth sending.
 
@@ -374,6 +376,13 @@ def message_for_draft(settings, draft) -> tuple[EmailMessage, str]:
     """
     attachments = [a for a in (draft["attachments"] or "").split("|") if a]
     to_name = " ".join(p for p in (draft["first_name"], draft["last_name"]) if p)
+    if attachments and settings.resume_link:
+        return build_message(
+            draft["subject"], with_resume_link(draft["body"], settings.resume_link),
+            draft["email"], to_name,
+            settings.from_email, settings.from_name, settings.reply_to,
+            settings.unsubscribe_mailto,
+        ), ""
     try:
         return build_message(
             draft["subject"], draft["body"], draft["email"], to_name,
@@ -403,6 +412,10 @@ def draft_defect(draft, settings) -> str:
     holes = unedited_markers(f"{draft['subject']}\n{draft['body']}")
     if holes:
         return f"unedited template: {', '.join(holes[:2])}"
+    # Drafts queued before the queue insisted on a real name still greet the
+    # company or a word lifted from the address ("Dear Main,").
+    if "first_name" in draft.keys() and not (draft["first_name"] or "").strip():
+        return "no person's name"
     attachments = [a for a in (draft["attachments"] or "").split("|") if a]
     # A draft carrying the hosted link instead of the PDF is complete: that is
     # the fallback the queue applies when there is nothing to attach. One or
