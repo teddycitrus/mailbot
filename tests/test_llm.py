@@ -1,8 +1,8 @@
-"""The alignment sentence: word cap, claim whitelist, and clean omission.
+"""The personal line: John's half is fixed text, the model only describes them.
 
-The claim whitelist is the important one. John asked that emails only assert
-things backed by his resume or GitHub, so a sentence naming experience outside
-ASPECTS must be rejected rather than sent.
+The claim rule is the important one. John asked that emails only assert things
+backed by his resume or GitHub, so nothing the model writes may speak for him,
+and a company with no plain overlap gets no line at all.
 """
 
 from __future__ import annotations
@@ -10,15 +10,12 @@ from __future__ import annotations
 import pytest
 
 from src.llm import (
-    ASPECTS, MAX_RETRIES, Personalizer, WORD_LIMIT, to_ascii, uses_only_allowed,
-    word_count,
+    BANNED, FACT_LINES, MAX_RETRIES, OPENERS, Personalizer, WORD_LIMIT,
+    clean_what, compose, match_aspect, to_ascii, word_count,
 )
 
-GOOD = ("Reducto's mission to automate document workflows aligns with my work "
-        "in computer-vision pipelines and agent-accessible tooling over MCP.")
-OFF_LIST = ("Ubicloud's mission to provide an open source cloud aligns with my "
-            "work in cloud infrastructure automation and scalable web services.")
-TOO_LONG = GOOD.replace("aligns", "and a great many other worthy ambitions besides aligns")
+AGENTS = "The infrastructure to run coding agents for your team"
+GOOD = "giving coding agents a place to run for whole teams"
 
 
 class ScriptedPersonalizer(Personalizer):
@@ -34,8 +31,8 @@ class ScriptedPersonalizer(Personalizer):
         return self.replies.pop(0) if self.replies else ""
 
 
-def line(p):
-    return p.line_for("Reducto", "agentic document platform", "detail")
+def line(p, one_liner=AGENTS, description=""):
+    return p.line_for("Agent Relay", one_liner, description)
 
 
 # ------------------------------------------------------------ helpers
@@ -51,52 +48,134 @@ def test_ascii_normalisation():
     assert to_ascii("a — b") == "a - b"
 
 
-def test_whitelist_detection():
-    assert uses_only_allowed(GOOD)
-    assert not uses_only_allowed(OFF_LIST)
+def test_fact_lines_are_plain_and_short():
+    """John's half is sent verbatim, so it must obey his own style rules."""
+    for lines in FACT_LINES.values():
+        for fact in lines:
+            assert ";" not in fact and "—" not in fact and "–" not in fact
+            assert fact.isascii()
+            assert not any(stem in fact.lower() for stem in BANNED)
+            assert word_count(fact) <= 32
 
 
-def test_aspects_are_unique_and_short_enough_to_fit():
-    """Each aspect is copied verbatim into a 24-word sentence, so keep them short."""
-    assert len(ASPECTS) == len(set(ASPECTS))
-    assert all(word_count(a) <= 6 for a in ASPECTS)
+def test_every_composed_line_fits_the_word_limit():
+    longest = "w" + " word" * 11
+    for opener in OPENERS:
+        for aspect, lines in FACT_LINES.items():
+            for fact in lines:
+                assert word_count(f"{opener} {longest}. {fact}") <= WORD_LIMIT
 
 
-# ------------------------------------------------------- accept / reject
+# ------------------------------------------------------------ matching
 
-def test_good_sentence_is_used_first_try():
+@pytest.mark.parametrize("one_liner, aspect", [
+    (AGENTS, "agent-accessible tooling over MCP"),
+    ("Turn any website into an MCP for your agents", "agent-accessible tooling over MCP"),
+    ("The AI fraud hunter", "real-time risk monitoring"),
+    ("Speaking coach for non-native English professionals", "speech-driven interfaces"),
+    ("100% automated inspection for consumer electronics parts", "computer-vision pipelines"),
+    ("Robots for vehicle maintenance.", "computer-vision pipelines"),
+])
+def test_plain_overlaps_are_matched(one_liner, aspect):
+    assert match_aspect(one_liner) == aspect
+
+
+@pytest.mark.parametrize("one_liner", [
+    "Open source alternative to AWS",
+    "Build games at the speed of thought",
+    "AI Video Production for Professionals",          # generating, not seeing
+    "Bookkeeping for SMBs, contractors & ecommerce",  # ecommerce as a customer
+    "Maps what employees do and what it costs",
+])
+def test_stretches_get_no_match(one_liner):
+    assert match_aspect(one_liner) == ""
+
+
+def test_a_passing_mention_in_the_description_is_not_enough():
+    assert match_aspect("Build games fast", "players can use voice chat") == ""
+
+
+def test_shipping_fast_never_matches_on_its_own():
+    assert "shipping full-stack features quickly" not in FACT_LINES
+
+
+# ------------------------------------------------------------ the phrase
+
+@pytest.mark.parametrize("raw, expected", [
+    (GOOD, GOOD),
+    (f"WHAT: {GOOD}.", GOOD),
+    (f"Saw you're {GOOD}", GOOD),
+])
+def test_clean_what_accepts_and_tidies(raw, expected):
+    assert clean_what(raw) == expected
+
+
+@pytest.mark.parametrize("bad", [
+    "",
+    "agents for teams",                                       # no -ing verb
+    "building",                                               # too short
+    "building " + "very " * 12 + "long things",               # too long
+    "building agents; and more for teams",                    # semicolon
+    "building agents — fast, for teams",                      # em dash
+    "building agents for teams!",                             # exclamation
+    "revolutionizing how teams run their coding agents",      # marketing word
+    "building a seamless home for coding agents",
+    "building the leading platform for coding agents",
+])
+def test_clean_what_rejects_generated_sounding_phrases(bad):
+    assert clean_what(bad) == ""
+
+
+def test_compose_restores_names_and_ai():
+    out = compose("Mage", "building mage's ai tools for app developers",
+                  "agent-accessible tooling over MCP")
+    assert "Mage's AI tools" in out
+    assert "an API for" in compose("X", "turning any website into an api for agents",
+                                   "agent-accessible tooling over MCP")
+    assert "maintenance" in compose("X", "building ai tools for maintenance crews",
+                                    "computer-vision pipelines")
+
+
+def test_compose_is_stable_per_company():
+    a = compose("Acme", GOOD, "agent-accessible tooling over MCP")
+    assert a == compose("Acme", GOOD, "agent-accessible tooling over MCP")
+
+
+# ------------------------------------------------------- line_for
+
+def test_good_phrase_is_used_first_try():
     p = ScriptedPersonalizer([GOOD])
-    assert line(p) == GOOD
+    out = line(p)
+    assert GOOD in out and "Nora" in out
     assert p.asked == 1
 
 
-def test_off_list_claim_is_rejected_then_retried():
-    p = ScriptedPersonalizer([OFF_LIST, GOOD])
-    assert line(p) == GOOD
+def test_no_overlap_means_no_line_and_no_model_call():
+    p = ScriptedPersonalizer([GOOD])
+    assert line(p, one_liner="Open source alternative to AWS") == ""
+    assert p.asked == 0
+
+
+def test_bad_phrase_is_retried():
+    p = ScriptedPersonalizer(["revolutionizing agent infrastructure", GOOD])
+    assert GOOD in line(p)
     assert p.asked == 2
-
-
-def test_over_long_sentence_is_rejected():
-    p = ScriptedPersonalizer([TOO_LONG, GOOD])
-    assert word_count(TOO_LONG) > WORD_LIMIT
-    assert line(p) == GOOD
 
 
 def test_empty_response_is_retried():
     """The usual real failure: the reasoning model returns empty content."""
     p = ScriptedPersonalizer(["", "", GOOD])
-    assert line(p) == GOOD
+    assert GOOD in line(p)
 
 
 def test_paragraph_is_omitted_when_every_attempt_fails():
-    """John asked for no filler: an unusable line means no paragraph at all."""
-    p = ScriptedPersonalizer([OFF_LIST] * (MAX_RETRIES + 2))
+    p = ScriptedPersonalizer(["nope"] * (MAX_RETRIES + 2))
     assert line(p) == ""
 
 
 def test_omitted_when_no_api_key():
     p = Personalizer("", "model")
-    assert p.line_for("X", "y", "z") == ""
+    assert line(p) == ""
 
 
 def test_omitted_when_budget_spent():
@@ -115,84 +194,3 @@ def test_budget_caps_retries_before_max_retries():
     p = ScriptedPersonalizer([""] * 50, max_calls=2)
     assert line(p) == ""
     assert p.asked == 2
-
-
-# ---------------------------------------------- structural shape of the line
-
-from src.llm import well_formed  # noqa: E402
-
-SKILLS_IN_MISSION = ("Synthio Labs's mission to agent-accessible tooling over MCP "
-                     "aligns with my work in agent-accessible tooling over MCP.")
-DUP_ACROSS_HINGE = ("Reducto's mission to automate documents with agent-accessible "
-                    "tooling over MCP aligns with my work in agent-accessible "
-                    "tooling over MCP and computer-vision pipelines.")
-TRAILING_CLAIM = ("Acme's mission to do useful things aligns with my work in "
-                  "computer-vision pipelines and deep distributed systems expertise.")
-
-
-def test_well_formed_accepts_the_intended_shape():
-    assert well_formed(GOOD)
-
-
-@pytest.mark.parametrize("bad", [
-    SKILLS_IN_MISSION,
-    DUP_ACROSS_HINGE,
-    TRAILING_CLAIM,
-    "Acme is great and I like computer-vision pipelines.",
-    "Acme's mission aligns with my work in aligns with my work in x.",
-    "Short aligns with my work in computer-vision pipelines.",
-])
-def test_well_formed_rejects_malformed(bad):
-    assert not well_formed(bad)
-
-
-def test_line_for_rejects_gibberish_and_omits(capsys):
-    """Gibberish is worse than nothing, so it must not reach an email."""
-    p = ScriptedPersonalizer([SKILLS_IN_MISSION] * 6)
-    assert line(p) == ""
-
-
-def test_line_for_recovers_after_a_malformed_attempt():
-    p = ScriptedPersonalizer([DUP_ACROSS_HINGE, GOOD])
-    assert line(p) == GOOD
-
-
-# ------------------------------------- relevance: only evident connections
-
-from src.llm import DECLINE, connection_is_evident  # noqa: E402
-
-UBICLOUD = "Ubicloud open source alternative to AWS, cloud servers and hosting"
-ARINI = "Arini AI receptionist for dentists that handles patient phone calls"
-
-
-def test_stretch_connection_is_rejected():
-    """A cloud host has nothing to do with computer vision."""
-    s = ("Ubicloud's mission to provide open source cloud aligns with my work "
-         "in computer-vision pipelines and speech-driven interfaces.")
-    assert not connection_is_evident(s, UBICLOUD)
-
-
-def test_evident_connection_is_kept():
-    s = ("Arini's mission to automate dental calls aligns with my work in "
-         "speech-driven interfaces and autonomous incident briefings.")
-    assert connection_is_evident(s, ARINI)
-
-
-def test_shipping_fast_alone_never_counts_as_a_connection():
-    """"I ship fast" is not a link to any company's mission."""
-    s = ("Acme's mission to do something aligns with my work in shipping "
-         "full-stack features quickly.")
-    assert not connection_is_evident(s, "Acme does something entirely unrelated")
-
-
-def test_model_declining_omits_without_retrying():
-    p = ScriptedPersonalizer([DECLINE, GOOD])
-    assert p.line_for("Acme", "unrelated widget maker", "") == ""
-    assert p.asked == 1, "a refusal is an answer, not a failure to retry"
-
-
-def test_irrelevant_but_well_formed_line_is_dropped():
-    s = ("Ubicloud's mission to provide open source cloud aligns with my work "
-         "in computer-vision pipelines and speech-driven interfaces.")
-    p = ScriptedPersonalizer([s] * 6)
-    assert p.line_for("Ubicloud", "open source alternative to AWS", "") == ""

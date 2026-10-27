@@ -17,6 +17,7 @@ blocks urllib's default user agent with error 1010.
 from __future__ import annotations
 
 import re
+import zlib
 
 import requests
 
@@ -25,8 +26,8 @@ from .config import app_root
 from .ratelimit import Budget, RateLimiter
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-# "<25 words" means 24 is the most that qualifies.
-WORD_LIMIT = 24
+# What they build, what John built and what was a grind, then a question.
+WORD_LIMIT = 50
 MAX_RETRIES = 3
 
 def load_aspects() -> list[str]:
@@ -75,26 +76,20 @@ def cues_for(aspect: str) -> set[str]:
 
 
 SYSTEM = (
-    "You write ONE sentence for a cold internship email, following an exact "
-    "template. Output only the sentence, nothing else.\n\n"
-    "TEMPLATE: <Company>'s mission to <A> aligns with my work in <X> and <Y>.\n"
-    "Optionally: <Company>'s mission to <A> and <B> aligns with my work in "
-    "<X> and <Y>.\n\n"
-    "RULES:\n"
-    "- Under 25 words. This is absolute.\n"
-    "- <A> and <B> describe what the company does, in your own plain words.\n"
-    "- <X> and <Y> MUST be copied verbatim from the ALLOWED list. Never invent "
-    "any other experience.\n"
-    "- Pick the two ALLOWED items most genuinely relevant to this company.\n"
-    "- NEVER put an ALLOWED item in <A> or <B>. Those describe the company only, "
-    "in your own words. ALLOWED items appear ONLY after 'aligns with my work in'.\n"
-    "- After the two ALLOWED items, stop. Add nothing further.\n"
-    "- Plain text. No markdown, no emoji, no em dash, no flattery.\n\n"
-    "EXAMPLE: Huscarl's mission to quantify emerging risks and keep actuarial "
-    "models audit-ready aligns with my work in real-time risk monitoring and "
-    "autonomous incident briefings."
+    "You describe what a startup builds, for one line of a cold email. Answer "
+    "with only the phrase, nothing else.\n\n"
+    "Rules:\n"
+    "- It must fit after \"Saw you're\". Start with an -ing verb.\n"
+    "- 4 to 12 words, normal grammar with articles.\n"
+    "- Say concretely what the product does and for whom, the way you would "
+    "tell a friend. Not the vision, not the market.\n"
+    "- Plain everyday words, lowercase except names. Commas and hyphens only.\n"
+    "- Never use marketing words like mission, revolutionize, empower, "
+    "seamless, leverage, innovative, cutting-edge, solutions, platform.\n\n"
+    "Good: building phone agents that book appointments for dental offices\n"
+    "Good: giving coding agents a place to run for whole teams\n"
+    "Bad: revolutionizing the future of work with AI-powered solutions"
 )
-
 
 # Models emit typographic punctuation. Plain ASCII travels better in email and
 # matches the rest of the template.
@@ -114,9 +109,6 @@ def to_ascii(text: str) -> str:
 def word_count(text: str) -> int:
     return len(re.findall(r"\S+", text))
 
-
-HINGE = "aligns with my work in"
-DECLINE = "NONE"
 
 # Words that signal a company genuinely works in the same territory as one of
 # John's projects. Used as a backstop on top of the model's own judgement: if
@@ -164,56 +156,151 @@ ASPECT_CUES: dict[str, set[str]] = {
 }
 
 
-def connection_is_evident(sentence: str, company_text: str,
-                          aspects: list[str] = ASPECTS) -> bool:
-    """True when at least one chosen aspect is echoed by the company's own words."""
-    low = sentence.lower()
-    if HINGE not in low:
-        return False
-    work = low.split(HINGE, 1)[1]
-    chosen = [a for a in aspects if a.lower() in work]
-    blob = (company_text or "").lower()
-    return any(
-        any(cue in blob for cue in cues_for(aspect))
-        for aspect in chosen
-    )
+# John's half of the line, written by hand so nothing about him is ever
+# generated: what he built, the part of it that was a grind, and a question
+# about how the company handles the same thing. The question is what gives a
+# founder a reason to reply; the pain point is what shows he has actually done
+# this work. Each pain is one nearly everyone who builds that kind of thing hits.
+#
+# aspect: (what he built, the annoying part)
+FACT_PARTS: dict[str, tuple[str, str]] = {
+    "agent-accessible tooling over MCP": (
+        "an MCP endpoint for Nora",
+        "getting the model to reliably pick the right tool"),
+    "autonomous incident briefings": (
+        "Vapi voice agents for Eureka",
+        "handling interruptions so the agent didn't talk over people"),
+    "speech-driven interfaces": (
+        "the speech side of Iris",
+        "making the voice sound natural instead of flat and robotic"),
+    "real-time risk monitoring": (
+        "the risk monitoring in Eureka",
+        "flagging real problems without drowning people in false alarms"),
+    "supply-chain disruption detection": (
+        "supply chain disruption detection for Eureka",
+        "matching messy news mentions to the right supplier"),
+    "brand and product evaluation": (
+        "Nora's brand scoring",
+        "pulling consistent signals out of product pages that were all built differently"),
+    "visual similarity scoring": (
+        "visual similarity scoring for Nora",
+        "getting CLIP scores to match what a person would call similar"),
+    "computer-vision pipelines": (
+        "a computer vision pipeline for Iris",
+        "keeping it accurate when lighting and camera angles changed"),
+}
+
+# Rotated so consecutive emails do not end the same way.
+QUESTIONS = (
+    "Curious how you handle that.",
+    "Would love to hear how you deal with it.",
+)
+
+FACT_LINES: dict[str, list[str]] = {
+    aspect: [f"When I built {built}, the annoying part was {pain}. {question}"
+             for question in QUESTIONS]
+    for aspect, (built, pain) in FACT_PARTS.items()
+}
+
+# How the company half is introduced. Rotated per company.
+OPENERS = ["Saw you're", "Looks like you're", "Saw that you're", "Read that you're"]
+
+# Stems that make a line read as generated or as marketing copy.
+BANNED = (
+    "mission", "align", "passion", "excit", "thrill", "innovat", "cutting",
+    "leverag", "revolution", "resonat", "impress", "journey", "seamless",
+    "empower", "transform", "landscape", "game-chang", "unlock", "streamlin",
+    "robust", "synerg", "delve", "elevat", "harness", "solution", "platform",
+    "next-gen", "world-class", "intersection", "ecosystem", "paradigm",
+    "supercharg", "reimagin", "redefin", "pioneer",
+)
+ALLOWED_CHARS = re.compile(r"^[A-Za-z0-9 ,'\-&/.]+$")
 
 
-def uses_only_allowed(sentence: str, aspects: list[str] = ASPECTS) -> bool:
-    """At least one allowed aspect must appear, or the model went off-script."""
-    low = sentence.lower()
-    return any(aspect.lower() in low for aspect in aspects)
+def _pick(options: list[str], key: str) -> str:
+    """A stable choice per company, so a retry renders the same line."""
+    return options[zlib.crc32(key.encode("utf-8")) % len(options)]
 
 
-def well_formed(sentence: str, aspects: list[str] = ASPECTS) -> bool:
-    """Check the sentence actually has the shape John asked for.
+# What has to appear in the company's own words before a project of John's is
+# brought up, matched at the start of a word. Ordered by preference when more
+# than one fits. Kept narrow on purpose: a stretch reads worse than no line.
+MATCH_CUES: dict[str, tuple[str, ...]] = {
+    "agent-accessible tooling over MCP": ("agent", "mcp"),
+    "autonomous incident briefings": ("on-call", "incident", "receptionist",
+                                      "phone call", "calls"),
+    "speech-driven interfaces": ("voice", "speech", "speak", "spoken", "audio",
+                                 "transcri", "conversation"),
+    "real-time risk monitoring": ("risk", "fraud", "complian", "threat",
+                                  "security", "monitoring", "alert"),
+    "supply-chain disruption detection": ("supply chain", "supplier", "logistic",
+                                          "freight", "procurement"),
+    "visual similarity scoring": ("visual search", "image search", "similar"),
+    # Seeing, not generating: an AI video studio is not computer vision.
+    "computer-vision pipelines": ("computer vision", "camera", "ocr", "robot",
+                                  "perception", "inspection", "detect"),
+    # Not "ecommerce" alone: that shows up in customer lists, as in a
+    # bookkeeping firm serving "SMBs, contractors & ecommerce".
+    "brand and product evaluation": ("brand", "shopify", "storefront",
+                                     "product catalog"),
+}
 
-    The failure this catches is the model dropping John's own skills into the
-    company's half, producing things like "Synthio Labs's mission to
-    agent-accessible tooling over MCP aligns with my work in agent-accessible
-    tooling over MCP". That is gibberish, and gibberish is worse than omitting
-    the paragraph, so it is rejected here.
+
+def _hits(cues: tuple[str, ...], text: str) -> int:
+    return sum(bool(re.search(r"\b" + re.escape(cue), text, re.I)) for cue in cues)
+
+
+def match_aspect(one_liner: str, description: str = "",
+                 aspects: list[str] = ASPECTS) -> str:
+    """The one claim of John's this company plainly relates to, or "".
+
+    Decided here rather than by the model, which turned down agent-tooling
+    companies and tied a game studio to voice work. A cue in the one-liner
+    counts; the longer description needs three different cues, because a
+    passing mention there is not what the company does.
     """
-    low = sentence.lower()
-    if low.count(HINGE) != 1:
-        return False
-    mission, work = low.split(HINGE, 1)
-    mission, work = mission.strip(), work.strip()
-    if len(mission.split()) < 4 or not work:
-        return False
-    # John's skills belong only after the hinge, never in the company's clause.
-    if any(a.lower() in mission for a in aspects):
-        return False
-    used = [a for a in aspects if a.lower() in work]
-    if not 1 <= len(used) <= 2:
-        return False
-    # The work half should be the listed aspects joined by "and", not prose
-    # with extra invented claims trailing off it.
-    remainder = work
-    for aspect in used:
-        remainder = remainder.replace(aspect.lower(), "")
-    remainder = re.sub(r"[\s,.;]|\band\b", "", remainder)
-    return not remainder
+    # aspects.txt is read lowercased, the tables here are not.
+    allowed = {a.lower() for a in aspects}
+    best, best_score = "", 0
+    for aspect, cues in MATCH_CUES.items():
+        if aspect.lower() not in allowed or aspect not in FACT_LINES:
+            continue
+        top = _hits(cues, one_liner or "")
+        deep = _hits(cues, description or "")
+        if not top and deep < 3:
+            continue
+        score = 2 * top + deep
+        if score > best_score:
+            best, best_score = aspect, score
+    return best
+
+
+def clean_what(text: str) -> str:
+    """The model's phrase, tidied, or "" when it reads as generated."""
+    what = (text or "").strip()
+    what = re.sub(r"^(?:what:|saw you're|you're)\s*", "", what, flags=re.I)
+    what = what.strip().strip('"').rstrip(".").strip()
+    words = what.split()
+    if not 4 <= len(words) <= 12 or not words[0].lower().endswith("ing"):
+        return ""
+    if not ALLOWED_CHARS.match(what) or ".." in what:
+        return ""
+    if any(stem in what.lower() for stem in BANNED):
+        return ""
+    return what
+
+
+def compose(company: str, what: str, aspect: str) -> str:
+    # The model lowercases names ("building mage sdk tools"); restore the
+    # company's own spelling, and common acronyms.
+    if company:
+        what = re.sub(r"\b" + re.escape(company) + r"\b", company, what, flags=re.I)
+    for acronym in ("AI", "API", "MCP", "SDK", "LLM", "CRM", "GPU"):
+        what = re.sub(r"\b" + acronym + r"(s?)\b", acronym + r"\1", what,
+                      flags=re.I)
+    opener = _pick(OPENERS, company)
+    fact = _pick(FACT_LINES[aspect], company + aspect)
+    return f"{opener} {what}. {fact}"
 
 
 class Personalizer:
@@ -232,56 +319,44 @@ class Personalizer:
 
     def line_for(self, company: str, one_liner: str, description: str,
                  role: str = "") -> str:
-        """Return the alignment sentence, or "" to omit the paragraph entirely.
+        """Return the personal line, or "" to omit the paragraph entirely.
 
-        A generic filler line is worse than no line: it says nothing specific
-        and reads like a mail merge, so we drop the paragraph instead.
+        Which of John's projects to mention is decided by match_aspect from
+        the company's own words, and his half of the line is fixed text from
+        FACT_LINES. The model only writes the short phrase about the company,
+        so it cannot claim anything he has not done.
         """
-        if not self.enabled or self.budget.exhausted or not self.budget.take():
+        aspect = match_aspect(one_liner, description)
+        # No plain overlap means no line, and no model call spent finding out.
+        if (not aspect or not self.enabled or self.budget.exhausted
+                or not self.budget.take()):
             return ""
         prompt = (
             f"Company: {company}\n"
             f"What they do: {one_liner}\n"
-            f"More detail: {description[:500]}\n\n"
-            "ALLOWED (copy two of these verbatim):\n"
-            + "\n".join(f"- {a}" for a in ASPECTS)
-            + "\n\nWrite the sentence."
+            f"More detail: {description[:500]}"
         )
-        company_text = f"{company} {one_liner} {description}"
 
-        def declined(text: str) -> bool:
-            return text.strip().upper().startswith(DECLINE)
+        def render(text: str) -> str:
+            what = clean_what(text)
+            if not what:
+                return ""
+            line = compose(company, what, aspect)
+            return line if word_count(line) <= WORD_LIMIT else ""
 
-        def acceptable(text: str) -> bool:
-            return (bool(text) and word_count(text) <= WORD_LIMIT
-                    and uses_only_allowed(text) and well_formed(text)
-                    and connection_is_evident(text, company_text))
-
-        sentence = self._ask(prompt)
-        # A refusal is a real answer: the model saw no genuine link, so respect
-        # it rather than badgering it into inventing one.
-        if declined(sentence):
-            return ""
-        if acceptable(sentence):
-            return sentence
-        # Retry a few times. The usual failure is an empty response, which
-        # happens when the reasoning model spends its whole token budget
-        # thinking; that is transient and a fresh attempt normally succeeds.
-        # Over-long or off-list output means it improvised experience John does
-        # not have, which the nudge below corrects.
-        nudge = (
-            f"\n\nYour last attempt was empty, too long, or used experience "
-            f"outside the ALLOWED list. Answer with ONE sentence under "
-            f"{WORD_LIMIT} words, copying two ALLOWED items exactly."
-        )
+        line = render(self._ask(prompt))
+        if line:
+            return line
+        # The usual failure is an empty response, when the reasoning model
+        # spends its token budget thinking; a fresh attempt normally works.
+        nudge = ("\n\nYour last answer broke the rules. Only the phrase, 4 to 12 "
+                 "plain words starting with an -ing verb.")
         for _ in range(MAX_RETRIES):
             if not self.budget.take():
                 break
-            retry = self._ask(prompt + nudge)
-            if declined(retry):
-                return ""
-            if acceptable(retry):
-                return retry
+            line = render(self._ask(prompt + nudge))
+            if line:
+                return line
         return ""
 
     def _ask(self, prompt: str) -> str:
@@ -299,7 +374,7 @@ class Personalizer:
                         {"role": "system", "content": SYSTEM},
                         {"role": "user", "content": prompt},
                     ],
-                    "temperature": 0.3,
+                    "temperature": 0.5,
                     # gpt-oss is a reasoning model: with a small budget it spends
                     # every token thinking and returns empty content.
                     "max_tokens": 400,
