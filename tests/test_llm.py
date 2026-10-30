@@ -11,7 +11,7 @@ import pytest
 
 from src.llm import (
     BANNED, FACT_LINES, MAX_RETRIES, OPENERS, Personalizer, WORD_LIMIT,
-    clean_what, compose, match_aspect, to_ascii, word_count,
+    clean_what, closing, compose, match_aspect, to_ascii, word_count,
 )
 
 AGENTS = "The infrastructure to run coding agents for your team"
@@ -63,18 +63,28 @@ def test_every_composed_line_fits_the_word_limit():
     for opener in OPENERS:
         for aspect, lines in FACT_LINES.items():
             for fact in lines:
-                assert word_count(f"{opener} {longest}. {fact}") <= WORD_LIMIT
+                line = f"{opener} {longest}. {fact}{closing('Two Word')}"
+                assert word_count(line) <= WORD_LIMIT
+
+
+def test_the_line_ends_with_the_one_ask():
+    out = compose("Superserve", GOOD, "AI agents that act through tools")
+    assert out.endswith(", as well as discuss opportunities at Superserve.")
+    assert out.count("?") == 0
 
 
 # ------------------------------------------------------------ matching
 
 @pytest.mark.parametrize("one_liner, aspect", [
-    (AGENTS, "agent-accessible tooling over MCP"),
-    ("Turn any website into an MCP for your agents", "agent-accessible tooling over MCP"),
+    (AGENTS, "AI agents that act through tools"),
+    ("Turn any website into an MCP for your agents", "AI agents that act through tools"),
     ("The AI fraud hunter", "real-time risk monitoring"),
     ("Speaking coach for non-native English professionals", "speech-driven interfaces"),
     ("100% automated inspection for consumer electronics parts", "computer-vision pipelines"),
     ("Robots for vehicle maintenance.", "computer-vision pipelines"),
+    ("AI that stops cyber attacks before they spread", "autonomous attack containment"),
+    ("Security monitoring for cloud apps", "autonomous attack containment"),
+    ("Real-time fraud alerts for banks", "real-time risk monitoring"),
 ])
 def test_plain_overlaps_are_matched(one_liner, aspect):
     assert match_aspect(one_liner) == aspect
@@ -126,19 +136,18 @@ def test_clean_what_rejects_generated_sounding_phrases(bad):
     assert clean_what(bad) == ""
 
 
-def test_compose_restores_names_and_ai():
-    out = compose("Mage", "building mage's ai tools for app developers",
-                  "agent-accessible tooling over MCP")
-    assert "Mage's AI tools" in out
-    assert "an API for" in compose("X", "turning any website into an api for agents",
-                                   "agent-accessible tooling over MCP")
+def test_compose_is_lowercase_except_the_company_name():
+    out = compose("Mage", "building mage's AI tools for app developers",
+                  "AI agents that act through tools")
+    assert "Mage's ai tools" in out
+    assert out.replace("Mage", "mage") == out.lower()
     assert "maintenance" in compose("X", "building ai tools for maintenance crews",
                                     "computer-vision pipelines")
 
 
 def test_compose_is_stable_per_company():
-    a = compose("Acme", GOOD, "agent-accessible tooling over MCP")
-    assert a == compose("Acme", GOOD, "agent-accessible tooling over MCP")
+    a = compose("Acme", GOOD, "AI agents that act through tools")
+    assert a == compose("Acme", GOOD, "AI agents that act through tools")
 
 
 # ------------------------------------------------------- line_for
@@ -146,7 +155,7 @@ def test_compose_is_stable_per_company():
 def test_good_phrase_is_used_first_try():
     p = ScriptedPersonalizer([GOOD])
     out = line(p)
-    assert GOOD in out and "Nora" in out
+    assert GOOD in out and "bastion" in out
     assert p.asked == 1
 
 

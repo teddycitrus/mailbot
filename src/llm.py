@@ -26,8 +26,8 @@ from .config import app_root
 from .ratelimit import Budget, RateLimiter
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-# What they build, what John built and what was a grind, then a question.
-WORD_LIMIT = 50
+# What they build, what John built and what was a grind, then the ask.
+WORD_LIMIT = 56
 MAX_RETRIES = 3
 
 def load_aspects() -> list[str]:
@@ -51,9 +51,8 @@ DEFAULT_ASPECTS = [
     "autonomous incident briefings",          # Eureka, Vapi/Twilio voice agents
     "supply-chain disruption detection",      # Eureka
     "live news scoring against supplier graphs",  # Eureka
-    "brand and product evaluation",           # Nora
-    "visual similarity scoring",              # Nora, CLIP embeddings
-    "agent-accessible tooling over MCP",      # Nora
+    "autonomous attack containment",          # Bastion
+    "AI agents that act through tools",       # Bastion's investigator
     "computer-vision pipelines",              # Iris
     "speech-driven interfaces",               # Iris
     "shipping full-stack features quickly",   # general, supported by repos
@@ -130,15 +129,11 @@ ASPECT_CUES: dict[str, set[str]] = {
     "live news scoring against supplier graphs": {
         "news", "supplier", "signal", "score", "graph", "intelligence", "market",
     },
-    "brand and product evaluation": {
-        "brand", "product", "commerce", "retail", "market", "creative", "ad",
-        "catalog", "shop", "consumer", "design",
+    "autonomous attack containment": {
+        "security", "cyber", "attack", "breach", "threat", "intrusion",
+        "vulnerab", "exploit", "firewall", "malware", "defen", "incident",
     },
-    "visual similarity scoring": {
-        "image", "visual", "photo", "similar", "embedding", "vision", "catalog",
-        "design", "video", "search", "match",
-    },
-    "agent-accessible tooling over MCP": {
+    "AI agents that act through tools": {
         "agent", "mcp", "tool", "api", "llm", "automat", "workflow", "integrat",
         "developer", "infrastructure", "platform", "data",
     },
@@ -164,9 +159,12 @@ ASPECT_CUES: dict[str, set[str]] = {
 #
 # aspect: (what he built, the annoying part)
 FACT_PARTS: dict[str, tuple[str, str]] = {
-    "agent-accessible tooling over MCP": (
-        "an MCP endpoint for Nora",
-        "getting the model to reliably pick the right tool"),
+    "AI agents that act through tools": (
+        "Bastion's investigator agent",
+        "making sure a retried action never fired twice"),
+    "autonomous attack containment": (
+        "the backend for Bastion",
+        "stopping it from banning real users on a false alarm"),
     "autonomous incident briefings": (
         "Vapi voice agents for Eureka",
         "handling interruptions so the agent didn't talk over people"),
@@ -179,22 +177,23 @@ FACT_PARTS: dict[str, tuple[str, str]] = {
     "supply-chain disruption detection": (
         "supply chain disruption detection for Eureka",
         "matching messy news mentions to the right supplier"),
-    "brand and product evaluation": (
-        "Nora's brand scoring",
-        "pulling consistent signals out of product pages that were all built differently"),
-    "visual similarity scoring": (
-        "visual similarity scoring for Nora",
-        "getting CLIP scores to match what a person would call similar"),
     "computer-vision pipelines": (
         "a computer vision pipeline for Iris",
         "keeping it accurate when lighting and camera angles changed"),
 }
 
-# Rotated so consecutive emails do not end the same way.
+# Rotated so consecutive emails do not end the same way. Left open because
+# compose() finishes the sentence with the ask, so the email makes one request
+# rather than a question about their work followed by a separate pitch.
 QUESTIONS = (
-    "Curious how you handle that.",
-    "Would love to hear how you deal with it.",
+    "Would love to hear how you deal with it",
+    "Would love to hear how you handle that",
 )
+
+
+def closing(company: str) -> str:
+    """The end of the personal line's last sentence: the one ask in the email."""
+    return f", as well as discuss opportunities at {company or 'your company'}."
 
 FACT_LINES: dict[str, list[str]] = {
     aspect: [f"When I built {built}, the annoying part was {pain}. {question}"
@@ -226,23 +225,23 @@ def _pick(options: list[str], key: str) -> str:
 # brought up, matched at the start of a word. Ordered by preference when more
 # than one fits. Kept narrow on purpose: a stretch reads worse than no line.
 MATCH_CUES: dict[str, tuple[str, ...]] = {
-    "agent-accessible tooling over MCP": ("agent", "mcp"),
+    "AI agents that act through tools": ("agent", "mcp"),
+    # Ahead of risk monitoring, which wins ties otherwise: a security company
+    # is Bastion's territory, not Eureka's.
+    "autonomous attack containment": ("security", "cyber", "attack", "breach",
+                                      "threat", "intrusion", "pentest",
+                                      "vulnerab", "exploit", "firewall"),
     "autonomous incident briefings": ("on-call", "incident", "receptionist",
                                       "phone call", "calls"),
     "speech-driven interfaces": ("voice", "speech", "speak", "spoken", "audio",
                                  "transcri", "conversation"),
-    "real-time risk monitoring": ("risk", "fraud", "complian", "threat",
-                                  "security", "monitoring", "alert"),
+    "real-time risk monitoring": ("risk", "fraud", "complian", "monitoring",
+                                  "alert"),
     "supply-chain disruption detection": ("supply chain", "supplier", "logistic",
                                           "freight", "procurement"),
-    "visual similarity scoring": ("visual search", "image search", "similar"),
     # Seeing, not generating: an AI video studio is not computer vision.
     "computer-vision pipelines": ("computer vision", "camera", "ocr", "robot",
                                   "perception", "inspection", "detect"),
-    # Not "ecommerce" alone: that shows up in customer lists, as in a
-    # bookkeeping firm serving "SMBs, contractors & ecommerce".
-    "brand and product evaluation": ("brand", "shopify", "storefront",
-                                     "product catalog"),
 }
 
 
@@ -291,16 +290,14 @@ def clean_what(text: str) -> str:
 
 
 def compose(company: str, what: str, aspect: str) -> str:
-    # The model lowercases names ("building mage sdk tools"); restore the
-    # company's own spelling, and common acronyms.
-    if company:
-        what = re.sub(r"\b" + re.escape(company) + r"\b", company, what, flags=re.I)
-    for acronym in ("AI", "API", "MCP", "SDK", "LLM", "CRM", "GPU"):
-        what = re.sub(r"\b" + acronym + r"(s?)\b", acronym + r"\1", what,
-                      flags=re.I)
+    # The whole email is lowercase except the recipient's names, so the line
+    # is lowered and then the company's own spelling restored.
     opener = _pick(OPENERS, company)
     fact = _pick(FACT_LINES[aspect], company + aspect)
-    return f"{opener} {what}. {fact}"
+    line = f"{opener} {what}. {fact}{closing(company)}".lower()
+    if company:
+        line = re.sub(r"\b" + re.escape(company) + r"\b", company, line, flags=re.I)
+    return line
 
 
 class Personalizer:

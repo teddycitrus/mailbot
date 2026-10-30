@@ -379,6 +379,11 @@ class Pipeline:
                 row["company_name"] or "", row["one_liner"] or "",
                 row["description"] or "", row["role"] or "",
             )
+            if not note:
+                # The ask lives at the end of the personal line, so an email
+                # without one still needs it on its own.
+                company = row["company_name"] or "your company"
+                note = f"would love to discuss opportunities at {company}."
             context = {
                 "first_name": first,
                 "full_name": " ".join(
