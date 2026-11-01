@@ -20,7 +20,9 @@ from urllib.parse import urlparse
 
 from .models import (
     CATCHALL, Company, Contact, PENDING, SKIP_MX_UNRESOLVED, SKIP_NO_MX,
-    SKIP_PROBE_UNAVAILABLE, SRC_INFERRED, SRC_SCRAPED, UNVERIFIED,
+    PROV_FOUNDER_PUBLISHED, PROV_GIT_COMMIT, PROV_GUESS, PROV_HOUSE_PATTERN,
+    PROV_SITE, SKIP_PROBE_UNAVAILABLE, SRC_INFERRED, SRC_SCRAPED, UNVERIFIED,
+    deliverable,
 )
 from . import patterns
 from .github_source import find_org_for
@@ -274,14 +276,20 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
         html = fetcher.get(company_row["yc_url"], respect_robots=False)
         if html:
             people = parse_yc_founders(html)
+
+    # 2. Addresses the company publishes itself. A company with no YC page
+    # (VC portfolio, GitHub, HN) has no founder list yet, so the same walk
+    # reads founder names off its own about and team pages.
+    scrape = scrape_site(fetcher, company_row["website"], domain,
+                         want_people=not people)
+    published = {e for e in scrape.emails if not is_never_send(e)}
+    if not people:
+        people = scrape.people
+
     targeted = [p for p in people if role_matches(p, settings.target_roles)] or people
     # Role matches first, then the rest of the team, so a company with one
     # CTO and two other founders still yields more than one person.
     targeted = targeted + [p for p in people if p not in targeted]
-
-    # 2. Addresses the company publishes itself.
-    scrape = scrape_site(fetcher, company_row["website"], domain)
-    published = {e for e in scrape.emails if not is_never_send(e)}
 
     # 2b. Addresses the team published in git commits. These are written by the
     # person, not inferred, so they survive a catch-all domain. The observed
@@ -308,8 +316,11 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
         if verdict.confidence <= 0:
             continue
         first, last = _match_person(email, targeted)
+        matched_founder = bool(first)
         if not first:
             first, last = _name_from_commit(email, commit_names.get(email, ""))
+        provenance = (PROV_GIT_COMMIT if email in commit_names
+                      else PROV_FOUNDER_PUBLISHED if matched_founder else PROV_SITE)
         if first:
             # Every address tied to a real name teaches us this domain's
             # convention, which is what makes later guesses cheap and safe.
@@ -322,7 +333,7 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
             role=_role_for(first, targeted), source=SRC_SCRAPED,
             verify_status=verdict.status, verify_detail=verdict.detail,
             confidence=min(confidence, 99), status=PENDING,
-            bio=_bio_for(first, targeted),
+            bio=_bio_for(first, targeted), provenance=provenance,
         ))
 
     # 4. Then guess for the rest of the team, but only where a guess is provable.
@@ -365,7 +376,7 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
                     role=person.role, bio=person.bio, linkedin=person.linkedin,
                     source=SRC_INFERRED, verify_status=verdict.status,
                     verify_detail=verdict.detail, confidence=verdict.confidence,
-                    status=PENDING,
+                    status=PENDING, provenance=PROV_GUESS,
                 ))
 
     # 4b. On a catch-all domain a guess is normally unprovable, but if the
@@ -394,13 +405,15 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
                 source=SRC_INFERRED, verify_status=CATCHALL,
                 verify_detail=(f"built from the {house_pattern} convention observed "
                                f"on {domain}"),
-                confidence=75, status=PENDING,
+                confidence=75, status=PENDING, provenance=PROV_HOUSE_PATTERN,
             ))
 
     # No shared-inbox fallback: hello@ and founders@ are refused at the send
     # gate, so a company with no person to write to is left without a contact.
 
-    contacts.sort(key=lambda c: -c.confidence)
+    # Sendable first, so they get the cap ahead of anything the gate refuses.
+    contacts.sort(key=lambda c: (not deliverable(c.verify_status, c.provenance),
+                                 -c.confidence))
     note = "" if contacts else _why_empty(people, published, verifier, domain,
                                           unprobed)
     return EnrichResult(contacts=contacts[:cap], note=note)

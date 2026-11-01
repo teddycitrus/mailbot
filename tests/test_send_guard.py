@@ -134,7 +134,8 @@ def _pipeline_for_send(tmp_path, monkeypatch, raises):
     pdf.write_bytes(b"%PDF-1.4")
     obj.db = Database(tmp_path / "s.db")
     cid = obj.db.upsert_company(Company(name="Acme", domain="acme.ai"))
-    ct = obj.db.upsert_contact(Contact(email="a@acme.ai", first_name="Ann", company_id=cid))
+    ct = obj.db.upsert_contact(Contact(email="a@acme.ai", first_name="Ann", company_id=cid,
+                                          verify_status="verified"))
     obj.db.queue_draft(ct, "Subj", "Body\n", [str(pdf)])
 
     def boom(*_a, **_k):
@@ -197,7 +198,8 @@ def _deliverable(tmp_path, attachment, resume_link):
     )
     obj.db = Database(tmp_path / "d.db")
     cid = obj.db.upsert_company(Company(name="Acme", domain="acme.ai"))
-    ct = obj.db.upsert_contact(Contact(email="a@acme.ai", first_name="Ann", company_id=cid))
+    ct = obj.db.upsert_contact(Contact(email="a@acme.ai", first_name="Ann", company_id=cid,
+                                          verify_status="verified"))
     obj.db.queue_draft(ct, "Subj", "Best,\nJohn\n", [attachment])
     return obj, obj.db.queued_drafts(limit=1)
 

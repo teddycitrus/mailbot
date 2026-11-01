@@ -165,6 +165,10 @@ class Settings:
     # sent on different days, and a reply, opt-out or hard bounce from any
     # of them closes the company. See Database.company_slot.
     max_contacts_per_company: int = 3
+    # Fund portfolio pages read by the vc source, and the Tranco rank inside
+    # which a domain counts as a big company and is skipped. See vc_source.py.
+    vc_portfolios_path: Path = Path("config/vc_portfolios.txt")
+    vc_max_site_rank: int = 20_000
 
     @classmethod
     def load(cls, env_file: str | os.PathLike[str] | None = ".env") -> "Settings":
@@ -238,6 +242,8 @@ class Settings:
             priority_path=_path("PRIORITY_PATH", "config/priority.txt"),
             smtp_probe_relay=os.getenv("SMTP_PROBE_RELAY", "").strip(),
             max_contacts_per_company=max(1, _int("MAX_CONTACTS_PER_COMPANY", 3)),
+            vc_portfolios_path=_path("VC_PORTFOLIOS_PATH", "config/vc_portfolios.txt"),
+            vc_max_site_rank=max(0, _int("VC_MAX_SITE_RANK", 20_000)),
         )
 
     def daily_cap(self, active_days: int, bounce_pct: float) -> tuple[int, str]:

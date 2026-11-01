@@ -44,6 +44,7 @@
         <li><a href="#built-with">Built With</a></li>
       </ul>
     </li>
+    <li><a href="#architecture">Architecture</a></li>
     <li>
       <a href="#getting-started">Getting Started</a>
       <ul>
@@ -84,17 +85,18 @@ the computer you run it on.
 
 ### How It Finds Addresses
 
-Five free sources, in the order they are tried:
+Six free sources, in the order they are tried:
 
 | Source | What it gives | Cost |
 | --- | --- | --- |
 | Y Combinator OSS directory | Companies, location, headcount, batch, hiring flag | No key |
 | GitHub org search by city | Companies that never applied to an accelerator | Token |
-| Company website crawl | Any address the company publishes itself | No key |
+| US and Canadian VC portfolio pages | Fund-backed companies outside YC (`config/vc_portfolios.txt`) | No key |
+| Company website crawl | Any address the company publishes, and founder names from its team page | No key |
 | Public git commits | Addresses engineers published in their own commits | Optional token |
 | Hacker News "Who is hiring" | Addresses the hiring person typed themselves | No key |
 
-Discovery runs on two sources because one accelerator is not a market. YC's
+Discovery runs on several sources because one accelerator is not a market. YC's
 directory is roughly thirty San Francisco companies for every Toronto one, which
 describes YC rather than the cities. GitHub org search is keyed on a
 self-reported location, so it reaches companies outside that pipeline and gives
@@ -102,6 +104,13 @@ every target city comparable depth. The tradeoff is metadata: a YC record
 carries a batch and a team size, a GitHub org carries neither, so the age filter
 falls back to the org's creation date and the headcount filter cannot run.
 Companies are tagged with the source they came from and stay distinguishable.
+
+VC portfolio pages carry even less: a link and sometimes a name. Each night
+reads a rotating slice of about thirty US and Canadian funds. A portfolio also
+lists the fund's oldest wins, so any domain inside the top 20,000 sites on the
+free Tranco ranking is skipped as a big company, as are companies on a foreign
+country domain. With no YC page to name the founders, they are read off the
+company's own about and team pages.
 
 When no address is published, one is inferred from the person's name and the
 domain's observed naming convention, then confirmed over SMTP: an MX lookup,
@@ -111,16 +120,27 @@ nothing is ever delivered during a check.
 Every confirmed address teaches the tool that domain's convention, so guessing
 gets more accurate the longer it runs.
 
-There is one honest limit. Most startups use Google Workspace, which answers
+There is one honest limit. Many startup domains are catch-alls, which answer
 `250 OK` to every recipient including invented ones, so a probe there proves
-nothing. On those domains Mailbot will not send to a guess. It falls back to an
-address a human actually published, or it skips the company.
+nothing. So Mailbot sends to an address only when its own mailbox accepted
+`RCPT TO` on a domain that refused a random control address, or, on a
+catch-all domain, when how it was found is itself the evidence:
+
+| Provenance on a catch-all domain | Sent to? |
+| --- | --- |
+| The person posted it in an HN "Who is hiring" thread | Yes |
+| Published on the site, and the local part fits a named founder | Yes |
+| Author address on the company's own git commits | Yes |
+| A founder's name in the convention other real addresses there prove | Yes |
+| Published on the site but tied to nobody | No (35% bounced) |
+| A permutation of a name with no evidence | No |
 
 ### Guardrails
 
 This is a cold email tool, so the restraint is the point:
 
 - A hard daily cap, defaulting to a deliberately low number
+- Only SMTP-verified addresses, or catch-all ones from a trusted source (table above), are sent to, follow-ups included
 - An address is contacted at most once, enforced by a unique index and a send log
 - Up to three people per company (MAX_CONTACTS_PER_COMPANY), never two on the same day, and nobody else once one of them replies or opts out
 - Sends only during the recipient's own local morning, on weekdays
@@ -137,6 +157,95 @@ This is a cold email tool, so the restraint is the point:
 * [Vite](https://vitejs.dev/), [Tailwind CSS](https://tailwindcss.com/) and [Recharts](https://recharts.org/)
 * [SQLite](https://www.sqlite.org/) for local state
 * [PyInstaller](https://pyinstaller.org/) for the packaged build
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+<!-- ARCHITECTURE -->
+## Architecture
+
+Mailbot is one Python program run as separate scheduled jobs that share a
+single SQLite file. Discovery fills `companies`, enrichment fills `contacts`,
+drafting fills `drafts`, and sending writes the `sends` log that every later
+send is checked against.
+
+```mermaid
+flowchart LR
+    subgraph discovery["Discovery"]
+        YC(["YC OSS directory"])
+        GH(["GitHub org search"])
+        VC(["VC portfolio pages<br/><sub>US and Canada</sub>"])
+        HN(["HN Who is hiring"])
+    end
+    TR(["Tranco ranking<br/><sub>big-company filter</sub>"])
+    subgraph enrichment["Enrich"]
+        F["finder<br/><sub>founders, published and commit addresses</sub>"]
+        V["verifier<br/><sub>MX + RCPT probe, catch-all control</sub>"]
+    end
+    DB[("SQLite<br/><sub>companies, contacts, drafts, sends</sub>")]
+    Q["queue<br/><sub>gates + personal line</sub>"]
+    LLM(["Groq LLM"])
+    S["send<br/><sub>cap, window, deliverability gate</sub>"]
+    G(["Gmail SMTP and IMAP"])
+    MX(["Recipient mail servers"])
+
+    YC & GH & HN -->|"new companies"| DB
+    VC -->|"portfolio domains"| DB
+    TR -.->|"skip top sites"| VC
+    DB -->|"status=new"| F
+    F -->|"candidate addresses"| V
+    V -->|"RCPT TO, no DATA"| MX
+    V -->|"verified or trusted contacts"| DB
+    DB --> Q
+    Q -.->|"one sentence"| LLM
+    Q -->|"queued drafts"| DB
+    DB --> S
+    S -->|"mail"| G
+    G -->|"replies, bounces, opt-outs"| DB
+```
+
+One company, from a portfolio page to a sent email:
+
+```mermaid
+sequenceDiagram
+    participant Build as build job
+    participant Site as company site
+    participant Ver as verifier
+    participant MX as mail server
+    participant DB as SQLite
+    participant Tick as tick job
+    Build->>Site: fetch homepage (name, description)
+    Build->>DB: company, source=vc, status=new
+    Build->>Site: about and team pages
+    Site-->>Build: founder names, published addresses
+    Build->>Ver: candidates for each founder
+    Ver->>MX: RCPT TO random control address
+    MX-->>Ver: 550, so not a catch-all
+    Ver->>MX: RCPT TO founder address
+    MX-->>Ver: 250 accepted
+    Ver-->>DB: contact, verify_status=verified
+    Build->>DB: draft queued
+    Tick->>DB: can_send_to passes
+    Tick->>MX: send in the recipient's morning
+    Note over Tick,DB: send logged; the address is never mailed first-touch again
+```
+
+Every send passes these checks, in order, in `Database.can_send_to`:
+
+1. The address is a person's mailbox, not a shared inbox or a blocked domain.
+2. It is not on the suppression list (opt-outs, hard bounces).
+3. The contact has not already been sent to, replied or bounced.
+4. The send log has no earlier successful send to it.
+5. Its `verify_status` is `verified` (the mailbox itself accepted an SMTP RCPT),
+   or it is `catchall` with a trusted `provenance`: `hn_post`,
+   `founder_published`, `git_commit` or `house_pattern`.
+
+Then the daily cap, the per-company limit (three people, never two on one day)
+and the recipient's local send window apply. Follow-ups go through the same
+checks in `can_send_to_again`, with only the prior-send rule relaxed.
+
+Hard limits: 400 HTTP fetches per run by default, a per-run GitHub call cap,
+SMTP probing that gives up after repeated timeouts instead of pushing into a
+throttle, and a Tranco download at most once a week.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -209,6 +318,7 @@ python -m dash                    # setup and progress console
                                   # (same as: python -m src.main dashboard)
 python -m src.main discover       # find qualifying companies (Y Combinator)
 python -m src.main gh             # find companies via GitHub org search
+python -m src.main vc             # find companies on US and Canadian VC portfolio pages
 python -m src.main hn             # import the Hacker News hiring threads
 python -m src.main priority       # seed the companies named in config/priority.txt
 python -m src.main enrich         # find and verify a contact at each company
@@ -247,6 +357,8 @@ are never committed or bundled.
 | `QUEUE_TARGET` | `60` | How many finished drafts to keep waiting |
 | `MIRROR_TO_DRAFTS` | `true` | Copy queued drafts to Gmail Drafts as a fallback |
 | `PRIORITY_PATH` | `config/priority.txt` | Companies that skip the gates and go first |
+| `VC_PORTFOLIOS_PATH` | `config/vc_portfolios.txt` | Fund portfolio pages, one `fund, country, url` line each |
+| `VC_MAX_SITE_RANK` | `20000` | Portfolio domains ranked inside this on Tranco are skipped as big companies |
 | `TARGET_LOCATIONS` | `San Francisco,New York,Toronto` | Comma separated |
 | `MAX_EMPLOYEES`, `MAX_COMPANY_AGE_YEARS` | `200`, `5` | Target filter |
 | `PREFER_RECENTLY_FUNDED` | `true` | Rank by recency of funding blended with ability to hire |

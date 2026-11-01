@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -126,6 +127,45 @@ def test_parses_founders_with_roles_and_bios():
     allen = next(p for p in people if p.first_name == "Allen")
     assert "CTO" in allen.bio
     assert "linkedin.com/in/androidallen" in allen.linkedin
+
+
+def test_parses_founders_from_the_embedded_page_json():
+    # The current YC page: founders only in the data-page attribute.
+    page = {"props": {"company": {"founders": [
+        {"full_name": "Caleb Peffer", "title": "Founder/CEO", "is_active": True,
+         "founder_bio": "CEO at Firecrawl\n",
+         "linkedin_url": "https://www.linkedin.com/in/caleb-peffer/"},
+        {"full_name": "Gone Person", "title": "Founder", "is_active": False},
+    ]}}}
+    html = f"<html><body><div data-page='{json.dumps(page)}'></div></body></html>"
+    people = parse_yc_founders(html)
+    assert [p.full_name for p in people] == ["Caleb Peffer"]
+    assert people[0].role == "Founder/CEO"
+    assert people[0].bio == "CEO at Firecrawl"
+    assert "caleb-peffer" in people[0].linkedin
+
+
+def test_robots_is_read_with_our_own_user_agent():
+    # Bot firewalls 403 urllib's default agent; the real file allows everyone.
+    from src.scraper import Fetcher
+    fetcher = Fetcher("mailbot-test")
+    seen = []
+
+    def get(url, timeout=None):
+        seen.append(fetcher.session.headers["User-Agent"])
+        return SimpleNamespace(status_code=200, text="User-agent: *\nDisallow:\n")
+
+    fetcher.session.get = get
+    assert fetcher.allowed("https://acme.ai/about")
+    assert seen == ["mailbot-test"]
+
+
+def test_robots_403_still_means_keep_out():
+    from src.scraper import Fetcher
+    fetcher = Fetcher("mailbot-test")
+    fetcher.session.get = lambda url, timeout=None: SimpleNamespace(
+        status_code=403, text="")
+    assert not fetcher.allowed("https://acme.ai/about")
 
 
 def test_parser_survives_a_page_with_no_founders():
@@ -312,3 +352,43 @@ def test_a_cap_of_one_keeps_the_old_behaviour(tmp_path, monkeypatch):
 def test_commit_author_names_an_address_only_when_it_fits(email, author, expected):
     from src.finder import _name_from_commit
     assert _name_from_commit(email, author) == expected
+
+
+# ----------------------------------------------------- provenance on catch-alls
+
+class _CatchAll:
+    """A catch-all domain: every probe proves nothing."""
+
+    def __init__(self, db):
+        self.db = db
+
+    def verify(self, email, source=None):
+        from src.models import CATCHALL
+        from src.verifier import Verdict
+        return Verdict(CATCHALL, "catch-all domain, address was published", 75)
+
+    def first_verified(self, candidates, domain):
+        from src.models import CATCHALL
+        from src.verifier import Verdict
+        return None, Verdict(CATCHALL, "catch-all domain, guesses unprovable", 25)
+
+    def is_catchall(self, domain):
+        return True
+
+    def mx_lookup(self, domain):
+        return "mx.acme.ai", True
+
+
+def test_published_addresses_are_tagged_by_how_they_were_found(tmp_path, monkeypatch):
+    from src import finder
+    from src.scraper import SiteScrape
+
+    db, company = _team_company(tmp_path, monkeypatch, [("Ann", "Lee", "CEO")])
+    monkeypatch.setattr(finder, "scrape_site", lambda *a, **k: SiteScrape(
+        emails={"ann@acme.ai", "zed@acme.ai"}))
+    settings = SimpleNamespace(target_roles=("ceo",), max_contacts_per_company=3)
+    result = finder.enrich_company(company, _FetchAnything(), _CatchAll(db), settings)
+    tags = {c.email: c.provenance for c in result.contacts}
+    assert tags == {"ann@acme.ai": "founder_published", "zed@acme.ai": "site_unattributed"}
+    # The trusted one sorts first, so it gets the per-company cap.
+    assert result.contacts[0].email == "ann@acme.ai"

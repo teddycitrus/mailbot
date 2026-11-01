@@ -56,6 +56,7 @@ case "$job" in
         run hn --limit 60 --months 3
         run discover --limit 60
         run gh --limit 60
+        run vc --limit 30
         run enrich --limit 90
         run queue --limit 40
         run mirror --limit 60

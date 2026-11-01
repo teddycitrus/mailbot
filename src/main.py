@@ -50,6 +50,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="how many monthly threads back to read")
     p = sub.add_parser("gh", help="find companies via GitHub org search (non-YC)")
     p.add_argument("--limit", type=int, default=40)
+    p = sub.add_parser("vc", help="find companies on US and Canadian VC portfolio pages")
+    p.add_argument("--limit", type=int, default=30)
+    p.add_argument("--pages", type=int, default=8,
+                   help="portfolio pages to read this run, rotating through the list")
     p = sub.add_parser("enrich", help="find a contact at each new company")
     p.add_argument("--limit", type=int, default=15)
     p = sub.add_parser("priority", help="seed the companies named in priority.txt")
@@ -197,6 +201,8 @@ def main(argv: list[str] | None = None) -> int:
             pipeline.import_hn(args.limit, args.months)
         elif args.command == "gh":
             pipeline.discover_github(args.limit)
+        elif args.command == "vc":
+            pipeline.discover_vc(args.limit, args.pages)
         elif args.command == "priority":
             pipeline.priority(args.resolve, args.limit)
         elif args.command == "enrich":

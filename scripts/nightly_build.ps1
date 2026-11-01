@@ -28,11 +28,13 @@ if (Test-Path $venv) { $script:python = $venv }
 # HN first: those contacts arrive already published, no inference needed.
 # Three threads back, so a night the job does not run is caught up later.
 Write-Mailbot hn --limit 60 --months 3
-# Two discovery sources. YC has the better metadata, batch and team size, so it
+# Three discovery sources. YC has the better metadata, batch and team size, so it
 # still runs first. GitHub org search reaches companies that never applied to an
-# accelerator, which is the only way Toronto gets meaningful volume.
+# accelerator, which is the only way Toronto gets meaningful volume. VC
+# portfolio pages add US and Canadian fund-backed companies.
 Write-Mailbot discover --limit 60
 Write-Mailbot gh       --limit 60
+Write-Mailbot vc       --limit 30
 Write-Mailbot enrich   --limit 90
 # Draft immediately, while the contacts this run just found are fresh, rather
 # than leaving it to the morning. By the time anyone is awake the queue is

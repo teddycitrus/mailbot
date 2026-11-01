@@ -1,0 +1,39 @@
+# Fund portfolio pages read by `mailbot vc`, one per line:
+#   fund | country | portfolio url
+# Each night reads a rotating slice of this list, so every fund comes round
+# every few nights. Only pages that carry company links in their HTML work; a
+# page that draws its portfolio with JavaScript alone yields nothing and can
+# be left out. Lines starting with # are ignored.
+
+# --- United States ---
+a16z | US | https://a16z.com/portfolio/
+Accel | US | https://www.accel.com/relationships
+First Round | US | https://firstround.com/companies/
+Union Square Ventures | US | https://www.usv.com/companies/
+Kleiner Perkins | US | https://www.kleinerperkins.com/partnerships/
+Felicis | US | https://www.felicis.com/portfolio
+boldstart | US | https://www.boldstart.vc/portfolio
+Khosla Ventures | US | https://www.khoslaventures.com/portfolio
+Spark Capital | US | https://www.sparkcapital.com/companies
+Craft Ventures | US | https://www.craftventures.com/portfolio
+Initialized | US | https://initialized.com/companies
+Pear VC | US | https://pear.vc/companies/
+8VC | US | https://www.8vc.com/companies
+Afore | US | https://www.afore.vc/portfolio
+Unusual Ventures | US | https://www.unusual.vc/portfolio
+Lerer Hippeau | US | https://www.lererhippeau.com/portfolio
+Bowery Capital | US | https://www.bowerycap.com/portfolio
+Floodgate | US | https://www.floodgate.com/companies
+Contrary | US | https://www.contrary.com/companies
+Haystack | US | https://www.haystack.vc/
+
+# --- Canada ---
+Panache Ventures | CA | https://www.panache.vc/portfolio
+Real Ventures | CA | https://realventures.com/portfolio/
+Version One | CA | https://versionone.vc/portfolio/
+Georgian | CA | https://georgian.io/portfolio/
+Graphite Ventures | CA | https://www.graphitevc.com/portfolio
+Brightspark | CA | https://www.brightspark.com/portfolio
+Whitecap | CA | https://whitecapvp.com/portfolio/
+Front Row Ventures | CA | https://www.frontrow.vc/portfolio
+Two Small Fish | CA | https://www.twosmallfish.vc/portfolio

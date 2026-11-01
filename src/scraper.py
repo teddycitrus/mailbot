@@ -8,6 +8,7 @@ Requests are rate limited and capped, identify themselves honestly in the User
 
 from __future__ import annotations
 
+import json
 import re
 from html import unescape as html_unescape
 from dataclasses import dataclass, field
@@ -56,6 +57,8 @@ class Person:
 class SiteScrape:
     emails: set[str] = field(default_factory=set)
     pages_fetched: int = 0
+    # Founders the site names itself, read only when the caller asks.
+    people: list[Person] = field(default_factory=list)
 
 
 def split_name(full: str) -> tuple[str, str]:
@@ -78,6 +81,7 @@ class Fetcher:
         self.budget = Budget(max_fetches, "http")
         self.timeout = timeout
         self._robots: dict[str, RobotFileParser | None] = {}
+        self.last_url = ""
 
     def get(self, url: str, respect_robots: bool = True) -> str | None:
         if self.budget.exhausted:
@@ -93,6 +97,8 @@ class Fetcher:
             return None
         if resp.status_code != 200:
             return None
+        # Where redirects ended, for callers that care a site has moved.
+        self.last_url = resp.url
         ctype = resp.headers.get("Content-Type", "")
         if "html" not in ctype and "text" not in ctype:
             return None
@@ -118,13 +124,7 @@ class Fetcher:
         except Exception:
             return False
         if root not in self._robots:
-            parser = RobotFileParser()
-            parser.set_url(urljoin(root, "/robots.txt"))
-            try:
-                parser.read()
-            except Exception:
-                parser = None
-            self._robots[root] = parser
+            self._robots[root] = self._read_robots(root)
         parser = self._robots[root]
         if parser is None:
             return True
@@ -133,15 +133,44 @@ class Fetcher:
         except Exception:
             return True
 
+    def _read_robots(self, root: str) -> RobotFileParser | None:
+        """robots.txt fetched as this client, with RobotFileParser's status rules.
+
+        RobotFileParser.read() fetches with urllib's own User-Agent, which
+        bot firewalls answer with 403, and a 403 makes it deny the whole site.
+        A quarter of company sites were skipped that way while their actual
+        robots.txt allowed everyone.
+        """
+        parser = RobotFileParser()
+        parser.set_url(urljoin(root, "/robots.txt"))
+        try:
+            resp = self.session.get(parser.url, timeout=self.timeout)
+        except Exception:
+            return None
+        if resp.status_code in (401, 403):
+            parser.disallow_all = True
+        elif 400 <= resp.status_code < 500:
+            parser.allow_all = True
+        elif resp.status_code == 200:
+            parser.parse(resp.text.splitlines())
+        else:
+            return None
+        return parser
+
 
 def parse_yc_founders(html: str) -> list[Person]:
     """Pull founder name, role and bio off a YC company page.
 
-    Primary path keys off each founder's LinkedIn anchor, whose enclosing block
-    reads 'Name | Role | Bio'. Falls back to the Active Founders text section
-    for founders who have no LinkedIn link.
+    Primary path reads the page's embedded data-page JSON. Since late 2026 YC
+    renders founders client-side, so the static HTML has no founder text or
+    LinkedIn anchors at all; the two markup paths below are kept for older
+    copies of the page. They key off each founder's LinkedIn anchor, whose
+    enclosing block reads 'Name | Role | Bio', then the Active Founders text.
     """
     soup = BeautifulSoup(html, "lxml")
+    embedded = _embedded_founders(soup)
+    if embedded:
+        return embedded
     people: dict[str, Person] = {}
 
     for anchor in soup.select('a[href*="linkedin.com/in"]'):
@@ -169,6 +198,32 @@ def parse_yc_founders(html: str) -> list[Person]:
     if not people:
         people.update({p.full_name: p for p in _fallback_founders(soup)})
     return list(people.values())
+
+
+def _embedded_founders(soup: BeautifulSoup) -> list[Person]:
+    """Founders from the page's data-page JSON, active ones only."""
+    for el in soup.find_all(attrs={"data-page": True}):
+        try:
+            data = json.loads(el["data-page"])
+            founders = data["props"]["company"]["founders"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        people: list[Person] = []
+        for f in founders if isinstance(founders, list) else []:
+            if not isinstance(f, dict) or f.get("is_active") is False:
+                continue
+            name = " ".join(str(f.get("full_name") or "").split())
+            if not _looks_like_name(name):
+                continue
+            first, last = split_name(name)
+            people.append(Person(
+                first, last,
+                role=str(f.get("title") or "").strip(),
+                bio=" ".join(str(f.get("founder_bio") or "").split()),
+                linkedin=str(f.get("linkedin_url") or "").strip(),
+            ))
+        return people
+    return []
 
 
 def _looks_like_name(text: str) -> bool:
@@ -231,13 +286,20 @@ def extract_emails(html: str, domain: str) -> set[str]:
 
 
 def scrape_site(fetcher: Fetcher, website: str, domain: str,
-                paths: tuple[str, ...] = CONTACT_PATHS) -> SiteScrape:
-    """Walk a handful of likely pages looking for published addresses."""
+                paths: tuple[str, ...] = CONTACT_PATHS,
+                want_people: bool = False) -> SiteScrape:
+    """Walk a handful of likely pages looking for published addresses.
+
+    With want_people the walk also reads founder names off the same pages,
+    and keeps going past the first address until it has found some, since
+    the about and team pages that name founders often come after contact.
+    """
     result = SiteScrape()
     if not website:
         return result
     if not website.startswith("http"):
         website = "https://" + website
+    seen: set[str] = set()
     for path in paths:
         url = urljoin(website, path) if path else website
         html = fetcher.get(url)
@@ -245,6 +307,89 @@ def scrape_site(fetcher: Fetcher, website: str, domain: str,
             continue
         result.pages_fetched += 1
         result.emails |= extract_emails(html, domain)
-        if result.emails and path:
+        if want_people:
+            for person in parse_site_founders(html):
+                if person.full_name.lower() not in seen:
+                    seen.add(person.full_name.lower())
+                    result.people.append(person)
+        if result.emails and path and (result.people or not want_people):
             break
     return result
+
+
+# A founder's title, as a team page writes it. Deliberately narrow: "Head of
+# Growth" is a person, but not one this campaign writes to off a guess.
+FOUNDER_TITLE = re.compile(
+    r"\b(co-?\s?founder|founder|ceo|cto|chief executive|chief technology)\b", re.I)
+# Headings and nav labels that look like a capitalised name.
+NOT_NAME_WORDS = {
+    "our", "the", "team", "meet", "about", "us", "founder", "founders",
+    "co-founder", "cofounder", "ceo", "cto", "and", "with", "of", "for",
+    "company", "contact", "careers", "join", "leadership", "story", "mission",
+    "people", "advisors", "investors", "board", "news", "blog", "home",
+}
+
+
+def _site_name(text: str) -> bool:
+    if not _looks_like_name(text):
+        return False
+    words = text.split()
+    if not (2 <= len(words) <= 3):
+        return False
+    if any(w.lower().strip(",.") in NOT_NAME_WORDS for w in words):
+        return False
+    return all(re.fullmatch(r"[A-Z][a-zA-Z'\-]+\.?", w) for w in words)
+
+
+def parse_site_founders(html: str) -> list[Person]:
+    """Founders a company names on its own site.
+
+    Two signals, strongest first. Schema.org JSON-LD, where an Organization
+    lists its founder or a Person carries a jobTitle. Then team-page text: a
+    name line followed by a founder title, or "Name, Co-founder & CEO" on one
+    line. Only founder-level titles count; see FOUNDER_TITLE.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    people: dict[str, Person] = {}
+
+    def add(name: str, role: str) -> None:
+        name = " ".join(name.split())
+        if _site_name(name) and name not in people:
+            first, last = split_name(name)
+            people[name] = Person(first, last, role.strip()[:80])
+
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "")
+        except ValueError:
+            continue
+        stack = data if isinstance(data, list) else [data]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, list):
+                stack.extend(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            stack.extend(v for v in item.values() if isinstance(v, (dict, list)))
+            founders = item.get("founder") or item.get("founders")
+            for f in founders if isinstance(founders, list) else [founders]:
+                if isinstance(f, dict) and f.get("name"):
+                    add(str(f["name"]), "Founder")
+            if item.get("@type") == "Person" and item.get("name"):
+                title = str(item.get("jobTitle") or "")
+                if FOUNDER_TITLE.search(title):
+                    add(str(item["name"]), title)
+
+    lines = [ln.strip() for ln in soup.get_text("\n").split("\n") if ln.strip()]
+    for i, line in enumerate(lines):
+        if len(line) > 80:
+            continue
+        inline = re.match(r"^([A-Z][^,|\-]{2,40}?)\s*[,|\-]\s*(.+)$", line)
+        if inline and FOUNDER_TITLE.search(inline.group(2)):
+            add(inline.group(1), inline.group(2))
+            continue
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        if len(nxt) <= 60 and FOUNDER_TITLE.search(nxt):
+            add(line, nxt)
+    return list(people.values())

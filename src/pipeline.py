@@ -29,10 +29,12 @@ from .hn_source import fetch_posts, fetch_recent_posts
 from .llm import Personalizer
 from .models import (
     Company, Contact, ENRICHED, NO_CONTACTS, PENDING, SRC_SCRAPED,
+    PROV_HN_POST, SKIP_NOT_VERIFIED, deliverable,
 )
 from . import priority as priority_list
 from .priority import from_settings as priority_set
 from .scraper import Fetcher
+from .vc_source import SiteRanks, discover as discover_portfolios
 from .reporting import BAR, _print_table, build_digest, print_summary
 from .verifier import (
     Verifier, is_never_send, is_role_account,
@@ -118,6 +120,30 @@ class Pipeline:
                 [(c.name, c.domain, c.location[:20], c.github_org,
                   c.founded_year or "") for c in found],
                 ("company", "domain", "location", "org", "since"),
+            )
+        return len(found)
+
+    def discover_vc(self, limit: int = 30, pages: int = 8) -> int:
+        """Companies from US and Canadian fund portfolio pages.
+
+        Same funnel as the other sources: rows land with status=new, source=vc,
+        and enrich takes them from there.
+        """
+        ranks = SiteRanks(self.settings.db_path.parent / "cache" / "tranco-top.txt",
+                          self.settings.vc_max_site_rank)
+        found, stats = discover_portfolios(self.fetcher, self.settings, self.db,
+                                           ranks, limit=limit, pages_per_run=pages)
+        for company in found:
+            self.db.upsert_company(company)
+        print(f"vc: {stats.added} added from {stats.pages} portfolio page(s) "
+              f"({stats.pages_failed} failed), {stats.candidates} listed, "
+              f"{stats.already_known} already known, {stats.too_big} big companies, "
+              f"{stats.dead} sites down, {stats.moved} moved to another domain "
+              f"({self.fetcher.budget})")
+        if found:
+            _print_table(
+                [(c.name, c.domain, c.industry[:24], c.one_liner[:40]) for c in found],
+                ("company", "domain", "via", "one-liner"),
             )
         return len(found)
 
@@ -219,7 +245,15 @@ class Pipeline:
                 rows.append((company["name"], "-", "-", 0, result.note[:34]))
                 continue
             kept = 0
+            note = result.note
             for contact in result.contacts:
+                # Only what the send gate accepts is worth storing: a verified
+                # mailbox, or a catch-all one from a trusted source.
+                if not deliverable(contact.verify_status, contact.provenance):
+                    rows.append((company["name"], contact.email, "skip", 0,
+                                 f"{contact.verify_status}, {contact.provenance}"))
+                    note = note or SKIP_NOT_VERIFIED
+                    continue
                 allowed, why = self.db.can_send_to(contact.email)
                 if not allowed:
                     rows.append((company["name"], contact.email, "skip", 0, why))
@@ -233,7 +267,8 @@ class Pipeline:
                              contact.verify_status, contact.confidence,
                              contact.role[:34] or contact.source))
             self.db.set_company_status(
-                company["id"], ENRICHED if kept else NO_CONTACTS, result.note
+                company["id"], ENRICHED if kept else NO_CONTACTS,
+                result.note if kept else note,
             )
         print(f"enrich: {added} contacts added from {len(companies)} companies "
               f"({self.fetcher.budget}, {self.github.budget})")
@@ -283,7 +318,7 @@ class Pipeline:
                 if is_never_send(address) or address.split("@")[1] != post.domain:
                     continue
                 verdict = self.verifier.verify(address, source=SRC_SCRAPED)
-                if verdict.confidence > 0:
+                if deliverable(verdict.status, PROV_HN_POST):
                     usable.append((address, verdict))
             if not usable:
                 rows.append((post.company, "-", "-", 0, "no usable address"))
@@ -298,6 +333,7 @@ class Pipeline:
                     role="posted the hiring ad", verify_status=verdict.status,
                     verify_detail=f"published on HN: {verdict.detail}",
                     confidence=verdict.confidence, status=PENDING,
+                    provenance=PROV_HN_POST,
                 ))
                 if contact_id is None:
                     rows.append((post.company, address, "skip", 0, "duplicate"))

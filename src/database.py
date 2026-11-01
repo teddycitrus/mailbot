@@ -16,7 +16,7 @@ from typing import Iterable, Iterator, Optional
 from .models import (
     BOUNCED, CATCHALL, Company, Contact, ENRICHED, NO_CONTACTS, PENDING,
     QUEUED, REPLIED, SENT, SKIP_MX_UNRESOLVED, SKIP_PROBE_UNAVAILABLE,
-    SUPPRESSED, VERIFIED,
+    SUPPRESSED, VERIFIED, deliverable,
 )
 from .verifier import is_personal_mailbox
 
@@ -68,7 +68,10 @@ CREATE TABLE IF NOT EXISTS contacts (
     verify_status TEXT DEFAULT 'unverified',
     verify_detail TEXT DEFAULT '',
     status        TEXT DEFAULT 'pending',
-    created_at    TEXT NOT NULL
+    created_at    TEXT NOT NULL,
+    -- How the address was found; decides whether a catch-all one may be
+    -- sent to. See models.TRUSTED_PROVENANCE.
+    provenance    TEXT DEFAULT ''
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_email ON contacts(email);
 CREATE INDEX IF NOT EXISTS idx_contacts_status ON contacts(status);
@@ -146,6 +149,12 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _undeliverable_reason(row) -> str:
+    if row["verify_status"] == CATCHALL:
+        return f"catch-all, untrusted source ({row['provenance'] or 'unknown'})"
+    return f"not SMTP-verified ({row['verify_status']})"
+
+
 class Database:
     # Scheduled jobs overlap by design: drafting runs every two hours, sending
     # every fifteen minutes, and both carry a wake trigger that fires them at
@@ -195,6 +204,7 @@ class Database:
             ("companies", "github_org", "TEXT DEFAULT ''"),
             ("companies", "priority", "INTEGER DEFAULT 0"),
             ("drafts", "gmail_message_id", "TEXT DEFAULT ''"),
+            ("contacts", "provenance", "TEXT DEFAULT ''"),
         ):
             have = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
             if column not in have:
@@ -298,11 +308,12 @@ class Database:
         cur = self.conn.execute(
             """INSERT INTO contacts
                (company_id, email, first_name, last_name, role, bio, linkedin,
-                confidence, source, verify_status, verify_detail, status, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                confidence, source, verify_status, verify_detail, status, created_at,
+                provenance)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (c.company_id, email, c.first_name, c.last_name, c.role, c.bio,
              c.linkedin, c.confidence, c.source, c.verify_status, c.verify_detail,
-             c.status, _now()),
+             c.status, _now(), c.provenance),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -399,7 +410,8 @@ class Database:
         if self.is_suppressed(email):
             return False, "suppressed"
         row = self.conn.execute(
-            "SELECT status FROM contacts WHERE email = ?", (email,)
+            "SELECT status, verify_status, provenance FROM contacts WHERE email = ?",
+            (email,)
         ).fetchone()
         if row and row["status"] in {SENT, REPLIED, BOUNCED, SUPPRESSED}:
             return False, f"already {row['status']}"
@@ -408,6 +420,12 @@ class Database:
         ).fetchone()
         if prior:
             return False, "already in send log"
+        # A stored contact is mailed only once its own mailbox accepted an SMTP
+        # RCPT, or, on a catch-all domain, when it came from a trusted source.
+        # An address with no row yet is being vetted by enrich, which applies
+        # the same rule before storing it (see models.deliverable).
+        if row and not deliverable(row["verify_status"], row["provenance"]):
+            return False, _undeliverable_reason(row)
         return True, ""
 
     def can_send_to_again(self, email: str) -> tuple[bool, str]:
@@ -423,7 +441,8 @@ class Database:
         if self.is_suppressed(email):
             return False, "suppressed"
         row = self.conn.execute(
-            "SELECT status FROM contacts WHERE email = ?", (email,)
+            "SELECT status, verify_status, provenance FROM contacts WHERE email = ?",
+            (email,)
         ).fetchone()
         if row is None:
             return False, "unknown contact"
@@ -431,6 +450,8 @@ class Database:
             return False, f"already {row['status']}"
         if row["status"] != SENT:
             return False, f"status is {row['status']}, not sent"
+        if not deliverable(row["verify_status"], row["provenance"]):
+            return False, _undeliverable_reason(row)
         return True, ""
 
     def is_suppressed(self, email: str) -> bool:

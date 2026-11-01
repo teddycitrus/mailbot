@@ -26,6 +26,30 @@ CATCHALL = "catchall"          # domain accepts everything; cannot confirm
 UNDELIVERABLE = "undeliverable"
 NO_MX = "no_mx"
 
+
+# Contact.provenance: how the address was come by. On a catch-all domain the
+# SMTP probe proves nothing, so this is the only evidence the address is real.
+PROV_HN_POST = "hn_post"                      # the person posted it on HN
+PROV_FOUNDER_PUBLISHED = "founder_published"  # published, local part fits a named founder
+PROV_GIT_COMMIT = "git_commit"                # author address on the company's commits
+PROV_HOUSE_PATTERN = "house_pattern"          # founder name + convention proven on the domain
+PROV_SITE = "site_unattributed"               # published on the site, tied to nobody
+PROV_GUESS = "guess"                          # a permutation of a founder's name
+# Sources good enough to send to on a catch-all domain. Unattributed site
+# addresses bounced 8 in 23 there; these bounced 4 in 75 between them.
+TRUSTED_PROVENANCE = frozenset({
+    PROV_HN_POST, PROV_FOUNDER_PUBLISHED, PROV_GIT_COMMIT, PROV_HOUSE_PATTERN,
+})
+
+
+def deliverable(verify_status: str, provenance: str) -> bool:
+    """Mail goes only to a mailbox that accepted an SMTP RCPT, or, on a
+    catch-all domain where no probe can tell, to an address from a trusted
+    source."""
+    if verify_status == VERIFIED:
+        return True
+    return verify_status == CATCHALL and provenance in TRUSTED_PROVENANCE
+
 # Company.skip_reason. Only the ones the rest of the code has to match on: the
 # first is a finding about the domain, the others record a lookup or probe
 # that never answered, and telling them apart is what keeps an outage from
@@ -35,6 +59,8 @@ SKIP_MX_UNRESOLVED = "MX lookup failed, DNS did not answer"
 # Founders were found but no mail server answered a single probe, usually
 # because the laptop relay was off. Nothing was learned about the addresses.
 SKIP_PROBE_UNAVAILABLE = "SMTP probing unavailable, retry when it is back"
+# Addresses were found, but no mailbox among them accepted an SMTP RCPT.
+SKIP_NOT_VERIFIED = "no verified or trusted address"
 
 # Where an address came from, best first.
 SRC_SCRAPED = "scraped"        # literally published on the site or YC page
@@ -79,6 +105,7 @@ class Contact:
     verify_status: str = UNVERIFIED
     verify_detail: str = ""
     status: str = PENDING
+    provenance: str = ""
     id: Optional[int] = None
 
     @property

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from src.database import Database
-from src.models import BOUNCED, Company, Contact, REPLIED, SENT
+from src.models import BOUNCED, CATCHALL, Company, Contact, REPLIED, SENT, VERIFIED
 
 
 @pytest.fixture
@@ -40,7 +40,8 @@ def test_email_is_normalised_to_lowercase(db, company_id):
 
 
 def test_fresh_address_is_sendable(db, company_id):
-    db.upsert_contact(Contact(email="new@acme.ai", company_id=company_id))
+    db.upsert_contact(Contact(email="new@acme.ai", company_id=company_id,
+                              verify_status=VERIFIED))
     allowed, why = db.can_send_to("new@acme.ai")
     assert allowed and why == ""
 
@@ -213,7 +214,8 @@ def test_followup_carries_the_original_thread_id(db, company_id):
 
 
 def test_can_send_to_again_gate(db, company_id):
-    cid = db.upsert_contact(Contact(email="a@acme.ai", company_id=company_id))
+    cid = db.upsert_contact(Contact(email="a@acme.ai", company_id=company_id,
+                                    verify_status=VERIFIED))
     assert db.can_send_to_again("a@acme.ai")[0] is False, "not contacted yet"
     _sent_days_ago(db, cid, "a@acme.ai", days=9)
     assert db.can_send_to_again("a@acme.ai")[0] is True
@@ -222,6 +224,29 @@ def test_can_send_to_again_gate(db, company_id):
     db.set_contact_status(cid, SENT)
     db.suppress("a@acme.ai", "opt-out")
     assert db.can_send_to_again("a@acme.ai")[0] is False
+
+
+@pytest.mark.parametrize("status, provenance, why", [
+    ("unverified", "hn_post", "not SMTP-verified (unverified)"),
+    (CATCHALL, "site_unattributed", "catch-all, untrusted source (site_unattributed)"),
+    (CATCHALL, "guess", "catch-all, untrusted source (guess)"),
+    (CATCHALL, "", "catch-all, untrusted source (unknown)"),
+])
+def test_unproven_addresses_are_refused(db, company_id, status, provenance, why):
+    cid = db.upsert_contact(Contact(email="a@acme.ai", company_id=company_id,
+                                    verify_status=status, provenance=provenance))
+    assert db.can_send_to("a@acme.ai") == (False, why)
+    _sent_days_ago(db, cid, "a@acme.ai", days=9)
+    assert db.can_send_to_again("a@acme.ai") == (False, why)
+
+
+@pytest.mark.parametrize("provenance", [
+    "hn_post", "founder_published", "git_commit", "house_pattern",
+])
+def test_catchall_from_a_trusted_source_is_sendable(db, company_id, provenance):
+    db.upsert_contact(Contact(email="a@acme.ai", company_id=company_id,
+                              verify_status=CATCHALL, provenance=provenance))
+    assert db.can_send_to("a@acme.ai") == (True, "")
 
 
 def test_unknown_address_cannot_be_followed_up(db):
