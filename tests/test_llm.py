@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from src.llm import (
-    BANNED, FACT_LINES, MAX_RETRIES, OPENERS, Personalizer, WORD_LIMIT,
+    BANNED, DEFAULT_ASPECTS, FACT_LINES, MAX_RETRIES, OPENERS, Personalizer, WORD_LIMIT,
     clean_what, closing, compose, match_aspect, to_ascii, word_count,
 )
 
@@ -76,7 +76,13 @@ def test_the_line_ends_with_the_one_ask():
 # ------------------------------------------------------------ matching
 
 @pytest.mark.parametrize("one_liner, aspect", [
-    (AGENTS, "AI agents that act through tools"),
+    (AGENTS, "AI agents in isolated workspaces"),
+    ("API sandboxes, built for AI agents", "AI agents in isolated workspaces"),
+    ("AI code review for your team", "AI agents in isolated workspaces"),
+    ("AI agents for accounting firms", "AI agents that act through tools"),
+    ("Long-horizon research agents", "agentic research loops"),
+    ("Autoresearch as a service", "agentic research loops"),
+    ("Hill-climb any benchmark, for any model", "agentic research loops"),
     ("Turn any website into an MCP for your agents", "AI agents that act through tools"),
     ("The AI fraud hunter", "real-time risk monitoring"),
     ("Speaking coach for non-native English professionals", "speech-driven interfaces"),
@@ -87,7 +93,22 @@ def test_the_line_ends_with_the_one_ask():
     ("Real-time fraud alerts for banks", "real-time risk monitoring"),
 ])
 def test_plain_overlaps_are_matched(one_liner, aspect):
-    assert match_aspect(one_liner) == aspect
+    assert match_aspect(one_liner, aspects=DEFAULT_ASPECTS) == aspect
+
+
+@pytest.mark.parametrize("one_liner", [
+    "AI-powered research desk for hedge funds",
+    "Performance-Optimized Influencer Marketing at Scale",
+    "Optimizing fleet planning with data driven algorithms",
+])
+def test_loose_research_words_do_not_cite_kev_olution(one_liner):
+    assert match_aspect(one_liner, aspects=DEFAULT_ASPECTS) != "agentic research loops"
+
+
+def test_a_project_left_out_of_aspects_is_never_cited():
+    allowed = ["AI agents that act through tools"]
+    assert match_aspect("The AI fraud hunter", aspects=allowed) == ""
+    assert match_aspect(AGENTS, aspects=allowed) == "AI agents that act through tools"
 
 
 @pytest.mark.parametrize("one_liner", [
@@ -98,11 +119,12 @@ def test_plain_overlaps_are_matched(one_liner, aspect):
     "Maps what employees do and what it costs",
 ])
 def test_stretches_get_no_match(one_liner):
-    assert match_aspect(one_liner) == ""
+    assert match_aspect(one_liner, aspects=DEFAULT_ASPECTS) == ""
 
 
 def test_a_passing_mention_in_the_description_is_not_enough():
-    assert match_aspect("Build games fast", "players can use voice chat") == ""
+    assert match_aspect("Build games fast", "players can use voice chat",
+                        aspects=DEFAULT_ASPECTS) == ""
 
 
 def test_shipping_fast_never_matches_on_its_own():
@@ -155,7 +177,7 @@ def test_compose_is_stable_per_company():
 def test_good_phrase_is_used_first_try():
     p = ScriptedPersonalizer([GOOD])
     out = line(p)
-    assert GOOD in out and "bastion" in out
+    assert GOOD in out and "when i built" in out
     assert p.asked == 1
 
 
