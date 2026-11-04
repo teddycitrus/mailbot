@@ -7,12 +7,13 @@ so importing this module is always safe.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import time as dtime
 from pathlib import Path
 
-from .models import SELF_PUBLISHED, TRUSTED_PROVENANCE
+from .models import MAIN_LANE, SELF_PUBLISHED, TRUSTED_PROVENANCE
 
 try:
     from dotenv import load_dotenv
@@ -62,6 +63,50 @@ def _bool(name: str, default: bool) -> bool:
     if not raw:
         return default
     return raw in {"1", "true", "yes", "on"}
+
+
+_LANE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,15}$")
+# What makes a lane a separate account. A lane file without these would send
+# from the main account under another lane's brakes, or read the main inbox
+# for its own bounces and never see them, the mix-ups that must be
+# impossible rather than merely unlikely.
+_LANE_REQUIRED = ("FROM_EMAIL", "SMTP_USER", "SMTP_PASS", "IMAP_USER", "IMAP_PASS")
+
+
+def lane_env_path(env_file: str | os.PathLike[str], lane: str) -> Path:
+    """Where a lane's settings live: .env.volume beside .env, and so on."""
+    base = Path(env_file)
+    return base.parent / f"{base.name}.{lane}"
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    """KEY=VALUE lines, # comments, optional quotes. Parsed here rather than
+    by dotenv, which is optional and would silently do nothing if absent."""
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def _apply_lane(env_file, lane: str) -> None:
+    """Layer a lane's file over the main settings, its values winning."""
+    if not _LANE_NAME.match(lane):
+        raise ConfigError(f"lane must be a short lowercase name, got {lane!r}")
+    path = lane_env_path(env_file or ".env", lane)
+    if not path.exists():
+        raise ConfigError(f"lane {lane!r} needs its settings in {path}")
+    values = _read_env_file(path)
+    missing = [k for k in _LANE_REQUIRED if not values.get(k)]
+    if missing:
+        raise ConfigError(f"{path} must set its own {', '.join(missing)}")
+    os.environ.update(values)
 
 
 def _clock(name: str, default: str) -> dtime:
@@ -160,8 +205,9 @@ class Settings:
     # Companies named by hand, which skip the size and age gates and sort
     # ahead of everything else. See priority.py.
     priority_path: Path
-    # host:port of a SOCKS5 relay for SMTP probes, empty to probe directly.
-    # On the server this is the laptop's SSH tunnel; see verifier.py.
+    # host:port of a SOCKS5 relay for SMTP probes, empty to probe directly,
+    # which is how the server runs. Only for a network that blocks port 25;
+    # see verifier.py.
     smtp_probe_relay: str = ""
     # People written to at one company, counting the queue. Colleagues are
     # sent on different days, and a reply, opt-out or hard bounce from any
@@ -177,9 +223,39 @@ class Settings:
     # Most the ramp cap may be, as a multiple of the busiest recent send day.
     # 0 turns the growth limiter off.
     send_ramp_max_growth: int = 2
+    # The sending account these settings act for. "main" is .env alone; any
+    # other lane is .env with .env.<lane> layered on top. See models.py.
+    lane: str = MAIN_LANE
+    # Where alerts go. A second account mailing its alerts to itself would
+    # mail an inbox nobody reads, so a lane points this at the operator.
+    alert_to: str = ""
+    # How often the send timer fires. The day's allowance is spread across
+    # the ticks left in each recipient's window instead of a fixed number
+    # per tick, which had capped a timezone at about 27 a day whatever the
+    # limit said.
+    send_tick_minutes: int = 15
+    # The share of the daily cap kept for follow-ups while any are due.
+    followup_share_pct: int = 33
+    # Keep unprovable first-name guesses on catch-all domains, reserved for
+    # the volume lane, instead of discarding them. Set on the main .env,
+    # where enrich runs.
+    volume_guesses: bool = False
+    # The volume lane's own brake on those guesses: above this recent bounce
+    # rate, or above it today with two or more bounced, they wait.
+    guess_max_bounce_pct: int = 6
+
+    @property
+    def operator_email(self) -> str:
+        return self.alert_to or self.from_email
 
     @classmethod
-    def load(cls, env_file: str | os.PathLike[str] | None = ".env") -> "Settings":
+    def load(cls, env_file: str | os.PathLike[str] | None = ".env",
+             lane: str = MAIN_LANE) -> "Settings":
+        lane = (lane or MAIN_LANE).strip().lower()
+        if lane != MAIN_LANE:
+            # Before the main file, and over the environment, because
+            # load_dotenv below never overrides a value already set.
+            _apply_lane(env_file, lane)
         if env_file and Path(env_file).exists():
             load_dotenv(env_file, override=False)
         return cls(
@@ -254,6 +330,12 @@ class Settings:
             vc_max_site_rank=max(0, _int("VC_MAX_SITE_RANK", 20_000)),
             catchall_strict_bounce_pct=max(0, _int("CATCHALL_STRICT_BOUNCE_PCT", 3)),
             send_ramp_max_growth=max(0, _int("SEND_RAMP_MAX_GROWTH", 2)),
+            lane=lane,
+            alert_to=os.getenv("ALERT_TO", "").strip(),
+            send_tick_minutes=max(1, _int("SEND_TICK_MINUTES", 15)),
+            followup_share_pct=min(100, max(0, _int("FOLLOWUP_SHARE_PCT", 33))),
+            volume_guesses=_bool("VOLUME_GUESSES", False),
+            guess_max_bounce_pct=max(0, _int("GUESS_MAX_BOUNCE_PCT", 6)),
         )
 
     def catchall_provenance(self, bounce_pct: float) -> tuple[frozenset, str]:

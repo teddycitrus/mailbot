@@ -23,8 +23,9 @@ class CountingDB:
         self.depth = depth
         self.cleared = []
 
-    def queued_draft_count(self):
-        return self.depth
+    def queued_draft_count(self, reserved=None):
+        # Every draft here is an open one; nothing is reserved for a lane.
+        return 0 if reserved else self.depth
 
     def clear_draft_mirror(self, draft_id):
         self.cleared.append(draft_id)

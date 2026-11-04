@@ -532,3 +532,36 @@ def test_a_company_nobody_could_probe_is_parked_as_retryable():
     assert _why_empty(founders, [], answered, "acme.ai",
                       unprobed=True) == SKIP_PROBE_UNAVAILABLE
     assert SKIP_PROBE_UNAVAILABLE in Database.UNANSWERED_SKIPS
+
+
+# ------------------------------------------------ placeholder mail hosts
+
+@pytest.mark.parametrize("host, usable", [
+    ("mx.acme.ai", "mx.acme.ai"),
+    ("MX.Acme.AI.", "mx.acme.ai"),
+    ("ms55810524.msv1.invalid", ""),
+    ("localhost", ""),
+    ("mail.example", ""),
+    ("", ""),
+])
+def test_usable_mx(host, usable):
+    from src.verifier import usable_mx
+    assert usable_mx(host) == usable
+
+
+def test_an_mx_pointing_at_a_reserved_name_means_no_mail(monkeypatch):
+    """A half-set-up Microsoft 365 domain publishes ms...msv1.invalid. Probing
+    it failed to resolve, which read as "probing unavailable" and put the
+    company back in the queue every half hour, forever."""
+    monkeypatch.setattr(dns.resolver, "resolve", lambda *_: [
+        SimpleNamespace(preference=0, exchange="ms55810524.msv1.invalid.")
+    ])
+    assert Verifier(db=None).mx_lookup("auctor.test") == (None, True)
+
+
+def test_a_real_host_behind_a_placeholder_still_counts(monkeypatch):
+    monkeypatch.setattr(dns.resolver, "resolve", lambda *_: [
+        SimpleNamespace(preference=0, exchange="ms1.msv1.invalid."),
+        SimpleNamespace(preference=10, exchange="mx.acme.ai."),
+    ])
+    assert Verifier(db=None).mx_lookup("acme.ai") == ("mx.acme.ai", True)

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 
 from src import pipeline as pipeline_module
+from src.emailer import WindowState
 from src.main import Pipeline
 
 
@@ -277,8 +278,12 @@ def test_drafts_outside_their_window_do_not_starve_open_ones(monkeypatch, capsys
     send while Eastern drafts sat just past the slice.
     """
     monkeypatch.setattr(
-        pipeline_module, "local_window_open",
-        lambda loc, *a: (loc == "Toronto", "08:00 America/Los_Angeles"))
+        pipeline_module, "window_state",
+        lambda loc, *a, **k: (
+            WindowState("open", "America/Toronto", "America/Toronto", 1)
+            if loc == "Toronto"
+            else WindowState("later", "America/Los_Angeles",
+                             "05:00 America/Los_Angeles")))
     west = [draft(f"w{i}@west.ai", body=LINKED) for i in range(60)]
     for d in west:
         d["company_location"] = "San Francisco"

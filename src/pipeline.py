@@ -7,7 +7,9 @@ on its own before the next.
 
 from __future__ import annotations
 
+import contextlib
 import imaplib
+import math
 import smtplib
 import time
 from collections import Counter
@@ -16,12 +18,13 @@ from pathlib import Path
 from .config import Settings
 from .database import Database
 from .emailer import (
-    draft_defect, message_for_draft, resume_link_line,
+    WindowState, draft_defect, message_for_draft, resume_link_line,
     strip_re_prefix, with_resume_link,
     build_message, in_send_window, load_template, local_date,
-    local_window_open, make_backend, pace_delay, unedited_markers,
-    validate_template,
+    make_backend, pace_delay, unedited_markers,
+    validate_template, window_state,
 )
+from .lanes import guess_hold, is_guess, spread
 from .mirror import GmailDrafts
 from .finder import discover as discover_companies, enrich_company
 from .gh_discovery import discover as discover_orgs
@@ -29,8 +32,9 @@ from .github_source import GitHubClient
 from .hn_source import fetch_posts, fetch_recent_posts
 from .llm import Personalizer
 from .models import (
-    CATCHALL, Company, Contact, ENRICHED, NO_CONTACTS, PENDING, SRC_SCRAPED,
-    PROV_HN_POST, SKIP_NOT_VERIFIED, TRUSTED_PROVENANCE, deliverable,
+    CATCHALL, Company, Contact, ENRICHED, MAIN_LANE, NO_CONTACTS, PENDING,
+    SKIP_CATCHALL_UNPROVABLE, SRC_SCRAPED, PROV_HN_POST, SKIP_NOT_VERIFIED,
+    TRUSTED_PROVENANCE, deliverable, lane_deliverable, volume_tier,
 )
 from . import priority as priority_list
 from .priority import from_settings as priority_set
@@ -54,10 +58,16 @@ _PRIORITY_HEADER = """\
 # Lines starting with # are ignored, so a name can be parked without deleting.
 """
 
+
+def _reserved_row(row) -> str:
+    """The lane a draft row is reserved for, "" when any lane may send it."""
+    return (row["contact_lane"] if "contact_lane" in row.keys() else "") or ""
+
+
 class Pipeline:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.db = Database(settings.db_path)
+        self.db = Database(settings.db_path, getattr(settings, "lane", MAIN_LANE))
         self.fetcher = Fetcher(
             settings.scrape_user_agent,
             per_minute=settings.http_rate_limit_per_min,
@@ -80,6 +90,15 @@ class Pipeline:
 
     def close(self) -> None:
         self.db.close()
+
+    @property
+    def lane(self) -> str:
+        return getattr(self.db, "lane", MAIN_LANE) or MAIN_LANE
+
+    def _tag(self, stage: str) -> str:
+        """The log prefix: "send" on main, "send[volume]" on another lane, so
+        two accounts writing one log stay apart."""
+        return stage if self.lane == MAIN_LANE else f"{stage}[{self.lane}]"
 
     # ---------------- stages ----------------
 
@@ -249,13 +268,16 @@ class Pipeline:
             note = result.note
             for contact in result.contacts:
                 # Only what the send gate accepts is worth storing: a verified
-                # mailbox, or a catch-all one from a trusted source.
-                if not deliverable(contact.verify_status, contact.provenance):
+                # mailbox, or a catch-all one from a trusted source, or a
+                # guess reserved for the volume lane, which only it may send.
+                reserved = getattr(contact, "lane", "")
+                if not lane_deliverable(contact.verify_status, contact.provenance,
+                                        reserved, reserved or MAIN_LANE):
                     rows.append((company["name"], contact.email, "skip", 0,
                                  f"{contact.verify_status}, {contact.provenance}"))
                     note = note or SKIP_NOT_VERIFIED
                     continue
-                allowed, why = self.db.can_send_to(contact.email)
+                allowed, why = self.db.can_send_to(contact.email, reserved)
                 if not allowed:
                     rows.append((company["name"], contact.email, "skip", 0, why))
                     continue
@@ -266,7 +288,8 @@ class Pipeline:
                 added += 1
                 rows.append((company["name"], contact.email,
                              contact.verify_status, contact.confidence,
-                             contact.role[:34] or contact.source))
+                             (f"{reserved} lane, " if reserved else "")
+                             + (contact.role[:34] or contact.source)))
             self.db.set_company_status(
                 company["id"], ENRICHED if kept else NO_CONTACTS,
                 result.note if kept else note,
@@ -346,6 +369,35 @@ class Pipeline:
         _print_table(rows, ("company", "email", "verify", "conf", "location"))
         return added
 
+    def reopen_catchall(self, limit: int) -> int:
+        """Put companies parked as "catch-all, guesses unprovable" back in
+        the enrich queue, a few a day, so the volume lane's guess tier has
+        people to write to. Off unless VOLUME_GUESSES is on, since without
+        it enrich would only park them again. Few at a time because each one
+        re-enriched costs fetches that new companies also need."""
+        if not getattr(self.settings, "volume_guesses", False):
+            print("reopen-catchall: VOLUME_GUESSES is off, nothing to do")
+            return 0
+        parked = self.db.companies_parked_on(SKIP_CATCHALL_UNPROVABLE)
+        for row in parked[:max(0, limit)]:
+            self.db.reopen_company(row["id"])
+        reopened = min(len(parked), max(0, limit))
+        print(f"reopen-catchall: {reopened} of {len(parked)} parked catch-all "
+              "companies back in the enrich queue")
+        return reopened
+
+    def import_apollo(self, path: Path, any_size: bool = False,
+                      dry_run: bool = False, limit: int = 0) -> int:
+        """Load an Apollo contacts export. See apollo.py for the rules."""
+        from .apollo import import_export
+        report = import_export(Path(path), self.db, self.verifier, self.settings,
+                               any_size=any_size, dry_run=dry_run, limit=limit)
+        verb = "would add" if dry_run else "added"
+        print(f"apollo: {verb} {report.added} contact(s) from {report.rows} row(s), "
+              f"{report.reserved} of them reserved for the volume lane")
+        _print_table(report.lines, ("email", "state", "detail"))
+        return report.added
+
     def queue(self, limit: int, target: int = 0) -> int:
         """Render drafts. With a target, only enough to reach that depth.
 
@@ -354,13 +406,21 @@ class Pipeline:
         calls the LLM once per draft, so "nothing to do" has to be decided
         before that and not after.
         """
+        # Two depths, kept apart: drafts any lane may send, and the volume
+        # lane's reserved guesses. One shared target let guesses fill the
+        # queue and stop verified people being drafted at all.
+        guesses_on = bool(getattr(self.settings, "volume_guesses", False))
+        room = {False: limit, True: limit if guesses_on else 0}
         if target:
-            have = self.db.queued_draft_count()
-            if have >= target:
-                print(f"queue: {have} already waiting, target {target}, "
-                      "nothing to render")
+            have_open = self.db.queued_draft_count(reserved=False)
+            have_held = self.db.queued_draft_count(reserved=True) if guesses_on else 0
+            room = {False: max(0, target - have_open),
+                    True: max(0, target - have_held) if guesses_on else 0}
+            if not any(room.values()):
+                print(f"queue: {have_open + have_held} already waiting, target "
+                      f"{target}, nothing to render")
                 return 0
-            limit = min(limit, target - have)
+            limit = min(limit, room[False] + room[True])
         template = load_template(self.settings.template_path)
         validate_template(template)
         holes = unedited_markers(f"{template.subject}\n{template.body}")
@@ -382,18 +442,25 @@ class Pipeline:
                   "and no RESUME_LINK is set; queuing without either, "
                   "send() will refuse these drafts")
 
-        contacts = self.db.contacts_by_status(PENDING, limit=limit * 3)
+        # Every pending contact, not a slice: with the open queue full, a
+        # slice of the best-ranked rows held no reserved ones at all.
+        contacts = self.db.contacts_by_status(PENDING, limit=-1)
         queued = 0
         rows = []
         for row in contacts:
             if queued >= limit:
                 break
-            if row["confidence"] < self.settings.min_confidence:
+            reserved = (row["lane"] if "lane" in row.keys() else "") or ""
+            if room[bool(reserved)] <= 0:
+                continue
+            # A reserved guess sits under MIN_CONFIDENCE by design, and is
+            # judged at send time by the volume lane's own brake instead.
+            if not reserved and row["confidence"] < self.settings.min_confidence:
                 rows.append((row["email"], "skip",
                              f"confidence {row['confidence']} < "
                              f"{self.settings.min_confidence}"))
                 continue
-            allowed, why = self.db.can_send_to(row["email"])
+            allowed, why = self.db.can_send_to(row["email"], reserved)
             if not allowed:
                 rows.append((row["email"], "skip", why))
                 continue
@@ -443,8 +510,17 @@ class Pipeline:
                 body = with_resume_link(body, self.settings.resume_link)
             self.db.queue_draft(row["id"], subject, body, attachments)
             queued += 1
-            rows.append((row["email"], "queued", subject[:40]))
+            room[bool(reserved)] -= 1
+            rows.append((row["email"], f"queued for {reserved}" if reserved
+                         else "queued", subject[:40]))
         print(f"queue: {queued} drafts ready ({self.personalizer.budget})")
+        failures = getattr(self.personalizer, "failures", None)
+        if failures:
+            # A failed call only drops the optional personal line, so nothing
+            # else would ever show that the model had stopped answering.
+            print(f"queue: {sum(failures.values())} groq call(s) failed, so "
+                  "those drafts carry the generic line: " + ", ".join(
+                      f"{n}x {why}" for why, n in failures.most_common(3)))
         _print_table(rows, ("email", "status", "detail"))
         return queued
 
@@ -473,16 +549,26 @@ class Pipeline:
         """
         settings = self.settings
         if not getattr(settings, "send_ramp_enabled", False):
-            return settings.daily_send_limit, "ramp off"
-        return settings.daily_cap(
-            self.db.active_send_days(today),
-            self.db.recent_bounce_pct(before_local_date=today),
-            self.db.max_daily_sends(before_local_date=today),
-        )
+            cap, why = settings.daily_send_limit, "ramp off"
+        else:
+            cap, why = settings.daily_cap(
+                self.db.active_send_days(today),
+                self.db.recent_bounce_pct(before_local_date=today),
+                self.db.max_daily_sends(before_local_date=today),
+            )
+        # On record so another lane can tell when this one is full, which is
+        # when the open queue becomes that lane's overflow.
+        record = getattr(self.db, "record_cap", None)
+        if record is not None:
+            record(today, cap)
+        return cap, why
 
     def _catchall_rule(self, today: str):
         """Today's test for a catch-all address, and why: see
-        Settings.catchall_provenance. None means no tightening applies."""
+        Settings.catchall_provenance. None means no tightening applies.
+
+        The volume lane's guess tier is left to its own brake, _guess_rule;
+        these tiers are about addresses with real evidence behind them."""
         rule = getattr(self.settings, "catchall_provenance", None)
         if rule is None:
             return None, ""
@@ -491,8 +577,93 @@ class Pipeline:
             return None, why
 
         def blocked(row) -> bool:
-            return row["verify_status"] == CATCHALL and row["provenance"] not in allowed
+            return (row["verify_status"] == CATCHALL and row["provenance"] not in allowed
+                    and not volume_tier(row["verify_status"], row["provenance"]))
         return blocked, why
+
+    def _guess_rule(self, today: str):
+        """The volume lane's brake on its guess tier: (test, why), or
+        (None, "") when guesses may go. See lanes.guess_hold."""
+        why = guess_hold(self.settings, self.db, today)
+        return (is_guess if why else None), why
+
+    def _window_states(self, rows: list, ignore_window: bool) -> list[tuple]:
+        """Each row paired with where its recipient's send window stands."""
+        settings = self.settings
+        if ignore_window:
+            anywhere = WindowState("open", "any", "any", 1)
+            return [(row, anywhere) for row in rows]
+        tick = getattr(settings, "send_tick_minutes", 15)
+
+        def state(row) -> WindowState:
+            # One clock for everyone unless windows follow the recipient.
+            location = ""
+            if settings.per_recipient_timezone and "company_location" in row.keys():
+                location = row["company_location"] or ""
+            return window_state(location, settings.send_timezone,
+                                settings.send_window_start, settings.send_window_end,
+                                tick)
+        return [(row, state(row)) for row in rows]
+
+    def _followup_pool(self, today: str, ignore_window: bool):
+        """Every due bump, the ones this lane may send with their windows, and
+        why the rest were refused, counted by reason.
+
+        Refused rows stay due forever and every tick walks all of them, so
+        they are tallied rather than printed one line each.
+        """
+        settings = self.settings
+        # Every due row, not a slice: refused ones are never cleared and sort
+        # oldest first, so a fixed slice filled with them and starved the rest.
+        due = self.db.due_for_followup(
+            settings.followup_after_days, settings.followup_max_total_sends,
+            limit=None,
+        )
+        refused: Counter = Counter()
+        catchall_blocked, catchall_why = self._catchall_rule(today)
+        guess_blocked, guess_why = self._guess_rule(today)
+        eligible = []
+        for row in due:
+            allowed, why = self.db.can_send_to_again(row["email"])
+            if not allowed:
+                refused[why] += 1
+                continue
+            if catchall_blocked and catchall_blocked(row):
+                refused[catchall_why] += 1
+                continue
+            if guess_blocked and guess_blocked(row):
+                refused[guess_why] += 1
+                continue
+            # A bump shares the daily cap with first emails, so it is spent
+            # only on a known person. Nudging an unnamed address twice drew
+            # opt-outs, never answers.
+            if not (row["first_name"] or "").strip():
+                refused["no person's name to follow up with"] += 1
+                continue
+            eligible.append(row)
+        return due, self._window_states(eligible, ignore_window), refused
+
+    def _followup_owed(self, today: str, cap: int, ignore_window: bool) -> int:
+        """Bumps still to go out today from their share of the cap.
+
+        The share is FOLLOWUP_SHARE_PCT of the cap, but never more than are
+        actually due and reachable today, so a quiet follow-up day hands its
+        slots back to first emails instead of leaving them unspent.
+        """
+        settings = self.settings
+        share = getattr(settings, "followup_share_pct", 0)
+        if not getattr(settings, "followup_enabled", False) or not share:
+            return 0
+        _due, states, _refused = self._followup_pool(today, ignore_window)
+        reachable = sum(1 for _row, state in states if state.today)
+        done = self.db.followup_count_on(today)
+        return max(0, min(math.ceil(cap * share / 100), done + reachable) - done)
+
+    def _first_emails_left(self, ignore_window: bool) -> int:
+        """Queued first emails this lane could still reach today."""
+        pool = self.db.queued_drafts(limit=None)
+        return sum(1 for _row, state in self._window_states(pool, ignore_window)
+                   if state.today)
 
     def followup(self, limit: int, ignore_window: bool = False) -> int:
         """Send one polite nudge to people who never answered.
@@ -502,8 +673,9 @@ class Pipeline:
         is excluded by the query, so this cannot turn into a drip campaign.
         """
         settings = self.settings
+        tag = self._tag("followup")
         if not settings.followup_enabled:
-            print("followup: disabled")
+            print(f"{tag}: disabled")
             return 0
         settings.require_for_send()
         template = load_template(settings.followup_template_path)
@@ -515,7 +687,7 @@ class Pipeline:
         # template could still leave by.
         holes = unedited_markers(f"{template.subject}\n{template.body}")
         if holes:
-            print(f"followup: refusing to send, {settings.followup_template_path} "
+            print(f"{tag}: refusing to send, {settings.followup_template_path} "
                   f"still has unedited placeholder(s): {', '.join(holes[:3])}")
             return 0
 
@@ -529,7 +701,7 @@ class Pipeline:
                 settings.send_window_end,
             )
             if not ok and not ignore_window:
-                print(f"followup: refused, {why}")
+                print(f"{tag}: refused, {why}")
                 return 0
 
         today = local_date(settings.send_timezone)
@@ -537,17 +709,12 @@ class Pipeline:
         cap, why_cap = self._todays_cap(today)
         remaining = max(0, cap - already)
         if remaining == 0:
-            print(f"followup: daily cap reached ({already}/{cap}, {why_cap})")
+            print(f"{tag}: daily cap reached ({already}/{cap}, {why_cap})")
             return 0
 
-        # Every due row, not a slice: refused ones are never cleared and sort
-        # oldest first, so a fixed slice filled with them and starved the rest.
-        due = self.db.due_for_followup(
-            settings.followup_after_days, settings.followup_max_total_sends,
-            limit=None,
-        )
+        due, states, refused = self._followup_pool(today, ignore_window)
         if not due:
-            print("followup: nobody due")
+            print(f"{tag}: nobody due")
             return 0
 
         # Same rule as the first email: the hosted link when one is set,
@@ -556,41 +723,28 @@ class Pipeline:
                        if not settings.resume_link and settings.resume_path.exists()
                        else [])
         if not attachments and not settings.resume_link:
-            print("followup: resume missing and no RESUME_LINK set, refusing to send")
+            print(f"{tag}: resume missing and no RESUME_LINK set, refusing to send")
             return 0
 
+        # Bumps get their share of the cap, spread over the morning like
+        # first emails. Once no first email is left to send today, nothing
+        # else wants the rest of the cap, so they may use it.
+        share = getattr(settings, "followup_share_pct", 0)
+        allowance = remaining
+        if share:
+            done = self.db.followup_count_on(today)
+            allowance = min(remaining, max(0, math.ceil(cap * share / 100) - done))
+            if allowance < remaining and not self._first_emails_left(ignore_window):
+                allowance = remaining
+        picked = spread(states, min(limit, allowance))
+
         sent = 0
-        # Refused rows stay due forever and every tick walks all of them, so
-        # they are counted by reason rather than printed one line each.
-        refused: Counter = Counter()
-        catchall_blocked, catchall_why = self._catchall_rule(today)
-        backend = make_backend(settings)
+        # No login when there is nothing to send: most ticks are like that.
+        backend = make_backend(settings) if picked else None
         try:
-            with backend:
-                for row in due:
-                    if sent >= min(limit, remaining):
-                        break
-                    allowed, why = self.db.can_send_to_again(row["email"])
-                    if not allowed:
-                        refused[why] += 1
-                        continue
-                    if catchall_blocked and catchall_blocked(row):
-                        refused[catchall_why] += 1
-                        continue
-                    if settings.per_recipient_timezone and not ignore_window:
-                        open_now, where = local_window_open(
-                            row["company_location"] or "", settings.send_timezone,
-                            settings.send_window_start, settings.send_window_end,
-                        )
-                        if not open_now:
-                            continue
-                    # A bump shares the daily cap with first emails, so it is
-                    # spent only on a known person. Nudging an unnamed address
-                    # twice drew opt-outs, never answers.
+            with backend or contextlib.nullcontext():
+                for index, row in enumerate(picked):
                     first = (row["first_name"] or "").strip()
-                    if not first:
-                        refused["no person's name to follow up with"] += 1
-                        continue
                     subject, body = template.render({
                         "first_name": first,
                         "original_subject": strip_re_prefix(row["first_subject"] or ""),
@@ -626,34 +780,19 @@ class Pipeline:
                     # Pacing separates messages; there is nothing to separate
                     # the last one from, and a tick that sends its single
                     # allowance should not then sit idle for twenty seconds.
-                    if sent < min(limit, remaining):
+                    if index < len(picked) - 1:
                         time.sleep(pace_delay(settings.send_delay_seconds))
         except smtplib.SMTPAuthenticationError:
-            print("followup: SMTP login rejected, see send for details")
+            print(f"{tag}: SMTP login rejected, see send for details")
             return 0
         except (smtplib.SMTPException, OSError) as exc:
-            print(f"followup: could not reach {settings.smtp_host}: {exc}")
+            print(f"{tag}: could not reach {settings.smtp_host}: {exc}")
             return 0
         if refused:
-            print("followup: skipped " + ", ".join(
+            print(f"{tag}: skipped " + ", ".join(
                 f"{n} {why}" for why, n in refused.most_common()))
-        print(f"followup: {sent} sent, {len(due)} were due")
+        print(f"{tag}: {sent} sent, {len(due)} were due")
         return sent
-
-    def _split_by_local_window(self, drafts: list):
-        """Separate drafts whose recipient is currently in their own morning."""
-        settings = self.settings
-        now_here, waiting = [], []
-        for draft in drafts:
-            location = draft["company_location"] if "company_location" in draft.keys() else ""
-            open_now, where = local_window_open(
-                location or "", settings.send_timezone,
-                settings.send_window_start, settings.send_window_end,
-            )
-            (now_here if open_now else waiting).append(
-                draft if open_now else (draft, where)
-            )
-        return now_here, waiting
 
     def _space_by_company(self, drafts: list, today: str):
         """At most one first email per company per day, none once it has spoken.
@@ -686,6 +825,7 @@ class Pipeline:
     def send(self, limit: int, ignore_window: bool = False) -> int:
         settings = self.settings
         settings.require_for_send()
+        tag = self._tag("send")
         today = local_date(settings.send_timezone)
 
         # In per-recipient mode each draft is gated on the window where the
@@ -697,34 +837,22 @@ class Pipeline:
                 settings.send_window_end,
             )
             if not ok and not ignore_window:
-                print(f"send: refused, {why}")
+                print(f"{tag}: refused, {why}")
                 return 0
 
         already = self.db.sent_count_on(today)
         cap, why_cap = self._todays_cap(today)
         remaining = max(0, cap - already)
         if remaining == 0:
-            print(f"send: daily cap reached ({already}/{cap}, {why_cap})")
+            print(f"{tag}: daily cap reached ({already}/{cap}, {why_cap})")
             return 0
 
         # The whole queue, filtered by window below. A slice of the top ranks
         # could be all one timezone and leave another zone's tick empty.
         pool = self.db.queued_drafts(limit=None)
         if not pool:
-            print("send: nothing queued")
+            print(f"{tag}: nothing queued")
             return 0
-
-        if settings.per_recipient_timezone and not ignore_window:
-            pool, waiting = self._split_by_local_window(pool)
-            if waiting:
-                zones: dict[str, int] = {}
-                for _, where in waiting:
-                    zones[where] = zones.get(where, 0) + 1
-                summary = ", ".join(f"{n} in {z}" for z, n in sorted(zones.items()))
-                print(f"send: {len(waiting)} waiting for their local morning ({summary})")
-            if not pool:
-                print("send: nobody is inside their local send window right now")
-                return 0
 
         # Last line of defence, and it screens the whole pool before the
         # budget is taken rather than after. A draft that still shows
@@ -737,10 +865,10 @@ class Pipeline:
         for email, why in blocked:
             print(f"  BLOCKED {email}: {why}")
         if blocked:
-            print(f"send: {len(blocked)} draft(s) blocked as incomplete, "
+            print(f"{tag}: {len(blocked)} draft(s) blocked as incomplete, "
                   f"passing over them for the next ready draft")
         if not pool:
-            print("send: no complete drafts to send")
+            print(f"{tag}: no complete drafts to send")
             return 0
 
         # Held, not skipped: they stay queued and go once the rate recovers.
@@ -749,24 +877,70 @@ class Pipeline:
             held_back = [d for d in pool if catchall_blocked(d)]
             if held_back:
                 pool = [d for d in pool if not catchall_blocked(d)]
-                print(f"send: {len(held_back)} catch-all draft(s) held ({catchall_why})")
+                print(f"{tag}: {len(held_back)} catch-all draft(s) held ({catchall_why})")
             if not pool:
-                print("send: only held catch-all drafts left")
+                print(f"{tag}: only held catch-all drafts left")
                 return 0
+
+        # The same, for the volume lane's guesses and its own brake.
+        guess_blocked, guess_why = self._guess_rule(today)
+        if guess_blocked:
+            held_back = [d for d in pool if guess_blocked(d)]
+            if held_back:
+                pool = [d for d in pool if not guess_blocked(d)]
+                print(f"{tag}: {len(held_back)} guess draft(s) held ({guess_why})")
+            if not pool:
+                print(f"{tag}: only held guess drafts left")
+                return 0
+
+        # Another lane takes an open draft only once main has used its whole
+        # cap for the day: before that, main would have sent it itself, and
+        # the main account is the one that has earned its reputation.
+        if self.lane != MAIN_LANE:
+            full, tally = self.db.lane_at_cap(MAIN_LANE, today)
+            if not full:
+                open_ = [d for d in pool if not _reserved_row(d)]
+                if open_:
+                    pool = [d for d in pool if _reserved_row(d)]
+                    print(f"{tag}: {len(open_)} open draft(s) left to the main "
+                          f"lane ({tally})")
+                if not pool:
+                    print(f"{tag}: nothing reserved for this lane is ready")
+                    return 0
 
         pool, held = self._space_by_company(pool, today)
         if held:
-            print(f"send: {len(held)} held back so colleagues are not mailed "
+            print(f"{tag}: {len(held)} held back so colleagues are not mailed "
                   "the same day, or because their company has answered")
         if not pool:
-            print("send: every ready draft is waiting on a colleague's send")
+            print(f"{tag}: every ready draft is waiting on a colleague's send")
             return 0
 
-        budget = min(limit, remaining)
-        drafts = pool[:budget]
+        states = self._window_states(pool, ignore_window)
+        if settings.per_recipient_timezone and not ignore_window:
+            waiting = Counter(state.where for _row, state in states if not state.open)
+            if waiting:
+                summary = ", ".join(f"{n} in {z}" for z, n in sorted(waiting.items()))
+                print(f"{tag}: {sum(waiting.values())} waiting for their local "
+                      f"morning ({summary})")
+            if not any(state.open for _row, state in states):
+                print(f"{tag}: nobody is inside their local send window right now")
+                return 0
+
+        # The rest of the day, less what is owed to follow-ups, spread over
+        # the ticks left in each open window. See lanes.spread.
+        owed = self._followup_owed(today, cap, ignore_window)
+        allowance = max(0, remaining - owed)
+        if allowance == 0:
+            print(f"{tag}: the rest of today's cap is kept for {owed} follow-up(s)")
+            return 0
+        drafts = spread(states, min(limit, allowance))
+        if not drafts:
+            print(f"{tag}: nothing due this tick, {allowance} left for today")
+            return 0
 
         if settings.dry_run:
-            print(f"send: DRY RUN, {len(drafts)} message(s) would go out")
+            print(f"{tag}: DRY RUN, {len(drafts)} message(s) would go out")
             for draft in drafts:
                 print(f"{BAR}\nTo: {draft['email']}\nSubject: {draft['subject']}\n")
                 print(draft["body"])
@@ -779,16 +953,17 @@ class Pipeline:
         except smtplib.SMTPAuthenticationError:
             # The likeliest failure on a scheduled run, and worth naming
             # precisely rather than dumping a traceback into the log.
-            print("send: SMTP login rejected. Gmail needs an app password, not\n"
+            env = ".env" if self.lane == MAIN_LANE else f".env.{self.lane}"
+            print(f"{tag}: SMTP login rejected. Gmail needs an app password, not\n"
                   "      your account password. Enable 2FA, create one at\n"
                   "      https://myaccount.google.com/apppasswords and put it in\n"
-                  "      SMTP_PASS (and IMAP_PASS) in .env.")
+                  f"      SMTP_PASS (and IMAP_PASS) in {env}.")
             return 0
         except (smtplib.SMTPException, OSError) as exc:
-            print(f"send: could not reach {settings.smtp_host}: "
+            print(f"{tag}: could not reach {settings.smtp_host}: "
                   f"{type(exc).__name__}: {exc}")
             return 0
-        print(f"send: {sent} delivered, {already + sent}/{cap} today ({why_cap})")
+        print(f"{tag}: {sent} delivered, {already + sent}/{cap} today ({why_cap})")
         return sent
 
     def _deliver(self, backend, drafts: list, today: str) -> int:
@@ -842,8 +1017,14 @@ class Pipeline:
         A failure here is not fatal and must not fail the run, which has
         already delivered real mail. The copy stays recorded as mirrored and
         the next mirror sync drops it.
+
+        Main only: the copies live in the main account's Drafts, which
+        another lane cannot reach with its own login. When another lane sends
+        a mirrored draft, the main mirror sync that runs right after it in
+        the same tick (scripts/job.sh) clears the copy.
         """
-        if not mirrored or not self.settings.mirror_to_drafts:
+        if (not mirrored or not self.settings.mirror_to_drafts
+                or self.lane != MAIN_LANE):
             return
         try:
             with GmailDrafts(self.settings) as gmail:

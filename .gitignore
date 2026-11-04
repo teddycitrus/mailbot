@@ -1,4 +1,7 @@
 .env
+# Per-lane settings (.env.volume) carry a second account's app password.
+.env.*
+!.env.example
 *.db
 *.db-wal
 *.db-shm

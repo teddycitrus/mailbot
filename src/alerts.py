@@ -59,7 +59,7 @@ class HealthReport:
 
 def _body(report: HealthReport, settings: Settings, today: str) -> str:
     lines = [
-        f"Mailbot health check, {today}",
+        f"{_label(settings)} health check, {today}",
         "",
         f"{len(report.failures)} failing, {len(report.warnings)} warning, "
         f"{len(report.checks)} checked.",
@@ -83,8 +83,21 @@ def _body(report: HealthReport, settings: Settings, today: str) -> str:
     return "\n".join(lines)
 
 
+def _lane(settings) -> str:
+    return getattr(settings, "lane", "main") or "main"
+
+
+def _label(settings) -> str:
+    """"Mailbot" on main, "Mailbot [volume]" on another lane."""
+    lane = _lane(settings)
+    return "Mailbot" if lane == "main" else f"Mailbot [{lane}]"
+
+
 def _write_alert_file(settings: Settings, text: str) -> Path:
-    path = settings.db_path.parent / ALERT_FILE
+    # One file per lane, so a healthy second account's "all good" cannot
+    # overwrite the main account's alert before anyone has read it.
+    name = ALERT_FILE if _lane(settings) == "main" else f"logs/ALERT-{_lane(settings)}.txt"
+    path = settings.db_path.parent / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return path
@@ -100,10 +113,14 @@ def _already_alerted(db: Database, fingerprint: str, today: str) -> bool:
 
 
 def _email(settings: Settings, subject: str, body: str) -> tuple[bool, str]:
-    """Mail the operator. Failing here is expected when SMTP is the fault."""
+    """Mail the operator. Failing here is expected when SMTP is the fault.
+
+    To ALERT_TO when set: a second account's own inbox is one nobody reads.
+    """
+    to = getattr(settings, "alert_to", "") or settings.from_email
     try:
         message = build_message(
-            subject, body, settings.from_email, settings.from_name,
+            subject, body, to, settings.from_name,
             settings.from_email, settings.from_name,
         )
         with make_backend(settings) as backend:
@@ -126,7 +143,8 @@ def health_check(settings: Settings, notify: bool = True,
     if report.healthy:
         # Clear the file rather than leaving yesterday's panic sitting there
         # looking current.
-        _write_alert_file(settings, f"Mailbot health check, {today}: all good.\n")
+        _write_alert_file(settings, f"{_label(settings)} health check, {today}: "
+                                    "all good.\n")
         return report
 
     _write_alert_file(settings, body)
@@ -134,12 +152,15 @@ def health_check(settings: Settings, notify: bool = True,
         return report
 
     names = ", ".join(c.name for c in report.failures[:3])
-    subject = f"Mailbot BROKEN: {names}" + (
+    subject = f"{_label(settings)} BROKEN: {names}" + (
         f" and {len(report.failures) - 3} more" if len(report.failures) > 3 else "")
 
-    fingerprint = report.fingerprint()
+    # The lane is part of what is wrong: the same fault on both accounts is
+    # two alerts, not one already sent.
+    fingerprint = report.fingerprint() + ("" if _lane(settings) == "main"
+                                          else f"-{_lane(settings)}")
     try:
-        db = Database(settings.db_path)
+        db = Database(settings.db_path, _lane(settings))
     except Exception:
         db = None
     try:
@@ -178,7 +199,7 @@ class BounceReport:
 
 def _bounce_body(report: BounceReport, settings: Settings) -> str:
     lines = [
-        f"Mailbot: {report.pct:.0f}% of today's mail bounced",
+        f"{_label(settings)}: {report.pct:.0f}% of today's mail bounced",
         "",
         f"  date      {report.day}",
         f"  sent      {report.sent}",
@@ -229,7 +250,7 @@ def bounce_check(settings: Settings, db: Database, day: str = "",
     if not report.over or not notify:
         return report
 
-    subject = (f"Mailbot: {report.pct:.0f}% bounce rate today "
+    subject = (f"{_label(settings)}: {report.pct:.0f}% bounce rate today "
                f"({len(report.bounced)}/{report.sent})")
     body = _bounce_body(report, settings)
     report.emailed, report.email_error = _email(settings, subject, body)

@@ -13,12 +13,12 @@ random address first: if the domain accepts it, the domain is a catch-all and
 no address on it can be confirmed. Guessed addresses on catch-all domains are
 therefore never treated as verified.
 
-Step 3 needs outbound port 25, which the server's cloud provider blocks. So
-the probe can go through a relay instead: an SSH tunnel the laptop holds open
-to the server (scripts/probe_relay.ps1), which the server sees as a SOCKS5
-proxy on a loopback port. Whenever the laptop is on, probes leave from the
-laptop's own connection; whenever it is off, the relay refuses and probing
-pauses instead of recording failures as findings. SMTP_PROBE_RELAY turns it on.
+Step 3 needs outbound port 25. The server reaches it directly, so probes
+normally leave from there. Where a network blocks it, the probe can go
+through a relay instead: an SSH tunnel the laptop holds open to the server
+(scripts/probe_relay.ps1), which the server sees as a SOCKS5 proxy on a
+loopback port. When the relay is down it refuses, and probing pauses instead
+of recording failures as findings. SMTP_PROBE_RELAY turns it on.
 """
 
 from __future__ import annotations
@@ -36,8 +36,8 @@ except ImportError:  # pragma: no cover - dnspython is in requirements
     dns = None  # type: ignore
 
 from .models import (
-    CATCHALL, NO_MX, ROLE_LOCALS, SRC_SCRAPED, UNDELIVERABLE, UNVERIFIED,
-    VERIFIED, deliverable,
+    CATCHALL, MAIN_LANE, NO_MX, ROLE_LOCALS, SRC_SCRAPED, UNDELIVERABLE,
+    UNVERIFIED, VERIFIED, lane_deliverable,
 )
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
@@ -133,7 +133,22 @@ def is_personal_mailbox(email: str) -> bool:
     return not (is_role_account(email) or is_never_send(email))
 
 
-def sendable_address_class(email: str, verify_status: str, provenance: str) -> bool:
+# Top-level names reserved by RFC 2606 and 6761 that can never resolve on the
+# public internet. An MX pointing at one, like the ms55810524.msv1.invalid that
+# a half-configured Microsoft 365 domain publishes, is not a mail host.
+RESERVED_TLDS = frozenset({"invalid", "localhost", "test", "example", "local"})
+
+
+def usable_mx(host: str) -> str:
+    """The host if mail could ever be delivered to it, else ""."""
+    host = (host or "").strip().rstrip(".").lower()
+    if not host or "." not in host:
+        return ""
+    return "" if host.rsplit(".", 1)[1] in RESERVED_TLDS else host
+
+
+def sendable_address_class(email: str, verify_status: str, provenance: str,
+                           reserved_for: str = "", lane: str = MAIN_LANE) -> bool:
     """Whether the send gates would mail an address of this class today.
 
     The address-quality half of Database.can_send_to: a personal mailbox
@@ -141,8 +156,12 @@ def sendable_address_class(email: str, verify_status: str, provenance: str) -> b
     ramp's bounce discount and the scorecard's gate replay both call this,
     so neither can drift from what the send path actually enforces; a gate
     change here or in deliverable() reaches all three at once.
+
+    Seen from `lane`: the volume lane's guess tier is a class it sends, so
+    its bounces count against that lane and never against main.
     """
-    return is_personal_mailbox(email) and deliverable(verify_status, provenance)
+    return is_personal_mailbox(email) and lane_deliverable(
+        verify_status, provenance, reserved_for, lane)
 
 
 # Tokens that mark a mailbox as functional rather than personal, matched as
@@ -339,7 +358,7 @@ class Verifier:
         if self.db is not None:
             row = self.db.cached_domain(domain)
             if row is not None:
-                self._mx[domain] = row["mx_host"] or None
+                self._mx[domain] = usable_mx(row["mx_host"] or "") or None
                 self._catchall[domain] = bool(row["catchall"])
                 return self._mx[domain], True
         if dns is None:
@@ -349,7 +368,11 @@ class Verifier:
             ranked = sorted(
                 (r.preference, str(r.exchange).rstrip(".")) for r in answers
             )
-            host = ranked[0][1] if ranked else None
+            # A placeholder host is the domain saying it takes no mail, the
+            # same finding as no MX at all. Probing it fails to resolve, which
+            # read as "probing unavailable" and requeued the company forever.
+            hosts = [h for _, h in ranked if usable_mx(h)]
+            host = hosts[0] if hosts else None
         except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
             # The domain answered for itself: it does not exist, or it exists
             # and publishes no mail host. Both are findings.

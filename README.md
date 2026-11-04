@@ -139,8 +139,8 @@ catch-all domain, when how it was found is itself the evidence:
 
 This is a cold email tool, so the restraint is the point:
 
-- A hard daily cap, defaulting to a deliberately low number
-- Only SMTP-verified addresses, or catch-all ones from a trusted source (table above), are sent to, follow-ups included
+- A hard daily cap, defaulting to a deliberately low number, per sending account
+- The main account sends only SMTP-verified addresses, or catch-all ones from a trusted source (table above), follow-ups included. Unprovable catch-all guesses go only from the optional second account, behind its own bounce brake
 - An address is contacted at most once, enforced by a unique index and a send log
 - Up to three people per company (MAX_CONTACTS_PER_COMPANY), never two on the same day, and nobody else once one of them replies or opts out
 - Sends only during the recipient's own local morning, on weekdays
@@ -184,8 +184,10 @@ flowchart LR
     DB[("SQLite<br/><sub>companies, contacts, drafts, sends</sub>")]
     Q["queue<br/><sub>gates + personal line</sub>"]
     LLM(["Groq LLM"])
-    S["send<br/><sub>cap, window, deliverability gate</sub>"]
-    G(["Gmail SMTP and IMAP"])
+    S["send, main lane<br/><sub>cap, window, deliverability gate</sub>"]
+    SV["send, volume lane<br/><sub>own cap, ramp, guess brake</sub>"]
+    G(["Gmail, main account"])
+    GV(["Gmail, second account"])
     MX(["Recipient mail servers"])
 
     YC & GH & HN -->|"new companies"| DB
@@ -201,7 +203,15 @@ flowchart LR
     DB --> S
     S -->|"mail"| G
     G -->|"replies, bounces, opt-outs"| DB
+    DB -.->|"overflow once main is full,<br/>reserved guesses"| SV
+    SV -.->|"mail, Reply-To main"| GV
+    GV -.->|"its bounces"| DB
 ```
+
+The second account is optional (`.env.volume`). Both accounts read one
+database: nobody is mailed by both, and a reply, opt-out or bounce in either
+closes that person, and their company, for both. Each account keeps its own
+cap, warmup ramp and bounce brake, read only from its own sends.
 
 One company, from a portfolio page to a sent email:
 
@@ -248,10 +258,24 @@ Every send passes these checks, in order, in `Database.can_send_to`:
    bounce rate passes `CATCHALL_STRICT_BOUNCE_PCT` (3%), catch-alls narrow to
    the self-published two (`hn_post`, `founder_published`); past double it,
    no catch-all goes. Held drafts stay queued until the rate recovers.
+6. A contact reserved for a lane goes from that lane only. With
+   `VOLUME_GUESSES=true`, enrich keeps one first-name guess per founder on a
+   catch-all domain (provenance `guess`), reserved for the volume lane; the
+   main account never sends one. The volume lane holds them while its recent
+   bounce rate is over `GUESS_MAX_BOUNCE_PCT` (6%), or for the rest of the
+   day once two or more of today's have bounced over it.
 
-Then the daily cap, the per-company limit (three people, never two on one day)
-and the recipient's local send window apply. Follow-ups go through the same
-checks in `can_send_to_again`, with only the prior-send rule relaxed.
+Then the daily cap, the per-company limit (three people, never two on one day,
+across both accounts) and the recipient's local send window apply. Follow-ups
+go through the same checks in `can_send_to_again`, with only the prior-send
+rule relaxed, and always from the account that sent the first message.
+
+How much goes out on a tick: each zone whose window is open gets the share of
+the day's remaining cap its drafts make up of everything still reachable today,
+divided by the ticks left in that window and rounded up. A zone that opens
+later keeps its share; a closed one hands it on. `FOLLOWUP_SHARE_PCT` (33%) of
+the cap is kept for follow-ups while any are due, and the volume lane takes an
+open draft only after main has used its whole cap that day.
 
 Hard limits: 400 HTTP fetches per run by default, a per-run GitHub call cap,
 SMTP probing that gives up after repeated timeouts instead of pushing into a
@@ -343,7 +367,15 @@ python -m src.main doctor         # check everything the scheduled jobs rely on
 python -m src.main health         # same checks, but email you if any of them fail
 python -m src.main bounce-report  # email you if the day's bounce rate went over
 python -m src.main reverify       # re-probe contacts whose verdict was a failed probe
+python -m src.main import-apollo export.csv   # load an Apollo export (--dry-run first)
+python -m src.main reopen-catchall             # re-enrich parked catch-all companies
+python -m src.main --lane volume send          # act as the second account
 ```
+
+`--lane volume` reads `.env.volume` over `.env` and accepts only the sending
+side: `send`, `followup`, `inbox`, `health`, `doctor`, `bounce-report`,
+`stats` and `preview`. Finding, drafting and the Drafts mirror run once, on
+main, for both accounts.
 
 Sending stays off until you set `DRY_RUN=false`. Run `preview` first and read
 what it is about to send in your name.
@@ -373,6 +405,11 @@ are never committed or bundled.
 | `MAX_EMPLOYEES`, `MAX_COMPANY_AGE_YEARS` | `200`, `5` | Target filter |
 | `PREFER_RECENTLY_FUNDED` | `true` | Rank by recency of funding blended with ability to hire |
 | `FOLLOWUP_AFTER_DAYS` | `6` | Set `FOLLOWUP_ENABLED=false` to disable entirely |
+| `FOLLOWUP_SHARE_PCT` | `33` | Share of the daily cap kept for follow-ups while any are due |
+| `SEND_TICK_MINUTES` | `15` | How often the send timer fires; the cap is spread over the ticks left |
+| `ALERT_TO` | `FROM_EMAIL` | Where health and bounce alerts go |
+| `VOLUME_GUESSES` | `false` | Keep catch-all first-name guesses for the second account |
+| `GUESS_MAX_BOUNCE_PCT` | `6` | The second account's brake on those guesses |
 | `GROQ_API_KEY` | none | Optional. Writes one tailored sentence per email |
 | `GITHUB_TOKEN` | none | Optional. Raises the API limit from 60 to 5000 per hour |
 | `DRY_RUN` | `true` | Nothing is sent until this is false |
@@ -406,7 +443,7 @@ Registers seven Windows tasks:
 | `mailbot-health` | Every day 07:45 | Check everything, alert if anything is broken |
 | `mailbot-draft` | Every day, 06:00 to 23:00, every 2h | Render drafts, copy them to Gmail Drafts |
 | `mailbot-prep` | Weekdays 08:25 | Full mailbox scan before the window opens |
-| `mailbot-send` | Weekdays 08:30 to 13:30, every 15m | Send two messages per tick |
+| `mailbot-send` | Weekdays 08:30 to 13:30, every 15m | Send each window's share of the day's cap |
 | `mailbot-bounce` | Weekdays 13:45 | Judge the day's bounce rate, alert if over |
 | `mailbot-build` | Every day 19:30 | Discover and enrich new companies |
 | `mailbot-digest` | Fridays 17:00 | Email you a weekly summary |

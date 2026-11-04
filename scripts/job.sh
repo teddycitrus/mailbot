@@ -32,21 +32,37 @@ run() {
     return 0
 }
 
+# The second sending account, when one is set up: .env.volume beside .env.
+# It runs after main in every job that sends or reads mail, so main always
+# gets first pick of the shared queue.
+volume() {
+    if [ -f "$root/.env.volume" ]; then run --lane volume "$@"; fi
+}
+
 printf '=== %s run %s ===\n' "$job" "$(date '+%Y-%m-%d %H:%M:%S')" >> "$log"
 
 case "$job" in
     prep)
         # The slow full mailbox scan, once, before the window opens.
         run inbox
+        volume inbox
         ;;
     tick)
         # Bounces and opt-outs first: someone who says stop at 09:00 must not
         # be mailed by the 09:15 tick. Then mirror, which notices anything
-        # sent by hand, and only then send.
+        # sent by hand, and only then send. The limits are only a backstop:
+        # send and followup spread the day's cap over the ticks left in each
+        # recipient's window themselves.
         run inbox --days 1 --limit 40
+        volume inbox --days 1 --limit 40
         run mirror --limit 25 --days 2
-        run send --limit 2
-        run followup --limit 1
+        run send --limit 50
+        run followup --limit 50
+        volume send --limit 50
+        volume followup --limit 50
+        # The volume lane cannot reach main's Drafts, so a copy of a draft
+        # it just sent is cleared here, in the same tick, not 15 minutes on.
+        if [ -f "$root/.env.volume" ]; then run mirror --limit 25 --days 2; fi
         ;;
     draft)
         run queue --limit 25
@@ -56,24 +72,30 @@ case "$job" in
         run hn --limit 60 --months 3
         run discover --limit 60
         run gh --limit 60
-        run vc --limit 30
-        run enrich --limit 90
+        run vc --limit 45
+        # A few parked catch-all companies back in, for the volume lane's
+        # guesses. Does nothing unless VOLUME_GUESSES is on.
+        run reopen-catchall --limit 20
+        run enrich --limit 100
         run queue --limit 40
         run mirror --limit 60
         run stats
         ;;
     reprobe)
-        # Port 25 is blocked here, so probes go through the laptop's tunnel.
-        # Exits in a second when the laptop is off; when it is on, re-probes
-        # what the other jobs could not and enriches a few companies.
+        # Re-probes what the other jobs could not and enriches a few
+        # companies. Exits in a second when port 25 is unreachable (or, with
+        # SMTP_PROBE_RELAY set, when the relay is down).
         run reprobe --limit 25 --enrich 5
         ;;
     health)
         run health
+        volume health
         ;;
     bounce)
         run inbox --days 1 --limit 80
         run bounce-report
+        volume inbox --days 1 --limit 80
+        volume bounce-report
         ;;
     digest)
         run digest --days 7

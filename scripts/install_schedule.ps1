@@ -5,7 +5,7 @@
 #   mailbot-health  every day 07:45            check everything, alert if broken
 #   mailbot-draft   every day 06:00-23:00 /2h  render drafts, copy to Gmail
 #   mailbot-prep    weekday 08:25              full mailbox scan
-#   mailbot-send    weekday 08:30-13:30 /15m   send two messages per tick
+#   mailbot-send    weekday 08:30-13:30 /15m   send the day's cap, spread per tick
 #   mailbot-bounce  weekday 13:45             judge the day's bounce rate
 #   mailbot-build   every day 19:30            slow, discover + enrich
 #   mailbot-digest  Friday  17:00              weekly summary email
@@ -201,11 +201,12 @@ Install-MailbotTask -Name "mailbot-prep" -Script "scripts\daily_run.ps1" `
     -RestartCount 2 -RestartMinutes 5 `
     -Description "Mailbot: full mailbox scan before the send window"
 
-# One tick every 15 minutes from 08:30 to 13:30, each sending at most one
-# message. 08:30-10:30 covers Eastern recipients in their own morning and
-# 11:30-13:30 covers Pacific ones; the hour between belongs to nobody and its
-# ticks no-op. Spreading the cap this way means the day's sends arrive across
-# each recipient's 08:30-10:30 rather than all inside four minutes.
+# One tick every 15 minutes from 08:30 to 13:30. 08:30-10:30 covers Eastern
+# recipients in their own morning and 11:30-13:30 covers Pacific ones; the
+# hour between belongs to nobody and its ticks no-op. Each tick sends its
+# zone's share of the day's cap divided by the ticks left in that window, so
+# the day's sends arrive across each recipient's 08:30-10:30 rather than all
+# inside four minutes.
 Install-MailbotTask -Name "mailbot-send" -Script "scripts\daily_run.ps1" `
     -Arguments "-Mode tick" -At "8:30am" -CatchUpOnWake `
     -RepeatEveryMinutes 15 -RepeatForHours 5 -TimeLimitMinutes 10 `

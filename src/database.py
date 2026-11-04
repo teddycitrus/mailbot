@@ -14,9 +14,9 @@ from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 from .models import (
-    BOUNCED, CATCHALL, Company, Contact, ENRICHED, NO_CONTACTS, PENDING,
-    QUEUED, REPLIED, SENT, SKIP_MX_UNRESOLVED, SKIP_PROBE_UNAVAILABLE,
-    SUPPRESSED, VERIFIED, deliverable,
+    BOUNCED, CATCHALL, Company, Contact, ENRICHED, MAIN_LANE, NO_CONTACTS,
+    PENDING, QUEUED, REPLIED, SENT, SKIP_CATCHALL_UNPROVABLE, SKIP_MX_UNRESOLVED,
+    SKIP_PROBE_UNAVAILABLE, SUPPRESSED, VERIFIED, lane_deliverable,
 )
 from .verifier import is_personal_mailbox, sendable_address_class
 
@@ -71,7 +71,10 @@ CREATE TABLE IF NOT EXISTS contacts (
     created_at    TEXT NOT NULL,
     -- How the address was found; decides whether a catch-all one may be
     -- sent to. See models.TRUSTED_PROVENANCE.
-    provenance    TEXT DEFAULT ''
+    provenance    TEXT DEFAULT '',
+    -- The only sending lane allowed to mail this person, '' for any. See
+    -- models.lane_deliverable.
+    lane          TEXT DEFAULT ''
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_email ON contacts(email);
 CREATE INDEX IF NOT EXISTS idx_contacts_status ON contacts(status);
@@ -102,7 +105,9 @@ CREATE TABLE IF NOT EXISTS sends (
     status      TEXT DEFAULT 'sent',
     error       TEXT DEFAULT '',
     sent_at     TEXT NOT NULL,
-    local_date  TEXT NOT NULL
+    local_date  TEXT NOT NULL,
+    -- The sending account it left from.
+    lane        TEXT DEFAULT 'main'
 );
 CREATE INDEX IF NOT EXISTS idx_sends_email ON sends(email);
 CREATE INDEX IF NOT EXISTS idx_sends_date ON sends(local_date);
@@ -135,6 +140,15 @@ CREATE TABLE IF NOT EXISTS company_snapshots (
     PRIMARY KEY (domain, seen_on)
 );
 
+-- Each lane's cap for a day, as its send path computed it. The volume lane
+-- reads main's to know when main is full and the open queue is overflow.
+CREATE TABLE IF NOT EXISTS daily_caps (
+    lane       TEXT NOT NULL,
+    local_date TEXT NOT NULL,
+    cap        INTEGER NOT NULL,
+    PRIMARY KEY (lane, local_date)
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id         INTEGER PRIMARY KEY,
     kind       TEXT NOT NULL,
@@ -149,10 +163,17 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _undeliverable_reason(row) -> str:
+def _undeliverable_reason(row, lane: str = MAIN_LANE) -> str:
+    reserved = row["lane"] if "lane" in row.keys() else ""
+    if reserved and reserved != lane:
+        return f"reserved for the {reserved} lane"
     if row["verify_status"] == CATCHALL:
         return f"catch-all, untrusted source ({row['provenance'] or 'unknown'})"
     return f"not SMTP-verified ({row['verify_status']})"
+
+
+def _reserved(row) -> str:
+    return (row["lane"] if "lane" in row.keys() else "") or ""
 
 
 class Database:
@@ -163,8 +184,13 @@ class Database:
     # run could die on a lock held by a sibling doing IMAP work.
     BUSY_TIMEOUT_SECONDS = 30
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, lane: str = MAIN_LANE):
         self.path = Path(path)
+        # The sending account this connection acts for. Sends are recorded
+        # under it, and the per-day accounting the ramp and the bounce brake
+        # read (counts, active days, bounce rate) only sees its own sends.
+        # Every gate on who may be mailed stays global.
+        self.lane = lane or MAIN_LANE
         self.conn = sqlite3.connect(self.path, timeout=self.BUSY_TIMEOUT_SECONDS)
         self.conn.execute(
             f"PRAGMA busy_timeout = {self.BUSY_TIMEOUT_SECONDS * 1000}")
@@ -205,12 +231,19 @@ class Database:
             ("companies", "priority", "INTEGER DEFAULT 0"),
             ("drafts", "gmail_message_id", "TEXT DEFAULT ''"),
             ("contacts", "provenance", "TEXT DEFAULT ''"),
+            # Which sending account a message left from. Every send before
+            # lanes existed was the main account's, which the default says.
+            ("sends", "lane", f"TEXT DEFAULT '{MAIN_LANE}'"),
+            # The only lane allowed to mail this contact, "" for any.
+            ("contacts", "lane", "TEXT DEFAULT ''"),
         ):
             have = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
             if column not in have:
                 self.conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"
                 )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sends_lane_date ON sends(lane, local_date)")
         self.conn.commit()
 
     def upsert_company(self, c: Company) -> int:
@@ -309,11 +342,11 @@ class Database:
             """INSERT INTO contacts
                (company_id, email, first_name, last_name, role, bio, linkedin,
                 confidence, source, verify_status, verify_detail, status, created_at,
-                provenance)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                provenance, lane)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (c.company_id, email, c.first_name, c.last_name, c.role, c.bio,
              c.linkedin, c.confidence, c.source, c.verify_status, c.verify_detail,
-             c.status, _now(), c.provenance),
+             c.status, _now(), c.provenance, getattr(c, "lane", "") or ""),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -402,19 +435,26 @@ class Database:
 
     # ---------- the duplicate-send gate ----------
 
-    def can_send_to(self, email: str) -> tuple[bool, str]:
-        """Single source of truth for whether an address may receive mail."""
+    def can_send_to(self, email: str, lane: str = "") -> tuple[bool, str]:
+        """Single source of truth for whether an address may receive mail.
+
+        Judged for this connection's lane, or for `lane` when given: drafting
+        runs on main but renders the volume lane's reserved contacts too, and
+        has to ask whether that lane could send them.
+        """
+        lane = lane or self.lane
         email = email.lower().strip()
         if not is_personal_mailbox(email):
             return False, "shared or blocked inbox"
         if self.is_suppressed(email):
             return False, "suppressed"
         row = self.conn.execute(
-            "SELECT status, verify_status, provenance FROM contacts WHERE email = ?",
+            "SELECT status, verify_status, provenance, lane FROM contacts WHERE email = ?",
             (email,)
         ).fetchone()
         if row and row["status"] in {SENT, REPLIED, BOUNCED, SUPPRESSED}:
             return False, f"already {row['status']}"
+        # Any lane's send counts: a person is written to once, by one account.
         prior = self.conn.execute(
             "SELECT 1 FROM sends WHERE email = ? AND status IN ('sent', 'sending')",
             (email,)
@@ -424,9 +464,11 @@ class Database:
         # A stored contact is mailed only once its own mailbox accepted an SMTP
         # RCPT, or, on a catch-all domain, when it came from a trusted source.
         # An address with no row yet is being vetted by enrich, which applies
-        # the same rule before storing it (see models.deliverable).
-        if row and not deliverable(row["verify_status"], row["provenance"]):
-            return False, _undeliverable_reason(row)
+        # the same rule before storing it (see models.deliverable). The volume
+        # lane adds only its own reserved guess tier to that.
+        if row and not lane_deliverable(row["verify_status"], row["provenance"],
+                                        _reserved(row), lane):
+            return False, _undeliverable_reason(row, lane)
         return True, ""
 
     def can_send_to_again(self, email: str) -> tuple[bool, str]:
@@ -442,7 +484,7 @@ class Database:
         if self.is_suppressed(email):
             return False, "suppressed"
         row = self.conn.execute(
-            "SELECT status, verify_status, provenance FROM contacts WHERE email = ?",
+            "SELECT status, verify_status, provenance, lane FROM contacts WHERE email = ?",
             (email,)
         ).fetchone()
         if row is None:
@@ -451,9 +493,21 @@ class Database:
             return False, f"already {row['status']}"
         if row["status"] != SENT:
             return False, f"status is {row['status']}, not sent"
-        if not deliverable(row["verify_status"], row["provenance"]):
-            return False, _undeliverable_reason(row)
+        if not lane_deliverable(row["verify_status"], row["provenance"],
+                                _reserved(row), self.lane):
+            return False, _undeliverable_reason(row, self.lane)
+        # The bump goes from the account the first message came from, so it
+        # threads under it and reads as the same person writing again.
+        first = self.first_send_lane(email)
+        if first and first != self.lane:
+            return False, f"first mailed from the {first} lane"
         return True, ""
+
+    def first_send_lane(self, email: str) -> str:
+        row = self.conn.execute(
+            "SELECT lane FROM sends WHERE email = ? AND status IN ('sent', 'sending') "
+            "ORDER BY id LIMIT 1", (email.lower().strip(),)).fetchone()
+        return (row["lane"] or MAIN_LANE) if row else ""
 
     def is_suppressed(self, email: str) -> bool:
         return self.conn.execute(
@@ -489,36 +543,55 @@ class Database:
         return int(cur.lastrowid)
 
     def queued_drafts(self, limit: int | None = 100) -> list[sqlite3.Row]:
+        """Drafts this lane may send: open ones, and any reserved for it.
+
+        A draft reserved for another lane is left out here rather than
+        refused at send time, where a refusal marks it skipped for good.
+        """
         return self.conn.execute(
             """SELECT d.*, c.email, c.first_name, c.last_name, c.role, c.company_id,
-                      c.verify_status, c.provenance,
+                      c.verify_status, c.provenance, c.lane AS contact_lane,
                       co.name AS company_name, co.location AS company_location
                FROM drafts d
                JOIN contacts c ON c.id = d.contact_id
                LEFT JOIN companies co ON co.id = c.company_id
                WHERE d.status = 'queued' AND c.status = ?
+                 AND COALESCE(c.lane, '') IN ('', ?)
                ORDER BY """ + NAMED_FIRST + """,
                         COALESCE(co.priority, 0) DESC, c.confidence DESC, d.id
                LIMIT ?""",
-            (QUEUED, -1 if limit is None else limit),
+            (QUEUED, self.lane, -1 if limit is None else limit),
         ).fetchall()
 
     def mark_draft(self, draft_id: int, status: str) -> None:
         self.conn.execute("UPDATE drafts SET status = ? WHERE id = ?", (status, draft_id))
         self.conn.commit()
 
-    def queued_draft_count(self) -> int:
-        """How deep the queue is, for the top-up target in queue()."""
+    def queued_draft_count(self, reserved: bool | None = None) -> int:
+        """How deep the queue is, for the top-up target in queue().
+
+        `reserved` counts only drafts held for one lane (True) or only open
+        ones (False), so guesses waiting for the volume lane never fill the
+        target that keeps the main queue topped up. None counts both.
+        """
+        clause = ("" if reserved is None
+                  else " AND COALESCE(c.lane, '') <> ''" if reserved
+                  else " AND COALESCE(c.lane, '') = ''")
         return int(self.conn.execute(
             """SELECT COUNT(*) FROM drafts d JOIN contacts c ON c.id = d.contact_id
-               WHERE d.status = 'queued' AND c.status = ?""",
+               WHERE d.status = 'queued' AND c.status = ?""" + clause,
             (QUEUED,),
         ).fetchone()[0])
 
     # ---------- Gmail Drafts mirror ----------
 
     def drafts_to_mirror(self, limit: int = 50) -> list[sqlite3.Row]:
-        """Queued drafts that have no copy in the Gmail Drafts folder yet."""
+        """Queued drafts that have no copy in the Gmail Drafts folder yet.
+
+        Only ones any lane may send. A draft reserved for the volume lane is
+        one the main account must never send, so a copy in its Drafts, one
+        tap from going out by hand, is exactly what has to be avoided.
+        """
         return self.conn.execute(
             """SELECT d.*, c.email, c.first_name, c.last_name, c.role, c.company_id,
                       co.name AS company_name, co.location AS company_location
@@ -526,6 +599,7 @@ class Database:
                JOIN contacts c ON c.id = d.contact_id
                LEFT JOIN companies co ON co.id = c.company_id
                WHERE d.status = 'queued' AND c.status = ?
+                 AND COALESCE(c.lane, '') = ''
                  AND COALESCE(d.gmail_message_id, '') = ''
                ORDER BY """ + NAMED_FIRST + """,
                         COALESCE(co.priority, 0) DESC, c.confidence DESC, d.id
@@ -572,7 +646,7 @@ class Database:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=after_days)).isoformat()
         return self.conn.execute(
             """SELECT c.id, c.email, c.first_name, c.last_name, c.role,
-                      c.verify_status, c.provenance,
+                      c.verify_status, c.provenance, c.lane AS contact_lane,
                       co.name AS company_name, co.location AS company_location,
                       co.one_liner, co.description,
                       COUNT(s.id) AS send_count,
@@ -597,10 +671,16 @@ class Database:
                      LEFT JOIN suppression os ON os.email = o.email
                      WHERE o.company_id = c.company_id AND o.id <> c.id
                        AND (o.status = ? OR os.reason = 'opt-out reply'))
+                 -- Bumped by the account that wrote first, so it threads.
+                 AND COALESCE((SELECT s5.lane FROM sends s5
+                                WHERE s5.contact_id = c.id
+                                  AND s5.status IN ('sent', 'sending')
+                                ORDER BY s5.id LIMIT 1), ?) = ?
                GROUP BY c.id
                HAVING COUNT(s.id) < ? AND MAX(s.sent_at) <= ?
                ORDER BY MAX(s.sent_at) LIMIT ?""",
-            (SENT, REPLIED, max_total_sends, cutoff, -1 if limit is None else limit),
+            (SENT, REPLIED, MAIN_LANE, self.lane, max_total_sends, cutoff,
+             -1 if limit is None else limit),
         ).fetchall()
 
     # ---------- sends ----------
@@ -611,10 +691,10 @@ class Database:
         self.conn.execute(
             """INSERT INTO sends
                (contact_id, email, subject, message_id, backend, status, error,
-                sent_at, local_date)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                sent_at, local_date, lane)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (contact_id, email.lower(), subject, message_id, backend, status,
-             error, _now(), local_date),
+             error, _now(), local_date, self.lane),
         )
         if status == "sent":
             self.conn.execute(
@@ -634,9 +714,9 @@ class Database:
         cur = self.conn.execute(
             """INSERT INTO sends
                (contact_id, email, subject, message_id, backend, status, error,
-                sent_at, local_date)
-               VALUES (?,?,?,'','','sending','',?,?)""",
-            (contact_id, email.lower(), subject, _now(), local_date),
+                sent_at, local_date, lane)
+               VALUES (?,?,?,'','','sending','',?,?,?)""",
+            (contact_id, email.lower(), subject, _now(), local_date, self.lane),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -654,10 +734,46 @@ class Database:
         self.conn.commit()
 
     def sent_count_on(self, local_date: str) -> int:
+        """Messages this lane has put on the wire on a day, attempts included."""
         row = self.conn.execute(
             "SELECT COUNT(*) AS n FROM sends WHERE local_date = ? "
-            "AND status IN ('sent', 'sending')",
-            (local_date,),
+            "AND status IN ('sent', 'sending') AND lane = ?",
+            (local_date, self.lane),
+        ).fetchone()
+        return int(row["n"])
+
+    def record_cap(self, local_date: str, cap: int) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO daily_caps (lane, local_date, cap) VALUES (?,?,?)",
+            (self.lane, local_date, int(cap)))
+        self.conn.commit()
+
+    def lane_at_cap(self, lane: str, local_date: str) -> tuple[bool, str]:
+        """Whether another lane has used its whole cap today, and its tally.
+
+        A lane that has not run today has no cap on record and counts as
+        not full: the open queue is its to send first.
+        """
+        row = self.conn.execute(
+            "SELECT cap FROM daily_caps WHERE lane = ? AND local_date = ?",
+            (lane, local_date)).fetchone()
+        if row is None:
+            return False, f"{lane} has not run today"
+        sent = int(self.conn.execute(
+            "SELECT COUNT(*) FROM sends WHERE lane = ? AND local_date = ? "
+            "AND status IN ('sent', 'sending')", (lane, local_date)).fetchone()[0])
+        return sent >= int(row["cap"]), f"{lane} at {sent}/{row['cap']}"
+
+    def followup_count_on(self, local_date: str) -> int:
+        """Of those, how many were bumps: a send to someone already written to."""
+        row = self.conn.execute(
+            """SELECT COUNT(*) AS n FROM sends s
+               WHERE s.local_date = ? AND s.status IN ('sent', 'sending')
+                 AND s.lane = ?
+                 AND EXISTS (SELECT 1 FROM sends p
+                             WHERE p.contact_id = s.contact_id AND p.id < s.id
+                               AND p.status IN ('sent', 'sending'))""",
+            (local_date, self.lane),
         ).fetchone()
         return int(row["n"])
 
@@ -670,8 +786,8 @@ class Database:
         """
         row = self.conn.execute(
             """SELECT COUNT(DISTINCT local_date) AS n FROM sends
-               WHERE status = 'sent' AND local_date < ?""",
-            (before_local_date,),
+               WHERE status = 'sent' AND local_date < ? AND lane = ?""",
+            (before_local_date, self.lane),
         ).fetchone()
         return int(row["n"])
 
@@ -698,14 +814,18 @@ class Database:
         figure holds still for the whole of that day. Counting today's sends
         let each clean delivery dilute the rate under the limit and lift the
         hold mid-morning: one day went 18 out against a cap of 8.
+
+        Per lane: each account's reputation is its own, so each brake reads
+        only the sends that account made, judged by what that lane may send.
         """
         rows = self.conn.execute(
-            """SELECT c.email, c.status, c.verify_status, c.provenance
+            """SELECT c.email, c.status, c.verify_status, c.provenance, c.lane
                FROM (SELECT contact_id FROM sends
-                     WHERE status = 'sent' AND (? = '' OR local_date < ?)
+                     WHERE status = 'sent' AND lane = ?
+                       AND (? = '' OR local_date < ?)
                      ORDER BY id DESC LIMIT ?) s
                JOIN contacts c ON c.id = s.contact_id""",
-            (before_local_date, before_local_date, max(1, window)),
+            (self.lane, before_local_date, before_local_date, max(1, window)),
         ).fetchall()
         if not rows:
             return 0.0
@@ -713,7 +833,8 @@ class Database:
             1 for r in rows
             if r["status"] == BOUNCED
             and sendable_address_class(
-                r["email"], r["verify_status"], r["provenance"])
+                r["email"], r["verify_status"], r["provenance"],
+                r["lane"] or "", self.lane)
         )
         return 100.0 * recurrable / len(rows)
 
@@ -727,10 +848,10 @@ class Database:
         row = self.conn.execute(
             """SELECT MAX(n) FROM (
                  SELECT COUNT(*) AS n FROM sends
-                 WHERE status = 'sent' AND (? = '' OR local_date < ?)
+                 WHERE status = 'sent' AND lane = ? AND (? = '' OR local_date < ?)
                  GROUP BY local_date
                  ORDER BY local_date DESC LIMIT ?)""",
-            (before_local_date, before_local_date, max(1, days)),
+            (self.lane, before_local_date, before_local_date, max(1, days)),
         ).fetchone()
         return int(row[0] or 0)
 
@@ -744,29 +865,32 @@ class Database:
         complete; one that arrives later simply lands in the next day's count.
         """
         total = int(self.conn.execute(
-            "SELECT COUNT(*) FROM sends WHERE local_date = ? AND status = 'sent'",
-            (local_date,),
+            "SELECT COUNT(*) FROM sends WHERE local_date = ? AND status = 'sent' "
+            "AND lane = ?",
+            (local_date, self.lane),
         ).fetchone()[0])
         rows = self.conn.execute(
             """SELECT DISTINCT s.email, c.confidence, c.verify_status,
-                      c.verify_detail, co.name AS company_name
+                      c.verify_detail, c.provenance, co.name AS company_name
                FROM sends s
                JOIN contacts c ON c.id = s.contact_id
                LEFT JOIN companies co ON co.id = c.company_id
                WHERE s.local_date = ? AND s.status = 'sent' AND c.status = ?
+                 AND s.lane = ?
                ORDER BY s.id""",
-            (local_date, BOUNCED),
+            (local_date, BOUNCED, self.lane),
         ).fetchall()
         return total, rows
 
     def sends_on(self, local_date: str) -> list[sqlite3.Row]:
+        """This lane's sends on a day."""
         return self.conn.execute(
             """SELECT s.*, co.name AS company_name, c.first_name, c.role
                FROM sends s
                JOIN contacts c ON c.id = s.contact_id
                LEFT JOIN companies co ON co.id = c.company_id
-               WHERE s.local_date = ? ORDER BY s.id""",
-            (local_date,),
+               WHERE s.local_date = ? AND s.lane = ? ORDER BY s.id""",
+            (local_date, self.lane),
         ).fetchall()
 
     def find_contact_by_email(self, email: str) -> Optional[sqlite3.Row]:
@@ -875,7 +999,7 @@ class Database:
     # lookup that never came back, so it belongs here.
     RETRYABLE_SKIPS = (
         "no candidate address accepted",
-        "catch-all domain, guesses unprovable",
+        SKIP_CATCHALL_UNPROVABLE,
         SKIP_MX_UNRESOLVED,
         SKIP_PROBE_UNAVAILABLE,
     )

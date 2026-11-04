@@ -257,13 +257,48 @@ def greeting_name(company: str) -> str:
 def local_window_open(location: str, default_tz: str, start: dtime, end: dtime,
                       now_utc: Optional[datetime] = None) -> tuple[bool, str]:
     """Is it currently inside the send window where the recipient sits?"""
+    state = window_state(location, default_tz, start, end, now_utc=now_utc)
+    return state.open, state.where
+
+
+@dataclass(frozen=True)
+class WindowState:
+    """Where one recipient's send window stands right now.
+
+    `phase` is "open", "later" (opens later today), "closed" (over for
+    today) or "weekend". `ticks_left` counts the send ticks still to come
+    in an open window, this one included, which is what lets a day's
+    allowance be spread evenly over the morning instead of spent at once.
+    """
+    phase: str
+    zone: str
+    where: str
+    ticks_left: int = 0
+
+    @property
+    def open(self) -> bool:
+        return self.phase == "open"
+
+    @property
+    def today(self) -> bool:
+        """Open now, or will be before the day is out."""
+        return self.phase in {"open", "later"}
+
+
+def window_state(location: str, default_tz: str, start: dtime, end: dtime,
+                 tick_minutes: int = 15,
+                 now_utc: Optional[datetime] = None) -> WindowState:
     zone = recipient_timezone(location, default_tz)
     moment = (now_utc or datetime.now(timezone.utc)).astimezone(ZoneInfo(zone))
     if moment.weekday() >= 5:
-        return False, f"weekend in {zone}"
-    if start <= _minute(moment) <= end:
-        return True, zone
-    return False, f"{moment:%H:%M} {zone}"
+        return WindowState("weekend", zone, f"weekend in {zone}")
+    clock = _minute(moment)
+    if clock < start:
+        return WindowState("later", zone, f"{moment:%H:%M} {zone}")
+    if clock > end:
+        return WindowState("closed", zone, f"{moment:%H:%M} {zone}")
+    minutes_left = (end.hour * 60 + end.minute) - (clock.hour * 60 + clock.minute)
+    return WindowState("open", zone, zone, minutes_left // max(1, tick_minutes) + 1)
 
 
 def pace_delay(base_seconds: int) -> float:

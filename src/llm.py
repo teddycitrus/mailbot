@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import zlib
+from collections import Counter
 
 import requests
 
@@ -339,6 +340,9 @@ class Personalizer:
         self.limiter = RateLimiter(per_minute)
         self.timeout = timeout
         self.last_error = ""
+        # Failed calls this run, by short reason. Reported by queue(), since
+        # a failure costs only the personal line and is otherwise silent.
+        self.failures: Counter = Counter()
 
     @property
     def enabled(self) -> bool:
@@ -411,10 +415,12 @@ class Personalizer:
             )
             if resp.status_code != 200:
                 self.last_error = f"HTTP {resp.status_code}: {resp.text[:120]}"
+                self.failures[f"HTTP {resp.status_code}"] += 1
                 return ""
             text = resp.json()["choices"][0]["message"]["content"]
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
+            self.failures[type(exc).__name__] += 1
             return ""
         text = to_ascii(text).strip().strip('"').replace("\n", " ")
         return re.sub(r"\s+", " ", text)

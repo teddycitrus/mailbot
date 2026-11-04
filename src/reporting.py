@@ -34,8 +34,10 @@ def build_digest(db, settings, days: int = 7, send_it: bool = True) -> str:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     con = db.conn
 
+    # Every lane: the digest is the one report that covers both accounts.
     sent = con.execute(
-        """SELECT s.email, s.sent_at, co.name AS company
+        """SELECT s.email, s.sent_at, COALESCE(s.lane, 'main') AS lane,
+                  co.name AS company
            FROM sends s
            LEFT JOIN contacts c ON c.id = s.contact_id
            LEFT JOIN companies co ON co.id = c.company_id
@@ -60,11 +62,16 @@ def build_digest(db, settings, days: int = 7, send_it: bool = True) -> str:
 
     rate = (len(replies) / len(sent) * 100) if sent else 0.0
     bounce_rate = (len(bounces) / len(sent) * 100) if sent else 0.0
+    by_lane: dict[str, int] = {}
+    for r in sent:
+        by_lane[r["lane"]] = by_lane.get(r["lane"], 0) + 1
+    split = (" (" + ", ".join(f"{n} {lane}" for lane, n in sorted(by_lane.items()))
+             + ")") if len(by_lane) > 1 else ""
 
     lines = [
         f"Mailbot digest, last {days} days",
         "",
-        f"  sent          {len(sent)}",
+        f"  sent          {len(sent)}{split}",
         f"  replies       {len(replies)}  ({rate:.0f}% of sent)",
         f"  bounces       {len(bounces)}  ({bounce_rate:.0f}% of sent)",
         f"  opt-outs      {len(opt_outs)}",
@@ -84,6 +91,7 @@ def build_digest(db, settings, days: int = 7, send_it: bool = True) -> str:
     if sent:
         lines += ["", "Sent to:"] + [
             f"  {r['sent_at'][:10]}  {r['email']}  ({r['company'] or '?'})"
+            + (f"  [{r['lane']}]" if r["lane"] != "main" else "")
             for r in sent
         ]
     if bounce_rate > 5:

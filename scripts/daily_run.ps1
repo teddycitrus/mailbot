@@ -102,17 +102,17 @@ else {
     # cadence and keeps the fetch small.
     Write-Mailbot mirror --limit 25 --days 2
 
-    # Two messages per tick. The tick count, not the cap, used to be what ended
-    # the day: ticks run 08:30-13:30, but a recipient is only eligible during
-    # the 08:30-10:30 window in their own zone, so each city gets about nine
-    # usable ticks. At one send per tick that ceiling is roughly 18 a day, which
-    # silently caps DAILY_SEND_LIMIT below whatever it is set to. Two per tick
-    # puts the cap back in charge. SEND_DELAY_SECONDS still paces them apart.
-    Write-Mailbot send --limit 2
+    # A fixed number per tick used to be what ended the day: a recipient is
+    # only eligible during the 08:30-10:30 window in their own zone, so each
+    # city gets about nine usable ticks, and two a tick capped a city near 18
+    # whatever DAILY_SEND_LIMIT said. send now spreads the day's cap over the
+    # ticks left in each window itself, so the limit here is only a backstop.
+    # SEND_DELAY_SECONDS still paces them apart.
+    Write-Mailbot send --limit 50
 
-    # One nudge to anyone who never answered. Shares the daily cap with the
-    # sends above, so the two together can never exceed DAILY_SEND_LIMIT.
-    Write-Mailbot followup --limit 1
+    # Nudges to anyone who never answered, from their FOLLOWUP_SHARE_PCT of
+    # the same daily cap, so the two together never exceed it.
+    Write-Mailbot followup --limit 50
 }
 
 Write-Log "=== finished $(Get-Date -Format 'HH:mm:ss') exit=$script:worst ==="

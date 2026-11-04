@@ -34,8 +34,11 @@ Write-Mailbot hn --limit 60 --months 3
 # portfolio pages add US and Canadian fund-backed companies.
 Write-Mailbot discover --limit 60
 Write-Mailbot gh       --limit 60
-Write-Mailbot vc       --limit 30
-Write-Mailbot enrich   --limit 90
+Write-Mailbot vc       --limit 45
+# Parked catch-all companies back in for the volume lane's guesses; a no-op
+# unless VOLUME_GUESSES is on.
+Write-Mailbot reopen-catchall --limit 20
+Write-Mailbot enrich   --limit 100
 # Draft immediately, while the contacts this run just found are fresh, rather
 # than leaving it to the morning. By the time anyone is awake the queue is
 # already deep and already copied to Gmail Drafts, so the morning has nothing

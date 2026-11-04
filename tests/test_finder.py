@@ -423,3 +423,30 @@ def test_published_addresses_are_tagged_by_how_they_were_found(tmp_path, monkeyp
     assert tags == {"ann@acme.ai": "founder_published", "zed@acme.ai": "site_unattributed"}
     # The trusted one sorts first, so it gets the per-company cap.
     assert result.contacts[0].email == "ann@acme.ai"
+
+
+# ----------------------------------------- guesses for the volume lane only
+
+def test_a_catchall_domain_yields_a_reserved_guess_when_asked(tmp_path, monkeypatch):
+    from src import finder
+    from src.models import CATCHALL, PROV_GUESS, VOLUME_LANE
+
+    db, company = _team_company(tmp_path, monkeypatch, [("Ann", "Lee", "CEO")])
+    settings = SimpleNamespace(target_roles=("ceo",), max_contacts_per_company=3,
+                               volume_guesses=True)
+    result = finder.enrich_company(company, _FetchAnything(), _CatchAll(db), settings)
+    assert [(c.email, c.verify_status, c.provenance, c.lane) for c in result.contacts] == [
+        ("ann@acme.ai", CATCHALL, PROV_GUESS, VOLUME_LANE)]
+    assert result.contacts[0].confidence < 70
+    db.close()
+
+
+def test_without_volume_guesses_a_catchall_domain_stays_parked(tmp_path, monkeypatch):
+    from src import finder
+    from src.models import SKIP_CATCHALL_UNPROVABLE
+
+    db, company = _team_company(tmp_path, monkeypatch, [("Ann", "Lee", "CEO")])
+    settings = SimpleNamespace(target_roles=("ceo",), max_contacts_per_company=3)
+    result = finder.enrich_company(company, _FetchAnything(), _CatchAll(db), settings)
+    assert result.contacts == [] and result.note == SKIP_CATCHALL_UNPROVABLE
+    db.close()

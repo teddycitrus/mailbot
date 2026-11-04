@@ -19,10 +19,10 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 from .models import (
-    CATCHALL, Company, Contact, PENDING, SKIP_MX_UNRESOLVED, SKIP_NO_MX,
-    PROV_FOUNDER_PUBLISHED, PROV_GIT_COMMIT, PROV_GUESS, PROV_HOUSE_PATTERN,
-    PROV_SITE, SKIP_PROBE_UNAVAILABLE, SRC_INFERRED, SRC_SCRAPED, UNVERIFIED,
-    deliverable,
+    CATCHALL, Company, Contact, PENDING, SKIP_CATCHALL_UNPROVABLE,
+    SKIP_MX_UNRESOLVED, SKIP_NO_MX, PROV_FOUNDER_PUBLISHED, PROV_GIT_COMMIT,
+    PROV_GUESS, PROV_HOUSE_PATTERN, PROV_SITE, SKIP_PROBE_UNAVAILABLE,
+    SRC_INFERRED, SRC_SCRAPED, UNVERIFIED, VOLUME_LANE, deliverable,
 )
 from . import patterns
 from .github_source import find_org_for
@@ -31,6 +31,12 @@ from .scraper import Fetcher, Person, parse_yc_founders, scrape_site
 from .verifier import Verifier, is_never_send, is_role_account
 
 YC_TAG_URL = "https://yc-oss.github.io/api/tags/{tag}.json"
+
+# A first-name guess on a catch-all domain proves nothing, so it ranks under
+# every sendable address the company has. Below MIN_CONFIDENCE on purpose:
+# the main lane never sends it, and the volume lane judges it by its own
+# bounce brake instead (see lanes.guess_hold).
+GUESS_CONFIDENCE = 40
 
 # Tags on the YC feed that mean "this is an ML/AI company".
 AI_TAGS = (
@@ -408,6 +414,37 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
                 confidence=75, status=PENDING, provenance=PROV_HOUSE_PATTERN,
             ))
 
+    # 4c. Still short on a catch-all domain: the single most likely address
+    # per remaining founder, by this domain's convention if one is known and
+    # the corpus-wide ordering otherwise. Unprovable, so reserved for the
+    # volume lane and never sent by the main account.
+    if (getattr(settings, "volume_guesses", False) and not full() and targeted
+            and verifier.is_catchall(domain)):
+        taken = {c.email for c in contacts}
+        for person in targeted:
+            if full():
+                break
+            if covered(person) or not person.first_name:
+                continue
+            guess = next(
+                (c for c in patterns.ordered_candidates(
+                    verifier.db, person.first_name, person.last_name, domain)
+                 if c not in taken and not is_never_send(c)
+                 and not is_role_account(c)), "")
+            if not guess:
+                continue
+            taken.add(guess)
+            contacts.append(Contact(
+                email=guess, company_id=company_id,
+                first_name=person.first_name, last_name=person.last_name,
+                role=person.role, bio=person.bio, linkedin=person.linkedin,
+                source=SRC_INFERRED, verify_status=CATCHALL,
+                verify_detail=(f"catch-all domain, unprovable guess at "
+                               f"{person.first_name}'s address, volume lane only"),
+                confidence=GUESS_CONFIDENCE, status=PENDING,
+                provenance=PROV_GUESS, lane=VOLUME_LANE,
+            ))
+
     # No shared-inbox fallback: hello@ and founders@ are refused at the send
     # gate, so a company with no person to write to is left without a contact.
 
@@ -439,7 +476,7 @@ def _why_empty(people, published, verifier: Verifier, domain: str,
     if not people and not published:
         return "no founders listed and no published address"
     if people and verifier.is_catchall(domain):
-        return "catch-all domain, guesses unprovable"
+        return SKIP_CATCHALL_UNPROVABLE
     if people:
         return "no candidate address accepted"
     return "no usable address"

@@ -35,6 +35,7 @@ PROV_GIT_COMMIT = "git_commit"                # author address on the company's 
 PROV_HOUSE_PATTERN = "house_pattern"          # founder name + convention proven on the domain
 PROV_SITE = "site_unattributed"               # published on the site, tied to nobody
 PROV_GUESS = "guess"                          # a permutation of a founder's name
+PROV_APOLLO = "apollo"                        # from an Apollo export; see apollo.py
 # Sources good enough to send to on a catch-all domain. Unattributed site
 # addresses bounced 8 in 23 there; these bounced 4 in 75 between them.
 TRUSTED_PROVENANCE = frozenset({
@@ -54,17 +55,57 @@ def deliverable(verify_status: str, provenance: str) -> bool:
         return True
     return verify_status == CATCHALL and provenance in TRUSTED_PROVENANCE
 
+
+# Sending lanes. Each lane is one sending account with its own cap, ramp and
+# bounce brake, over one shared database: a person is mailed by one lane at
+# most, ever, and a suppression or reply in either closes them for both.
+MAIN_LANE = "main"
+# The second account. It takes whatever main leaves in the queue, plus the
+# addresses only it may send: unprovable guesses on catch-all domains, which
+# the main account never risks. See Pipeline._guess_rule.
+VOLUME_LANE = "volume"
+# Catch-all addresses with no evidence behind them beyond a name and a
+# convention. Reserved for the volume lane, where a bad run costs a
+# throwaway account instead of the main one.
+VOLUME_PROVENANCE = frozenset({PROV_GUESS, PROV_APOLLO})
+
+
+def volume_tier(verify_status: str, provenance: str) -> bool:
+    """An address only the volume lane's guess tier may send."""
+    return verify_status == CATCHALL and provenance in VOLUME_PROVENANCE
+
+
+def lane_deliverable(verify_status: str, provenance: str,
+                     reserved_for: str = "", lane: str = MAIN_LANE) -> bool:
+    """deliverable(), seen from one lane.
+
+    A contact reserved for a lane goes from that lane only. The volume lane
+    may also send its own guess tier; every other address faces exactly the
+    main gate, whichever account sends it.
+    """
+    if reserved_for and reserved_for != lane:
+        return False
+    if deliverable(verify_status, provenance):
+        return True
+    return (lane == VOLUME_LANE and reserved_for == VOLUME_LANE
+            and volume_tier(verify_status, provenance))
+
+
 # Company.skip_reason. Only the ones the rest of the code has to match on: the
 # first is a finding about the domain, the others record a lookup or probe
 # that never answered, and telling them apart is what keeps an outage from
 # retiring a company for good. See Database.RETRYABLE_SKIPS.
 SKIP_NO_MX = "domain has no MX record, cannot receive mail"
 SKIP_MX_UNRESOLVED = "MX lookup failed, DNS did not answer"
-# Founders were found but no mail server answered a single probe, usually
-# because the laptop relay was off. Nothing was learned about the addresses.
+# Founders were found but no mail server answered a single probe: port 25
+# was unreachable, or a configured relay was down. Nothing was learned about
+# the addresses.
 SKIP_PROBE_UNAVAILABLE = "SMTP probing unavailable, retry when it is back"
 # Addresses were found, but no mailbox among them accepted an SMTP RCPT.
 SKIP_NOT_VERIFIED = "no verified or trusted address"
+# Founders are known, but the domain accepts every address, so no guess at
+# theirs can be proved. The volume lane's guess tier reopens these.
+SKIP_CATCHALL_UNPROVABLE = "catch-all domain, guesses unprovable"
 
 # Where an address came from, best first.
 SRC_SCRAPED = "scraped"        # literally published on the site or YC page
@@ -110,6 +151,8 @@ class Contact:
     verify_detail: str = ""
     status: str = PENDING
     provenance: str = ""
+    # The only lane allowed to send to this contact, "" for any.
+    lane: str = ""
     id: Optional[int] = None
 
     @property

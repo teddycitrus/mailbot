@@ -244,3 +244,15 @@ def test_budget_caps_retries_before_max_retries():
     p = ScriptedPersonalizer([""] * 50, max_calls=2)
     assert line(p) == ""
     assert p.asked == 2
+
+
+def test_a_failed_groq_call_is_counted_so_queue_can_report_it(monkeypatch):
+    from src import llm
+
+    def down(*_a, **_k):
+        raise ConnectionError("no route")
+
+    monkeypatch.setattr(llm.requests, "post", down)
+    p = llm.Personalizer("key", "model")
+    assert p._ask("x") == ""
+    assert p.failures == {"ConnectionError": 1}

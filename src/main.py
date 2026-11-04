@@ -33,12 +33,23 @@ LOCK_EXEMPT = frozenset({
     "bounce-report",
 })
 
+# What a second sending account may do. Finding, verifying, drafting and the
+# Drafts mirror all run on main, once, for both lanes: a lane running enrich
+# would probe from its own address and draft twice into one queue.
+LANE_COMMANDS = frozenset({
+    "send", "followup", "inbox", "bounces", "health", "doctor", "bounce-report",
+    "stats", "preview",
+})
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mailbot", description="Cold outreach to early-stage ML startups."
     )
     parser.add_argument("--env", default=".env", help="path to env file")
+    parser.add_argument("--lane", default="main",
+                        help="sending account to act for; any lane but main "
+                             "reads .env.<lane> on top of --env")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="create the database and exit")
@@ -56,6 +67,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="portfolio pages to read this run, rotating through the list")
     p = sub.add_parser("enrich", help="find a contact at each new company")
     p.add_argument("--limit", type=int, default=15)
+    p = sub.add_parser(
+        "reopen-catchall",
+        help="re-enrich companies parked as catch-all, for the volume lane's guesses")
+    p.add_argument("--limit", type=int, default=20)
+    p = sub.add_parser("import-apollo", help="load an Apollo contacts export (CSV)")
+    p.add_argument("csv")
+    p.add_argument("--any-size", action="store_true",
+                   help="skip the MAX_EMPLOYEES check")
+    p.add_argument("--limit", type=int, default=0, help="most rows to read (0 = all)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="probe and report, but write nothing")
     p = sub.add_parser("priority", help="seed the companies named in priority.txt")
     p.add_argument("--resolve", action="store_true",
                    help="look up the domain for entries that have none, and "
@@ -139,8 +161,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    lane = (args.lane or "main").strip().lower()
+    if lane != "main" and args.command not in LANE_COMMANDS:
+        print(f"{args.command} runs on the main lane only; it serves every lane",
+              file=sys.stderr)
+        return 2
     try:
-        settings = Settings.load(args.env)
+        settings = Settings.load(args.env, lane=lane)
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
@@ -166,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if report.failures else 0
 
     if args.command == "bounce-report":
-        db = Database(settings.db_path)
+        db = Database(settings.db_path, settings.lane)
         try:
             report = bounce_check(settings, db, args.day, notify=args.email)
         finally:
@@ -207,6 +234,11 @@ def main(argv: list[str] | None = None) -> int:
             pipeline.priority(args.resolve, args.limit)
         elif args.command == "enrich":
             pipeline.enrich(args.limit)
+        elif args.command == "reopen-catchall":
+            pipeline.reopen_catchall(args.limit)
+        elif args.command == "import-apollo":
+            pipeline.import_apollo(args.csv, any_size=args.any_size,
+                                   dry_run=args.dry_run, limit=args.limit)
         elif args.command == "queue":
             # 0 means "use the configured depth", which is what the drafting
             # job wants. A negative target turns the check off, for rendering
@@ -241,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command in ("bounces", "inbox"):
             settings.require_for_bounces()
             scan = scan_inbox(settings, pipeline.db, args.days, args.limit)
-            print(f"inbox: examined {scan.examined} message(s) -> "
+            print(f"{pipeline._tag('inbox')}: examined {scan.examined} message(s) -> "
                   f"{len(scan.bounced)} bounced, {len(scan.replied)} replied, "
                   f"{len(scan.opted_out)} opted out, "
                   f"{len(scan.drafted)} reply draft(s) saved")
@@ -269,8 +301,9 @@ def main(argv: list[str] | None = None) -> int:
                   "no-MX domain(s) resolve again and were reopened")
             _print_table(report.rows(), ("email", "confidence", "state", "detail"))
         elif args.command == "reprobe":
-            # Runs every half hour whether or not the laptop is on, so the
-            # common outcome is this early exit, and it must cost nothing.
+            # Runs every half hour. Where port 25 is blocked and probes go
+            # through a relay that is often down, the common outcome is this
+            # early exit, and it must cost nothing.
             ok, detail = port25_reachable(pipeline.verifier.relay)
             if not ok:
                 print(f"reprobe: {detail}, nothing to do until it is back")

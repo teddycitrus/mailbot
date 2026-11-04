@@ -248,8 +248,8 @@ def _send_ramp(settings, db, today: str) -> Check:
         return Check("send ramp", OK, why)
     earlier = [r[0] for r in db.conn.execute(
         """SELECT DISTINCT local_date FROM sends
-           WHERE status = 'sent' AND local_date < ?
-           ORDER BY local_date DESC LIMIT 5""", (today,))]
+           WHERE status = 'sent' AND local_date < ? AND lane = ?
+           ORDER BY local_date DESC LIMIT 5""", (today, getattr(db, "lane", "main")))]
     held = 1
     for day in earlier:
         if not cap_on(day)[1].startswith("held"):
@@ -274,18 +274,38 @@ def _last_weekday_sent(db, today: str) -> Check:
     while day.weekday() >= 5:
         day -= timedelta(days=1)
     sent = db.sent_count_on(day.isoformat())
+    lane = getattr(db, "lane", "main")
     # Only drafts that were already waiting that day; a queue refilled
-    # overnight says nothing about why the day itself was quiet.
+    # overnight says nothing about why the day itself was quiet. For a
+    # second lane, only the drafts reserved for it: the open queue is main's
+    # until main is full, so an empty day there can be correct.
     queued = db.conn.execute(
         """SELECT COUNT(*) FROM drafts d JOIN contacts c ON c.id = d.contact_id
            WHERE d.status = 'queued' AND c.status = 'queued'
-             AND d.created_at < ?""",
-        ((day + timedelta(days=1)).isoformat(),)).fetchone()[0]
+             AND d.created_at < ?"""
+        + ("" if lane == "main" else " AND c.lane = ?"),
+        ((day + timedelta(days=1)).isoformat(),)
+        + (() if lane == "main" else (lane,))).fetchone()[0]
     if sent == 0 and queued > 0:
-        return Check("sends yesterday", FAIL,
+        # A lane whose guesses were held by its own brake sends nothing by
+        # design, so there it is worth a look rather than an alarm.
+        return Check("sends yesterday", FAIL if lane == "main" else WARN,
                      f"nothing sent on {day.isoformat()} with {queued} drafts "
                      "queued; check that day's send log and the tick timer")
     return Check("sends yesterday", OK, f"{sent} sent on {day.isoformat()}")
+
+
+def _guess_tier(settings, db, today: str) -> Check:
+    """Is the volume lane's guess tier sending, or held by its brake?"""
+    from .lanes import guess_hold
+    queued = db.conn.execute(
+        """SELECT COUNT(*) FROM drafts d JOIN contacts c ON c.id = d.contact_id
+           WHERE d.status = 'queued' AND c.status = 'queued' AND c.lane = ?""",
+        (getattr(db, "lane", "main"),)).fetchone()[0]
+    why = guess_hold(settings, db, today)
+    if why:
+        return Check("guess tier", WARN, f"{why}; {queued} reserved draft(s) waiting")
+    return Check("guess tier", OK, f"{queued} reserved draft(s) queued")
 
 
 def _intake(settings, db, today: str) -> Check:
@@ -390,7 +410,37 @@ def _priority(settings) -> Check:
     return Check("priority list", OK, f"{len(entries)} companies")
 
 
+def _lane_checks(settings: Settings) -> list[Check]:
+    """What a second sending account adds to watch.
+
+    Everything shared (templates, resume, the queue, intake, verification,
+    the APIs) is checked once, by main's run; repeating it here would only
+    mail every fault twice.
+    """
+    lane = settings.lane
+    checks = []
+    try:
+        settings.require_for_send()
+        checks.append(Check("send config", OK, f"lane={lane}, from={settings.from_email}"))
+    except ConfigError as exc:
+        checks.append(Check("send config", FAIL, str(exc)))
+    checks += [_smtp(settings), _imap(settings)]
+    try:
+        db = Database(settings.db_path, lane)
+        today = local_date(settings.send_timezone)
+        checks.append(_send_ramp(settings, db, today))
+        if not settings.dry_run:
+            checks.append(_last_weekday_sent(db, today))
+        checks.append(_guess_tier(settings, db, today))
+        db.close()
+    except Exception as exc:
+        checks.append(Check("database", FAIL, f"{type(exc).__name__}: {exc}"))
+    return checks
+
+
 def run_checks(settings: Settings) -> list[Check]:
+    if getattr(settings, "lane", "main") != "main":
+        return _lane_checks(settings)
     checks = [*_templates(settings), _resume(settings)]
     try:
         settings.require_for_send()
