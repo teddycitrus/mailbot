@@ -34,6 +34,7 @@ def settings(**over):
         send_ramp_start=8,
         send_ramp_step=2,
         send_ramp_max_bounce_pct=5,
+        send_ramp_max_growth=2,
     )
     base.update(over)
     return _Stub(**base)
@@ -94,7 +95,7 @@ def test_volume_at_most_doubles_day_over_day():
     s = settings()
     cap, why = s.daily_cap(active_days=40, bounce_pct=0.0, recent_daily_max=8)
     assert cap == 16
-    assert "double" in why
+    assert "2x" in why
     assert s.daily_cap(40, 0.0, recent_daily_max=16)[0] == 25
 
 
@@ -116,6 +117,19 @@ def test_growth_limiter_is_silent_in_normal_operation():
 def test_growth_limiter_skipped_without_history():
     cap, why = settings().daily_cap(active_days=40, bounce_pct=0.0,
                                     recent_daily_max=None)
+    assert cap == 25
+    assert "complete" in why
+
+
+def test_growth_multiple_is_configurable():
+    s = settings(send_ramp_max_growth=3)
+    assert s.daily_cap(40, 0.0, recent_daily_max=8)[0] == 24
+    assert "3x" in s.daily_cap(40, 0.0, recent_daily_max=8)[1]
+
+
+def test_growth_limiter_off_at_zero():
+    cap, why = settings(send_ramp_max_growth=0).daily_cap(
+        active_days=40, bounce_pct=0.0, recent_daily_max=8)
     assert cap == 25
     assert "complete" in why
 

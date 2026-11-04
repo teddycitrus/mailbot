@@ -174,6 +174,9 @@ class Settings:
     # Recent bounce rate above which catch-all addresses tighten: over it,
     # only self-published ones go; over double, none. 0 turns this off.
     catchall_strict_bounce_pct: int = 3
+    # Most the ramp cap may be, as a multiple of the busiest recent send day.
+    # 0 turns the growth limiter off.
+    send_ramp_max_growth: int = 2
 
     @classmethod
     def load(cls, env_file: str | os.PathLike[str] | None = ".env") -> "Settings":
@@ -250,6 +253,7 @@ class Settings:
             vc_portfolios_path=_path("VC_PORTFOLIOS_PATH", "config/vc_portfolios.txt"),
             vc_max_site_rank=max(0, _int("VC_MAX_SITE_RANK", 20_000)),
             catchall_strict_bounce_pct=max(0, _int("CATCHALL_STRICT_BOUNCE_PCT", 3)),
+            send_ramp_max_growth=max(0, _int("SEND_RAMP_MAX_GROWTH", 2)),
         )
 
     def catchall_provenance(self, bounce_pct: float) -> tuple[frozenset, str]:
@@ -311,11 +315,12 @@ class Settings:
             return held, (f"held at {held}, recurrable bounce rate "
                           f"{bounce_pct:.1f}% over {self.send_ramp_max_bounce_pct}%")
 
-        if recent_daily_max is not None:
-            growth_limit = max(self.send_ramp_start, 2 * recent_daily_max)
+        growth = self.send_ramp_max_growth
+        if recent_daily_max is not None and growth > 0:
+            growth_limit = max(self.send_ramp_start, growth * recent_daily_max)
             if cap > growth_limit:
                 return growth_limit, (f"growing back, {growth_limit} today "
-                                      f"(double the recent {recent_daily_max})")
+                                      f"({growth}x the recent {recent_daily_max})")
 
         if cap >= ceiling:
             return ceiling, f"ramp complete at {ceiling}/day"
