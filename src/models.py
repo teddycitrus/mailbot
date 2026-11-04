@@ -40,6 +40,10 @@ PROV_GUESS = "guess"                          # a permutation of a founder's nam
 TRUSTED_PROVENANCE = frozenset({
     PROV_HN_POST, PROV_FOUNDER_PUBLISHED, PROV_GIT_COMMIT, PROV_HOUSE_PATTERN,
 })
+# The strongest of those: the person wrote the address down themselves.
+# What is left of catch-all sending when the bounce rate climbs (0 bounces
+# in 49 so far); inferred addresses go first. See Settings.catchall_provenance.
+SELF_PUBLISHED = frozenset({PROV_HN_POST, PROV_FOUNDER_PUBLISHED})
 
 
 def deliverable(verify_status: str, provenance: str) -> bool:

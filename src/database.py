@@ -491,6 +491,7 @@ class Database:
     def queued_drafts(self, limit: int | None = 100) -> list[sqlite3.Row]:
         return self.conn.execute(
             """SELECT d.*, c.email, c.first_name, c.last_name, c.role, c.company_id,
+                      c.verify_status, c.provenance,
                       co.name AS company_name, co.location AS company_location
                FROM drafts d
                JOIN contacts c ON c.id = d.contact_id
@@ -571,6 +572,7 @@ class Database:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=after_days)).isoformat()
         return self.conn.execute(
             """SELECT c.id, c.email, c.first_name, c.last_name, c.role,
+                      c.verify_status, c.provenance,
                       co.name AS company_name, co.location AS company_location,
                       co.one_liner, co.description,
                       COUNT(s.id) AS send_count,

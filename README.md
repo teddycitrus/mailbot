@@ -244,7 +244,10 @@ Every send passes these checks, in order, in `Database.can_send_to`:
    message leaves and updated after, so a failed write cannot cause a repeat.
 5. Its `verify_status` is `verified` (the mailbox itself accepted an SMTP RCPT),
    or it is `catchall` with a trusted `provenance`: `hn_post`,
-   `founder_published`, `git_commit` or `house_pattern`.
+   `founder_published`, `git_commit` or `house_pattern`. When the recent
+   bounce rate passes `CATCHALL_STRICT_BOUNCE_PCT` (3%), catch-alls narrow to
+   the self-published two (`hn_post`, `founder_published`); past double it,
+   no catch-all goes. Held drafts stay queued until the rate recovers.
 
 Then the daily cap, the per-company limit (three people, never two on one day)
 and the recipient's local send window apply. Follow-ups go through the same

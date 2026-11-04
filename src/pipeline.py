@@ -29,8 +29,8 @@ from .github_source import GitHubClient
 from .hn_source import fetch_posts, fetch_recent_posts
 from .llm import Personalizer
 from .models import (
-    Company, Contact, ENRICHED, NO_CONTACTS, PENDING, SRC_SCRAPED,
-    PROV_HN_POST, SKIP_NOT_VERIFIED, deliverable,
+    CATCHALL, Company, Contact, ENRICHED, NO_CONTACTS, PENDING, SRC_SCRAPED,
+    PROV_HN_POST, SKIP_NOT_VERIFIED, TRUSTED_PROVENANCE, deliverable,
 )
 from . import priority as priority_list
 from .priority import from_settings as priority_set
@@ -480,6 +480,20 @@ class Pipeline:
             self.db.max_daily_sends(before_local_date=today),
         )
 
+    def _catchall_rule(self, today: str):
+        """Today's test for a catch-all address, and why: see
+        Settings.catchall_provenance. None means no tightening applies."""
+        rule = getattr(self.settings, "catchall_provenance", None)
+        if rule is None:
+            return None, ""
+        allowed, why = rule(self.db.recent_bounce_pct(before_local_date=today))
+        if allowed >= TRUSTED_PROVENANCE:
+            return None, why
+
+        def blocked(row) -> bool:
+            return row["verify_status"] == CATCHALL and row["provenance"] not in allowed
+        return blocked, why
+
     def followup(self, limit: int, ignore_window: bool = False) -> int:
         """Send one polite nudge to people who never answered.
 
@@ -549,6 +563,7 @@ class Pipeline:
         # Refused rows stay due forever and every tick walks all of them, so
         # they are counted by reason rather than printed one line each.
         refused: Counter = Counter()
+        catchall_blocked, catchall_why = self._catchall_rule(today)
         backend = make_backend(settings)
         try:
             with backend:
@@ -558,6 +573,9 @@ class Pipeline:
                     allowed, why = self.db.can_send_to_again(row["email"])
                     if not allowed:
                         refused[why] += 1
+                        continue
+                    if catchall_blocked and catchall_blocked(row):
+                        refused[catchall_why] += 1
                         continue
                     if settings.per_recipient_timezone and not ignore_window:
                         open_now, where = local_window_open(
@@ -724,6 +742,17 @@ class Pipeline:
         if not pool:
             print("send: no complete drafts to send")
             return 0
+
+        # Held, not skipped: they stay queued and go once the rate recovers.
+        catchall_blocked, catchall_why = self._catchall_rule(today)
+        if catchall_blocked:
+            held_back = [d for d in pool if catchall_blocked(d)]
+            if held_back:
+                pool = [d for d in pool if not catchall_blocked(d)]
+                print(f"send: {len(held_back)} catch-all draft(s) held ({catchall_why})")
+            if not pool:
+                print("send: only held catch-all drafts left")
+                return 0
 
         pool, held = self._space_by_company(pool, today)
         if held:

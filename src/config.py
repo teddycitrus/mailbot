@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from datetime import time as dtime
 from pathlib import Path
 
+from .models import SELF_PUBLISHED, TRUSTED_PROVENANCE
+
 try:
     from dotenv import load_dotenv
 except ImportError:  # dotenv is optional; plain env vars still work.
@@ -169,6 +171,9 @@ class Settings:
     # which a domain counts as a big company and is skipped. See vc_source.py.
     vc_portfolios_path: Path = Path("config/vc_portfolios.txt")
     vc_max_site_rank: int = 20_000
+    # Recent bounce rate above which catch-all addresses tighten: over it,
+    # only self-published ones go; over double, none. 0 turns this off.
+    catchall_strict_bounce_pct: int = 3
 
     @classmethod
     def load(cls, env_file: str | os.PathLike[str] | None = ".env") -> "Settings":
@@ -244,7 +249,27 @@ class Settings:
             max_contacts_per_company=max(1, _int("MAX_CONTACTS_PER_COMPANY", 3)),
             vc_portfolios_path=_path("VC_PORTFOLIOS_PATH", "config/vc_portfolios.txt"),
             vc_max_site_rank=max(0, _int("VC_MAX_SITE_RANK", 20_000)),
+            catchall_strict_bounce_pct=max(0, _int("CATCHALL_STRICT_BOUNCE_PCT", 3)),
         )
+
+    def catchall_provenance(self, bounce_pct: float) -> tuple[frozenset, str]:
+        """Which provenances may still be mailed on a catch-all domain today.
+
+        A catch-all accepts any recipient, so the probe proves nothing and
+        provenance is the only evidence. As the recent bounce rate climbs the
+        weaker evidence goes first: inferred addresses (house pattern, commit
+        history) above the limit, every catch-all above double it. Verified
+        mailboxes are never affected. Fed the same rate as the ramp, which
+        stays put once a class stops being mailed, so this does not flap.
+        """
+        limit = self.catchall_strict_bounce_pct
+        if limit and bounce_pct > 2 * limit:
+            return frozenset(), (f"catch-all off, bounce rate {bounce_pct:.1f}% "
+                                 f"over {2 * limit}%")
+        if limit and bounce_pct > limit:
+            return SELF_PUBLISHED, (f"catch-all self-published only, bounce rate "
+                                    f"{bounce_pct:.1f}% over {limit}%")
+        return TRUSTED_PROVENANCE, "catch-all from trusted sources"
 
     def daily_cap(self, active_days: int, bounce_pct: float,
                   recent_daily_max: int | None = None) -> tuple[int, str]:
