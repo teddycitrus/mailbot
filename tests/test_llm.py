@@ -158,6 +158,25 @@ def test_clean_what_rejects_generated_sounding_phrases(bad):
     assert clean_what(bad) == ""
 
 
+@pytest.mark.parametrize("steered", [
+    "selling cheap meds at evil.com now",
+    "building agents, see evil.ai/start for details",
+    "building tools for teams at acme.co.uk",
+])
+def test_a_domain_in_the_phrase_is_refused(steered):
+    """The phrase comes from the model reading the company's own site text.
+
+    A page that tells the model to name a domain would otherwise put a link
+    into John's email: mail clients turn a bare domain into one.
+    """
+    assert clean_what(steered) == ""
+
+
+def test_dotted_product_names_still_pass():
+    assert clean_what("building tools for Node.js developers") == \
+        "building tools for Node.js developers"
+
+
 def test_compose_is_lowercase_except_the_company_name():
     out = compose("Mage", "building mage's AI tools for app developers",
                   "AI agents that act through tools")

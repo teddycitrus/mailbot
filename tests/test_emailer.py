@@ -113,6 +113,21 @@ def test_boundaries_are_inclusive():
     assert in_send_window(TZ, START, END, _at(2026, 9, 8, 10, 0))[0]
 
 
+def test_the_tick_on_the_closing_minute_still_sends():
+    """Timers fire a few seconds past the quarter hour.
+
+    Compared to the second, 10:00:04 is after a 10:00 end, so the last tick
+    of every recipient's window never sent: 0 of 436 October sends went out
+    at the configured end minute. The window is written in minutes.
+    """
+    at = _at(2026, 9, 8, 10, 0).replace(second=4)
+    assert in_send_window(TZ, START, END, at)[0]
+    assert not in_send_window(TZ, START, END, _at(2026, 9, 8, 10, 1))[0]
+    west, _ = local_window_open("San Francisco, CA", TZ, START, END,
+                                _utc(2026, 9, 8, 17, 0).replace(second=4))
+    assert west, "10:00:04 Pacific is the closing tick"
+
+
 @pytest.mark.parametrize("day", [5, 6])
 def test_weekends_are_refused(day):
     ok, why = in_send_window(TZ, START, END, _at(2026, 9, 5 + (day - 5), 9, 0))

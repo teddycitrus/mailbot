@@ -246,7 +246,8 @@ class Settings:
             vc_max_site_rank=max(0, _int("VC_MAX_SITE_RANK", 20_000)),
         )
 
-    def daily_cap(self, active_days: int, bounce_pct: float) -> tuple[int, str]:
+    def daily_cap(self, active_days: int, bounce_pct: float,
+                  recent_daily_max: int | None = None) -> tuple[int, str]:
         """Today's cap, grown from SEND_RAMP_START toward DAILY_SEND_LIMIT.
 
         A young sending address that opens at full daily volume reads as a
@@ -259,6 +260,14 @@ class Settings:
         still for the whole of today instead of climbing the moment the
         first message goes out.
 
+        `recent_daily_max` is the busiest recent day actually sent
+        (Database.max_daily_sends). The cap never exceeds double it, so
+        volume at most doubles day over day however much the ramp has
+        earned. Without this, coming off a long hold snaps the cap from the
+        floor straight to the ceiling, a three-fold jump the rest of this
+        method exists to avoid. None skips the check for callers that have
+        no send history to offer.
+
         Returns the cap and a short reason, because a cap that silently
         disagrees with DAILY_SEND_LIMIT is otherwise baffling in the logs.
         """
@@ -270,11 +279,18 @@ class Settings:
         cap = max(0, min(ceiling, earned))
 
         # Climbing while mail is bouncing is what gets an address blocked, so
-        # fall back to the opening step until the bounce rate recovers.
+        # fall back to the opening step until the bounce rate recovers. Only
+        # bounces that can recur count (see Database.recent_bounce_pct).
         if bounce_pct > self.send_ramp_max_bounce_pct:
             held = max(0, min(cap, self.send_ramp_start))
-            return held, (f"held at {held}, bounce rate {bounce_pct:.1f}% "
-                          f"over {self.send_ramp_max_bounce_pct}%")
+            return held, (f"held at {held}, recurrable bounce rate "
+                          f"{bounce_pct:.1f}% over {self.send_ramp_max_bounce_pct}%")
+
+        if recent_daily_max is not None:
+            growth_limit = max(self.send_ramp_start, 2 * recent_daily_max)
+            if cap > growth_limit:
+                return growth_limit, (f"growing back, {growth_limit} today "
+                                      f"(double the recent {recent_daily_max})")
 
         if cap >= ceiling:
             return ceiling, f"ramp complete at {ceiling}/day"

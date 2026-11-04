@@ -169,7 +169,8 @@ def apply_setup(payload: dict[str, str]) -> None:
         # A masked secret means "leave it alone", not "set it to asterisks".
         if key in SECRET_KEYS and set(value.strip()) == {"*"}:
             continue
-        updates[key] = value.strip().replace("\n", " ")
+        # Any line break would split one value into two .env lines on read.
+        updates[key] = re.sub(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]+", " ", value.strip())
 
     email = updates.get("FROM_EMAIL", "").strip()
     if email:

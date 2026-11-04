@@ -226,13 +226,36 @@ def _embedded_founders(soup: BeautifulSoup) -> list[Person]:
     return []
 
 
+# Words that YC pages and team pages put where a name belongs. A line made of
+# nothing but these ("Founder/CEO", "Co-Founder & CTO") is a job description,
+# not a person; one that got through became founderceo@, was mailed under
+# house_pattern provenance and bounced. Matched as whole tokens so real names
+# stay safe: Maceo shares letters with CEO and no token with this set.
+_ROLE_WORDS = frozenset({
+    "founder", "cofounder", "co", "ceo", "cto", "coo", "cpo", "cfo", "cmo",
+    "president", "director", "head", "lead", "chief", "officer", "engineer",
+    "engineering", "technology", "technical", "product", "executive",
+    "managing", "partner", "general", "operating", "scientist", "the",
+})
+
+
 def _looks_like_name(text: str) -> bool:
     if not (2 <= len(text) <= 60):
+        return False
+    # Digits and sign-like punctuation never appear in a person's name, and
+    # pattern.build() would silently strip them into a plausible-looking
+    # local part ("Founder/CEO" -> founderceo@).
+    if any(ch.isdigit() or ch in "/@&|()[]{}<>*#" for ch in text):
         return False
     words = text.split()
     if not (1 <= len(words) <= 4):
         return False
-    return all(w[:1].isupper() for w in words if w[:1].isalpha())
+    if not all(w[:1].isupper() for w in words if w[:1].isalpha()):
+        return False
+    tokens = [t for t in re.split(r"[^a-zA-Z]+", text.lower()) if t]
+    # all() over an empty list is True, which correctly rejects a "name"
+    # with no letters in it at all.
+    return not all(t in _ROLE_WORDS for t in tokens)
 
 
 def _fallback_founders(soup: BeautifulSoup) -> list[Person]:

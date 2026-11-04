@@ -170,10 +170,16 @@ def local_date(tz_name: str) -> str:
     return local_now(tz_name).date().isoformat()
 
 
+def _minute(moment: datetime) -> dtime:
+    """The clock to the minute. Windows are written in minutes, and timers
+    fire a few seconds late, so 10:00:04 must still count as 10:00."""
+    return moment.time().replace(second=0, microsecond=0)
+
+
 def in_send_window(tz_name: str, start: dtime, end: dtime,
                    now: Optional[datetime] = None) -> tuple[bool, str]:
     current = (now or local_now(tz_name))
-    clock = current.time()
+    clock = _minute(current)
     if current.weekday() >= 5:
         return False, f"weekend ({current:%A})"
     if start <= clock <= end:
@@ -255,7 +261,7 @@ def local_window_open(location: str, default_tz: str, start: dtime, end: dtime,
     moment = (now_utc or datetime.now(timezone.utc)).astimezone(ZoneInfo(zone))
     if moment.weekday() >= 5:
         return False, f"weekend in {zone}"
-    if start <= moment.time() <= end:
+    if start <= _minute(moment) <= end:
         return True, zone
     return False, f"{moment:%H:%M} {zone}"
 
@@ -556,6 +562,21 @@ def extract_bounced_addresses(raw_message: str, own_domain: str = "") -> set[str
     if own_domain:
         found = {a for a in found if not a.endswith("@" + own_domain.lower())}
     return {a for a in found if ADDR_RE.match(a)}
+
+
+DELAY_RE = re.compile(
+    r"(?im)^action:\s*delayed\b|^subject:.*\b(?:delay|delayed|still being retried)\b")
+
+
+def is_delay_notice(raw_message: str) -> bool:
+    """A warning that delivery is still being retried, not a failure.
+
+    RFC 3464 marks these "Action: delayed"; Gmail titles them "(Delay)",
+    Postfix "Delayed Mail (still being retried)". If the retries run out, a
+    separate failure notice follows, and that one is the bounce.
+    """
+    return bool(DELAY_RE.search(raw_message)) and not re.search(
+        r"(?im)^action:\s*failed\b", raw_message)
 
 
 def is_hard_bounce(raw_message: str) -> bool:

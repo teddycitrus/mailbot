@@ -1,10 +1,11 @@
 # End-of-window bounce check. Runs after the last send tick of the day.
 #
-# The warmup ramp already brakes on the bounce rate, but it reads the last
-# hundred sends. That is the right horizon for sender reputation and the wrong
-# one for noticing that today went wrong: two bounces in twenty-one sends is
-# 9.5% for the day and barely moves a hundred-send average. This looks at one
-# day on its own and mails you when it crosses DAILY_BOUNCE_ALERT_PCT.
+# The warmup ramp already brakes on the recurrable bounce rate, but it reads
+# the last hundred sends. That is the right horizon for sender reputation and
+# the wrong one for noticing that today went wrong: two bounces in twenty-one
+# sends is 9.5% for the day and barely moves a hundred-send average. This looks
+# at one day on its own, counts every bounce whatever its class, and mails you
+# when it crosses DAILY_BOUNCE_ALERT_PCT.
 #
 # The mailbox is scanned first. A failure notice that has not been read yet is
 # not in the database, and a check that runs before the scan would report a

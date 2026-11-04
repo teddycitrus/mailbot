@@ -229,6 +229,8 @@ BANNED = (
     "supercharg", "reimagin", "redefin", "pioneer",
 )
 ALLOWED_CHARS = re.compile(r"^[A-Za-z0-9 ,'\-&/.]+$")
+# Anything shaped like a host name. ".js" is spared for Node.js and Next.js.
+DOMAIN_LIKE = re.compile(r"\b[\w-]+\.(?!js\b)[a-z]{2,}\b", re.I)
 
 
 def _pick(options: list[str], key: str) -> str:
@@ -309,6 +311,10 @@ def clean_what(text: str) -> str:
     if not ALLOWED_CHARS.match(what) or ".." in what:
         return ""
     if any(stem in what.lower() for stem in BANNED):
+        return ""
+    # The phrase is written from the company's own site text, so a page can
+    # try to steer it. A domain would become a link in John's email.
+    if DOMAIN_LIKE.search(what):
         return ""
     return what
 

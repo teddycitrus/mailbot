@@ -30,18 +30,34 @@ from pathlib import Path
 from typing import Optional
 
 from .emailer import (
-    Template, build_message, extract_bounced_addresses, is_hard_bounce,
+    Template, build_message, extract_bounced_addresses, is_delay_notice, is_hard_bounce,
     load_template, strip_re_prefix, validate_template,
 )
 from .models import BOUNCED, REPLIED
+from .hn_source import CONSUMER
 from .verifier import first_name_from_email
 
 BOUNCE_SENDERS = ("mailer-daemon", "postmaster", "mail delivery", "mailer_daemon")
 
+# Built from a corpus of synthetic refusals (tests/test_optout_corpus.py).
+# The first version knew ten phrasings and missed half the corpus: opt out,
+# stop sending, remove us, reach out, leave me alone. Verbs stay bound to
+# their objects so "We stopped using Django" and "I removed the posting"
+# never read as refusals.
 OPT_OUT = re.compile(
-    r"(?i)\b(unsubscribe|remove me|take me off|stop emailing|stop contacting|"
-    r"do not (?:contact|email) me|don't (?:contact|email) me|not interested|"
-    r"no longer interested|please stop)\b"
+    r"(?i)\b(unsubscribe|unsub|opt (?:me |us )?out|"
+    r"remove (?:me|us|this address)|take (?:me|us) off|"
+    r"stop (?:emailing|contacting|sending|messaging)|"
+    r"(?:do not|don't) (?:contact|email|message|send|write to) (?:me|us)|"
+    r"(?:do not|don't) reach out|(?:do not|don't) send (?:any ?)?more|"
+    r"not interested|no longer interested|please stop|leave me alone|"
+    r"cease (?:all )?(?:communication|contact)|no more (?:e-?mails?|messages)|"
+    # French, Spanish, German. Same rule: the verb stays bound to its object.
+    r"ne plus (?:me|nous) (?:contacter|[ée]crire)|me retirer de (?:votre|vos|la|cette) liste|retirez[- ]moi|"
+    r"d[ée]sabonn\w*|pas int[ée]ress[ée]e?s?|"
+    r"no (?:me|nos) contact(?:e|en|es)|dar(?:me|nos)? de baja|"
+    r"no (?:estoy|estamos) interesad[oa]s?|"
+    r"abmelden|keine (?:e-?mails?|nachrichten) mehr|kein interesse)\b"
 )
 
 # Where a quoted original typically begins.
@@ -82,6 +98,27 @@ def strip_quoted(text: str) -> str:
 
 def wants_out(body: str) -> bool:
     return bool(OPT_OUT.search(strip_quoted(body)))
+
+
+def is_refusal(message) -> bool:
+    """The body says stop, or the subject does.
+
+    The List-Unsubscribe mailto on every message makes the mail client send
+    one with the subject "unsubscribe" and a body of its own boilerplate.
+    """
+    return (wants_out(plain_body(message))
+            or bool(OPT_OUT.search(header_text(message.get("Subject", "")))))
+
+
+def _colleague_refusal(db, sender: str, message):
+    """The contact a fresh refusal from their company's domain speaks for."""
+    domain = sender.rpartition("@")[2]
+    if (not domain or domain in CONSUMER or message.get("List-Unsubscribe")
+            or message.get("List-Id") or is_auto_reply(message)):
+        return None
+    if not is_refusal(message):
+        return None
+    return db.last_contacted_at_domain(domain)
 
 
 def plain_body(message) -> str:
@@ -227,7 +264,7 @@ def scan_inbox(settings, db, days: int = 30, limit: int = 500) -> InboxScan:
     contacted = {
         row["email"].lower()
         for row in db.conn.execute(
-            "SELECT DISTINCT email FROM sends WHERE status = 'sent'"
+            "SELECT DISTINCT email FROM sends WHERE status IN ('sent', 'sending')"
         )
     }
     # One draft per person. Later messages in the conversation are for a
@@ -260,6 +297,8 @@ def scan_inbox(settings, db, days: int = 30, limit: int = 500) -> InboxScan:
             subject = str(message.get("Subject", ""))
 
             if is_bounce(sender, subject):
+                if is_delay_notice(raw):
+                    continue
                 hard = is_hard_bounce(raw)
                 for addr in extract_bounced_addresses(raw, own_domain):
                     # Each scan rereads every notice still in the inbox, so
@@ -291,11 +330,22 @@ def scan_inbox(settings, db, days: int = 30, limit: int = 500) -> InboxScan:
                     header_text(message.get("In-Reply-To", "")).split()
                     + header_text(message.get("References", "")).split())
                 if row is None:
+                    # A colleague writing fresh from the company's own domain
+                    # to say stop. Only a refusal counts here, never mailing
+                    # lists, and never a free-mail host anyone can write from.
+                    row = _colleague_refusal(db, sender, message)
+                    if row is None:
+                        continue
+                    if not db.is_suppressed(sender):
+                        db.suppress(sender, "opt-out reply")
+                    if not db.is_suppressed(row["email"]):
+                        db.suppress(row["email"], "opt-out reply")
+                        db.log("opt_out", row["email"], f"via {sender}: {subject[:100]}")
+                        result.opted_out.append(row["email"])
                     continue
                 who = row["email"]
 
-            body = plain_body(message)
-            if wants_out(body):
+            if is_refusal(message):
                 if not db.is_suppressed(who):
                     db.suppress(who, "opt-out reply")
                     db.log("opt_out", who, subject[:120])

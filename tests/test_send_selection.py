@@ -47,8 +47,14 @@ class PoolDB:
     def recent_bounce_pct(self, window=100):
         return 0.0
 
+    due: list = []
+    refused: set = set()
+
     def due_for_followup(self, after_days, max_total_sends, limit=50):
-        return []
+        return self.due[:limit]
+
+    def can_send_to_again(self, email):
+        return (False, "shared or blocked inbox") if email in self.refused else (True, "")
 
     sent_companies: set = set()
     closed_companies: dict = {}
@@ -225,6 +231,60 @@ def test_ignore_window_still_overrides_the_clock(tmp_path, monkeypatch, capsys):
     # Gets past the clock, then stops on the cap lookup rather than the window.
     bot.followup(limit=1, ignore_window=True)
     assert "followup: refused" not in capsys.readouterr().out
+
+
+def due_row(email, location="Toronto"):
+    return {"id": 1, "email": email, "first_name": "Sam", "last_name": "Rees",
+            "first_subject": "hello", "first_message_id": "<m@x>",
+            "company_name": "Acme", "company_location": location}
+
+
+class NoBackend:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_refused_followups_at_the_head_do_not_starve_the_rest(
+        tmp_path, monkeypatch, capsys):
+    """Due follow-ups are oldest first, and a refused one is never cleared.
+
+    Role inboxes mailed before the role gate stay due forever, at the front.
+    A fixed slice of the oldest 50 filled up with them and every live nudge
+    behind sat unseen on every tick.
+    """
+    monkeypatch.setattr(pipeline_module, "make_backend", lambda s: NoBackend())
+    bot = followup_bot(tmp_path, FINISHED, resume_link="https://x.test/cv",
+                       resume_path=tmp_path / "none.pdf", from_name="John",
+                       from_email="j@x.test", reply_to="j@x.test",
+                       unsubscribe_mailto="j@x.test")
+    dead = [due_row(f"team{i}@old.ai") for i in range(60)]
+    bot.db.due = dead + [due_row("sam@live.ai")]
+    bot.db.refused = {r["email"] for r in dead}
+    bot.followup(limit=1)
+    out = capsys.readouterr().out
+    assert "FOLLOWUP (dry run) to sam@live.ai" in out
+    assert "followup: skipped 60 shared or blocked inbox" in out
+    assert "team0@old.ai" not in out
+
+
+def test_drafts_outside_their_window_do_not_starve_open_ones(monkeypatch, capsys):
+    """The pool was the top 50 by rank, filtered by window afterwards.
+
+    Fifty West Coast drafts at the head left an Eastern tick with nothing to
+    send while Eastern drafts sat just past the slice.
+    """
+    monkeypatch.setattr(
+        pipeline_module, "local_window_open",
+        lambda loc, *a: (loc == "Toronto", "08:00 America/Los_Angeles"))
+    west = [draft(f"w{i}@west.ai", body=LINKED) for i in range(60)]
+    for d in west:
+        d["company_location"] = "San Francisco"
+    pool = west + [draft("e@east.ai", body=LINKED)]
+    bare(pool, per_recipient_timezone=True).send(limit=2)
+    assert sent_in_dry_run(capsys.readouterr().out) == ["e@east.ai"]
 
 
 def test_per_recipient_mode_leaves_the_gate_to_the_per_draft_check(

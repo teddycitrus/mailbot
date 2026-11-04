@@ -18,7 +18,7 @@ from .models import (
     QUEUED, REPLIED, SENT, SKIP_MX_UNRESOLVED, SKIP_PROBE_UNAVAILABLE,
     SUPPRESSED, VERIFIED, deliverable,
 )
-from .verifier import is_personal_mailbox
+from .verifier import is_personal_mailbox, sendable_address_class
 
 # A named person first, everyone else after. Sorting on priority alone let a
 # verified hello@ tie with a founder's own address and fill half of each day.
@@ -395,7 +395,7 @@ class Database:
         return {r[0] for r in self.conn.execute(
             """SELECT DISTINCT c.company_id FROM sends s
                JOIN contacts c ON c.id = s.contact_id
-               WHERE s.local_date = ? AND s.status = 'sent'
+               WHERE s.local_date = ? AND s.status IN ('sent', 'sending')
                  AND c.company_id IS NOT NULL""",
             (local_date,),
         )}
@@ -416,7 +416,8 @@ class Database:
         if row and row["status"] in {SENT, REPLIED, BOUNCED, SUPPRESSED}:
             return False, f"already {row['status']}"
         prior = self.conn.execute(
-            "SELECT 1 FROM sends WHERE email = ? AND status = 'sent'", (email,)
+            "SELECT 1 FROM sends WHERE email = ? AND status IN ('sent', 'sending')",
+            (email,)
         ).fetchone()
         if prior:
             return False, "already in send log"
@@ -487,7 +488,7 @@ class Database:
         self.conn.commit()
         return int(cur.lastrowid)
 
-    def queued_drafts(self, limit: int = 100) -> list[sqlite3.Row]:
+    def queued_drafts(self, limit: int | None = 100) -> list[sqlite3.Row]:
         return self.conn.execute(
             """SELECT d.*, c.email, c.first_name, c.last_name, c.role, c.company_id,
                       co.name AS company_name, co.location AS company_location
@@ -498,7 +499,7 @@ class Database:
                ORDER BY """ + NAMED_FIRST + """,
                         COALESCE(co.priority, 0) DESC, c.confidence DESC, d.id
                LIMIT ?""",
-            (QUEUED, limit),
+            (QUEUED, -1 if limit is None else limit),
         ).fetchall()
 
     def mark_draft(self, draft_id: int, status: str) -> None:
@@ -560,7 +561,7 @@ class Database:
     # ---------- follow-ups ----------
 
     def due_for_followup(self, after_days: int, max_total_sends: int,
-                         limit: int = 50) -> list[sqlite3.Row]:
+                         limit: int | None = 50) -> list[sqlite3.Row]:
         """Contacts who were written to, never answered, and are due a nudge.
 
         Anyone who replied, bounced or opted out is excluded by the status and
@@ -581,7 +582,9 @@ class Database:
                         WHERE s3.contact_id = c.id AND s3.status = 'sent'
                         ORDER BY s3.id LIMIT 1) AS first_subject
                FROM contacts c
-               JOIN sends s ON s.contact_id = c.id AND s.status = 'sent'
+               -- A "sending" row is an attempt whose outcome was never
+               -- recorded; it counts, so the bump is never repeated.
+               JOIN sends s ON s.contact_id = c.id AND s.status IN ('sent', 'sending')
                LEFT JOIN companies co ON co.id = c.company_id
                WHERE c.status = ?
                  AND c.email NOT IN (SELECT email FROM suppression)
@@ -595,7 +598,7 @@ class Database:
                GROUP BY c.id
                HAVING COUNT(s.id) < ? AND MAX(s.sent_at) <= ?
                ORDER BY MAX(s.sent_at) LIMIT ?""",
-            (SENT, REPLIED, max_total_sends, cutoff, limit),
+            (SENT, REPLIED, max_total_sends, cutoff, -1 if limit is None else limit),
         ).fetchall()
 
     # ---------- sends ----------
@@ -617,9 +620,41 @@ class Database:
             )
         self.conn.commit()
 
+    def begin_send(self, contact_id: int, email: str, subject: str,
+                   local_date: str) -> int:
+        """Record an attempt, committed, before the message leaves.
+
+        If the write after SMTP accepts the message fails (a full disk, a
+        lock held past the timeout), this row is what stops the next tick
+        mailing the same person again: "sending" counts as mailed wherever
+        a prior send is checked. Unknown outcome means never resend.
+        """
+        cur = self.conn.execute(
+            """INSERT INTO sends
+               (contact_id, email, subject, message_id, backend, status, error,
+                sent_at, local_date)
+               VALUES (?,?,?,'','','sending','',?,?)""",
+            (contact_id, email.lower(), subject, _now(), local_date),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def finish_send(self, send_id: int, contact_id: int, message_id: str,
+                    backend: str, ok: bool, error: str = "") -> None:
+        self.conn.execute(
+            "UPDATE sends SET message_id = ?, backend = ?, status = ?, error = ?, "
+            "sent_at = ? WHERE id = ?",
+            (message_id, backend, "sent" if ok else "failed", error, _now(), send_id),
+        )
+        if ok:
+            self.conn.execute(
+                "UPDATE contacts SET status = ? WHERE id = ?", (SENT, contact_id))
+        self.conn.commit()
+
     def sent_count_on(self, local_date: str) -> int:
         row = self.conn.execute(
-            "SELECT COUNT(*) AS n FROM sends WHERE local_date = ? AND status = 'sent'",
+            "SELECT COUNT(*) AS n FROM sends WHERE local_date = ? "
+            "AND status IN ('sent', 'sending')",
             (local_date,),
         ).fetchone()
         return int(row["n"])
@@ -640,29 +675,62 @@ class Database:
 
     def recent_bounce_pct(self, window: int = 100,
                           before_local_date: str = "") -> float:
-        """Bounce rate over the most recent `window` sends, as a percentage.
+        """Recurrable bounce rate over the most recent `window` sends, as a
+        percentage.
 
         The inbox scan records a bounce on the contact rather than on the
         send row, so this joins back to contacts to count them.
+
+        Only bounces whose class of address the gates would still mail today
+        are counted: a personal mailbox that is verified, or catch-all with
+        trusted provenance. A bounce from a class the gates now refuse cannot
+        happen again, so holding the cap for it protects nothing; in October
+        that kept the ramp at the floor for weeks after the cause was fixed.
+        A bounce from a class still being sent to predicts more like it and
+        keeps holding. The check uses the same functions the send path does,
+        so loosening a gate automatically brings its bounces back into the
+        count. Bounced contacts are excluded from reprobing, which means
+        their verify_status still says what it said when the send was allowed.
 
         With `before_local_date`, only sends from earlier days count, so the
         figure holds still for the whole of that day. Counting today's sends
         let each clean delivery dilute the rate under the limit and lift the
         hold mid-morning: one day went 18 out against a cap of 8.
         """
-        row = self.conn.execute(
-            """SELECT COUNT(*) AS total,
-                      SUM(CASE WHEN c.status = ? THEN 1 ELSE 0 END) AS bounced
+        rows = self.conn.execute(
+            """SELECT c.email, c.status, c.verify_status, c.provenance
                FROM (SELECT contact_id FROM sends
                      WHERE status = 'sent' AND (? = '' OR local_date < ?)
                      ORDER BY id DESC LIMIT ?) s
                JOIN contacts c ON c.id = s.contact_id""",
-            (BOUNCED, before_local_date, before_local_date, max(1, window)),
-        ).fetchone()
-        total = int(row["total"] or 0)
-        if not total:
+            (before_local_date, before_local_date, max(1, window)),
+        ).fetchall()
+        if not rows:
             return 0.0
-        return 100.0 * int(row["bounced"] or 0) / total
+        recurrable = sum(
+            1 for r in rows
+            if r["status"] == BOUNCED
+            and sendable_address_class(
+                r["email"], r["verify_status"], r["provenance"])
+        )
+        return 100.0 * recurrable / len(rows)
+
+    def max_daily_sends(self, days: int = 3, before_local_date: str = "") -> int:
+        """The busiest of the last `days` days actually sent on.
+
+        Feeds the ramp's growth limiter: how much volume this address has
+        recently proven it can carry. Counted over send days rather than
+        calendar days so a weekend or an outage does not shrink it.
+        """
+        row = self.conn.execute(
+            """SELECT MAX(n) FROM (
+                 SELECT COUNT(*) AS n FROM sends
+                 WHERE status = 'sent' AND (? = '' OR local_date < ?)
+                 GROUP BY local_date
+                 ORDER BY local_date DESC LIMIT ?)""",
+            (before_local_date, before_local_date, max(1, days)),
+        ).fetchone()
+        return int(row[0] or 0)
 
     def bounces_on(self, local_date: str) -> tuple[int, list[sqlite3.Row]]:
         """How many went out on a day, and which of them have since bounced.
@@ -718,6 +786,16 @@ class Database:
             f"""SELECT c.* FROM sends s JOIN contacts c ON c.id = s.contact_id
                 WHERE s.message_id IN ({marks}) LIMIT 1""",
             ids,
+        ).fetchone()
+
+    def last_contacted_at_domain(self, domain: str) -> Optional[sqlite3.Row]:
+        """The person most recently written to at this mail domain, if any."""
+        return self.conn.execute(
+            """SELECT c.* FROM sends s JOIN contacts c ON c.id = s.contact_id
+               WHERE s.status = 'sent'
+                 AND substr(c.email, instr(c.email, '@') + 1) = ?
+               ORDER BY s.id DESC LIMIT 1""",
+            (domain.lower(),),
         ).fetchone()
 
     # ---------- domain cache ----------

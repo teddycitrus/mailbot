@@ -225,16 +225,23 @@ sequenceDiagram
     Ver-->>DB: contact, verify_status=verified
     Build->>DB: draft queued
     Tick->>DB: can_send_to passes
+    Tick->>DB: attempt recorded as sending
     Tick->>MX: send in the recipient's morning
-    Note over Tick,DB: send logged; the address is never mailed first-touch again
+    Tick->>DB: attempt marked sent or failed
+    Note over Tick,DB: the address is never mailed first-touch again, even if the last write failed
 ```
 
 Every send passes these checks, in order, in `Database.can_send_to`:
 
 1. The address is a person's mailbox, not a shared inbox or a blocked domain.
-2. It is not on the suppression list (opt-outs, hard bounces).
+2. It is not on the suppression list (opt-outs, hard bounces). An opt-out is
+   recognised from the person mailed, from anyone answering in our thread,
+   and from a colleague writing fresh from the same company domain (never a
+   mailing list or a free-mail host). Any of them closes the company.
 3. The contact has not already been sent to, replied or bounced.
-4. The send log has no earlier successful send to it.
+4. The send log has no earlier successful send to it, nor an attempt whose
+   outcome was never recorded. Each send is logged as `sending` before the
+   message leaves and updated after, so a failed write cannot cause a repeat.
 5. Its `verify_status` is `verified` (the mailbox itself accepted an SMTP RCPT),
    or it is `catchall` with a trusted `provenance`: `hn_post`,
    `founder_published`, `git_commit` or `house_pattern`.
@@ -432,11 +439,22 @@ three ways, because the thing being reported on may be the thing that is
 broken: an email, a desktop notification raised from the exit code, and
 `logs/ALERT.txt` on disk.
 
+The same run checks the warmup ramp. A day held at `SEND_RAMP_START` by the
+bounce brake is a warning; three send days in a row is a failure and an
+email, because from 2026-10-21 the cap sat at the floor for two weeks while
+every check said all good. It also fails on a weekday that sent nothing while
+drafts waited, and on a week that added fewer sendable named people than one
+day's `DAILY_SEND_LIMIT`, since a broken parser shows up as a trickle rather
+than an error.
+
 `mailbot-bounce` runs fifteen minutes after the last send tick and judges the
 day on its own. The warmup ramp already brakes on bounces, but it reads the
-last hundred sends: two bounces in twenty-one is 9.5% for the day and moves a
-hundred-send average by two points, so the brake stays off and a bad morning
-looks identical to a good one. This mails you when a single day crosses
+last hundred sends and counts only bounces whose class of address the gates
+would still mail (a bounce from a class they now refuse cannot recur): two
+bounces in twenty-one is 9.5% for the day and moves a hundred-send average by
+two points, so the brake stays off and a bad morning looks identical to a
+good one. This daily check counts every bounce whatever its class, because
+the question is whether today went wrong. It mails you when a single day crosses
 `DAILY_BOUNCE_ALERT_PCT`, and names what each bounced address was believed to
 be worth when it was drafted, because a verdict reading "no SMTP answer" means
 that address was never actually proved. Once probing is healthy again, `mailbot reverify`

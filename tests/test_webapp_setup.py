@@ -93,3 +93,15 @@ def test_a_sibling_directory_cannot_be_served(tmp_path):
     assert not sibling.is_relative_to(root)
     assert (root / "app.js").resolve().is_relative_to(root)
 
+
+
+def test_a_carriage_return_cannot_smuggle_a_key_into_env(install):
+    """read_env splits on any line break, \r included; only \n was stripped.
+
+    A value carrying \r wrote one line that read back as two, setting a key
+    the form is not allowed to touch.
+    """
+    webapp.apply_setup({"FROM_NAME": "John\rDRY_RUN=false\r\nDB_PATH=x.db"})
+    env = webapp.read_env()
+    assert "DRY_RUN" not in env and "DB_PATH" not in env
+    assert env["FROM_NAME"].startswith("John")

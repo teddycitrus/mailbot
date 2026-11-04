@@ -10,6 +10,7 @@ from __future__ import annotations
 import imaplib
 import smtplib
 import time
+from collections import Counter
 from pathlib import Path
 
 from .config import Settings
@@ -476,6 +477,7 @@ class Pipeline:
         return settings.daily_cap(
             self.db.active_send_days(today),
             self.db.recent_bounce_pct(before_local_date=today),
+            self.db.max_daily_sends(before_local_date=today),
         )
 
     def followup(self, limit: int, ignore_window: bool = False) -> int:
@@ -524,9 +526,11 @@ class Pipeline:
             print(f"followup: daily cap reached ({already}/{cap}, {why_cap})")
             return 0
 
+        # Every due row, not a slice: refused ones are never cleared and sort
+        # oldest first, so a fixed slice filled with them and starved the rest.
         due = self.db.due_for_followup(
             settings.followup_after_days, settings.followup_max_total_sends,
-            limit=max(limit * 5, 50),
+            limit=None,
         )
         if not due:
             print("followup: nobody due")
@@ -542,6 +546,9 @@ class Pipeline:
             return 0
 
         sent = 0
+        # Refused rows stay due forever and every tick walks all of them, so
+        # they are counted by reason rather than printed one line each.
+        refused: Counter = Counter()
         backend = make_backend(settings)
         try:
             with backend:
@@ -550,7 +557,7 @@ class Pipeline:
                         break
                     allowed, why = self.db.can_send_to_again(row["email"])
                     if not allowed:
-                        print(f"  skip {row['email']}: {why}")
+                        refused[why] += 1
                         continue
                     if settings.per_recipient_timezone and not ignore_window:
                         open_now, where = local_window_open(
@@ -564,7 +571,7 @@ class Pipeline:
                     # twice drew opt-outs, never answers.
                     first = (row["first_name"] or "").strip()
                     if not first:
-                        print(f"  skip {row['email']}: no person's name to follow up with")
+                        refused["no person's name to follow up with"] += 1
                         continue
                     subject, body = template.render({
                         "first_name": first,
@@ -589,12 +596,10 @@ class Pipeline:
                         print(f"{BAR}\nFOLLOWUP (dry run) to {row['email']}\n"
                               f"Subject: {subject}\n\n{body}")
                         continue
+                    attempt = self.db.begin_send(row["id"], row["email"], subject, today)
                     result = backend.send(message)
-                    self.db.record_send(
-                        row["id"], row["email"], subject, result.message_id,
-                        result.backend, today,
-                        "sent" if result.ok else "failed", result.error,
-                    )
+                    self.db.finish_send(attempt, row["id"], result.message_id,
+                                        result.backend, result.ok, result.error)
                     if result.ok:
                         sent += 1
                         print(f"  followed up {row['email']} ({row['company_name']})")
@@ -611,6 +616,9 @@ class Pipeline:
         except (smtplib.SMTPException, OSError) as exc:
             print(f"followup: could not reach {settings.smtp_host}: {exc}")
             return 0
+        if refused:
+            print("followup: skipped " + ", ".join(
+                f"{n} {why}" for why, n in refused.most_common()))
         print(f"followup: {sent} sent, {len(due)} were due")
         return sent
 
@@ -681,9 +689,9 @@ class Pipeline:
             print(f"send: daily cap reached ({already}/{cap}, {why_cap})")
             return 0
 
-        # Pull more than the budget so recipients outside their local morning
-        # can be skipped without starving the run.
-        pool = self.db.queued_drafts(limit=max(limit * 5, 50))
+        # The whole queue, filtered by window below. A slice of the top ranks
+        # could be all one timezone and leave another zone's tick empty.
+        pool = self.db.queued_drafts(limit=None)
         if not pool:
             print("send: nothing queued")
             return 0
@@ -775,12 +783,11 @@ class Pipeline:
                     continue
                 if note:
                     print(f"  {draft['email']}: {note}, using the resume link")
+                attempt = self.db.begin_send(
+                    draft["contact_id"], draft["email"], draft["subject"], today)
                 result = backend.send(message)
-                self.db.record_send(
-                    draft["contact_id"], draft["email"], draft["subject"],
-                    result.message_id, result.backend, today,
-                    "sent" if result.ok else "failed", result.error,
-                )
+                self.db.finish_send(attempt, draft["contact_id"], result.message_id,
+                                    result.backend, result.ok, result.error)
                 self.db.mark_draft(draft["id"], "sent" if result.ok else "failed")
                 if result.ok:
                     sent += 1

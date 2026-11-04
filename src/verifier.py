@@ -37,7 +37,7 @@ except ImportError:  # pragma: no cover - dnspython is in requirements
 
 from .models import (
     CATCHALL, NO_MX, ROLE_LOCALS, SRC_SCRAPED, UNDELIVERABLE, UNVERIFIED,
-    VERIFIED,
+    VERIFIED, deliverable,
 )
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
@@ -131,6 +131,18 @@ def is_personal_mailbox(email: str) -> bool:
     later send. They are refused outright rather than ranked last.
     """
     return not (is_role_account(email) or is_never_send(email))
+
+
+def sendable_address_class(email: str, verify_status: str, provenance: str) -> bool:
+    """Whether the send gates would mail an address of this class today.
+
+    The address-quality half of Database.can_send_to: a personal mailbox
+    that is verified, or on a catch-all domain, from a trusted source. The
+    ramp's bounce discount and the scorecard's gate replay both call this,
+    so neither can drift from what the send path actually enforces; a gate
+    change here or in deliverable() reaches all three at once.
+    """
+    return is_personal_mailbox(email) and deliverable(verify_status, provenance)
 
 
 # Tokens that mark a mailbox as functional rather than personal, matched as

@@ -13,13 +13,15 @@ import smtplib
 import socket
 import ssl
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 
 import requests
 
 from .config import ConfigError, Settings
 from .database import Database
-from .emailer import load_template, unedited_markers, validate_template
+from .emailer import load_template, local_date, unedited_markers, validate_template
+from .verifier import sendable_address_class
 
 OK, WARN, FAIL = "ok", "warn", "FAIL"
 
@@ -223,6 +225,95 @@ def _queue(settings, db) -> Check:
     return Check("queue", OK, f"{queued} queued, {pool} companies still to enrich")
 
 
+def _send_ramp(settings, db, today: str) -> Check:
+    """Is the bounce hold cutting volume, and for how long?
+
+    From 2026-10-21 the cap sat at the floor for two weeks, a third of the
+    usual volume, while every morning's check said all good. A hold is the
+    ramp doing its job for a day; three send days in a row means a class of
+    address that is still being mailed keeps bouncing, and someone should
+    look at bounce-report rather than wait.
+    """
+    if not getattr(settings, "send_ramp_enabled", False):
+        return Check("send ramp", OK, "ramp off")
+
+    def cap_on(day: str) -> tuple[int, str]:
+        return settings.daily_cap(
+            db.active_send_days(day),
+            db.recent_bounce_pct(before_local_date=day),
+            db.max_daily_sends(before_local_date=day))
+
+    cap, why = cap_on(today)
+    if not why.startswith("held"):
+        return Check("send ramp", OK, why)
+    earlier = [r[0] for r in db.conn.execute(
+        """SELECT DISTINCT local_date FROM sends
+           WHERE status = 'sent' AND local_date < ?
+           ORDER BY local_date DESC LIMIT 5""", (today,))]
+    held = 1
+    for day in earlier:
+        if not cap_on(day)[1].startswith("held"):
+            break
+        held += 1
+    if held >= 3:
+        span = f"at least {held}" if held > len(earlier) else str(held)
+        return Check("send ramp", FAIL,
+                     f"{why} for {span} send days in a row; "
+                     "run 'mailbot bounce-report' to see which addresses")
+    return Check("send ramp", WARN, why)
+
+
+def _last_weekday_sent(db, today: str) -> Check:
+    """Did anything go out on the last weekday, given there was mail to send?
+
+    A timer that stopped firing, a lock that never cleared, or every draft
+    failing a gate all look the same from here: a quiet day. Each tick logs
+    its reason, but nobody reads the tick log of a day nothing happened.
+    """
+    day = date.fromisoformat(today) - timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    sent = db.sent_count_on(day.isoformat())
+    # Only drafts that were already waiting that day; a queue refilled
+    # overnight says nothing about why the day itself was quiet.
+    queued = db.conn.execute(
+        """SELECT COUNT(*) FROM drafts d JOIN contacts c ON c.id = d.contact_id
+           WHERE d.status = 'queued' AND c.status = 'queued'
+             AND d.created_at < ?""",
+        ((day + timedelta(days=1)).isoformat(),)).fetchone()[0]
+    if sent == 0 and queued > 0:
+        return Check("sends yesterday", FAIL,
+                     f"nothing sent on {day.isoformat()} with {queued} drafts "
+                     "queued; check that day's send log and the tick timer")
+    return Check("sends yesterday", OK, f"{sent} sent on {day.isoformat()}")
+
+
+def _intake(settings, db, today: str) -> Check:
+    """How many sendable named people arrived in the last seven days.
+
+    A broken parser does not raise; it adds fewer people. When YC moved its
+    founder list into page JSON, intake fell to a handful a week for weeks
+    and the queue only looked healthy because the bounce hold was spending
+    it slowly. Measured against DAILY_SEND_LIMIT: under one day's sends in a
+    week is a failure, under three days' a warning.
+    """
+    start = (date.fromisoformat(today) - timedelta(days=7)).isoformat()
+    rows = db.conn.execute(
+        """SELECT email, verify_status, provenance FROM contacts
+           WHERE created_at >= ? AND created_at < ? AND TRIM(first_name) <> ''""",
+        (start, today)).fetchall()
+    n = sum(1 for r in rows
+            if sendable_address_class(r["email"], r["verify_status"], r["provenance"]))
+    limit = settings.daily_send_limit
+    detail = f"{n} sendable people added in the last 7 days"
+    if n < limit:
+        return Check("intake", FAIL, f"{detail}, under one day's limit of {limit}; "
+                     "a source or parser may have stopped yielding (see the build log)")
+    if n < 3 * limit:
+        return Check("intake", WARN, f"{detail}, under three days' sends")
+    return Check("intake", OK, detail)
+
+
 def _verification(db) -> Check:
     """Is the prober proving anything, or only recording its own failures?
 
@@ -312,6 +403,11 @@ def run_checks(settings: Settings) -> list[Check]:
     try:
         db = Database(settings.db_path)
         checks.append(_queue(settings, db))
+        today = local_date(settings.send_timezone)
+        checks.append(_send_ramp(settings, db, today))
+        if not settings.dry_run:
+            checks.append(_last_weekday_sent(db, today))
+        checks.append(_intake(settings, db, today))
         checks.append(_verification(db))
         db.close()
     except Exception as exc:

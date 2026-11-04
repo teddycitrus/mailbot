@@ -145,6 +145,37 @@ def test_parses_founders_from_the_embedded_page_json():
     assert "caleb-peffer" in people[0].linkedin
 
 
+def test_a_role_title_where_a_name_belongs_is_not_a_founder():
+    """A page that puts "Founder/CEO" in the name slot must yield nobody.
+
+    One of these got through, was turned into founderceo@ by the house
+    pattern, was greeted as "Hi Founder/CEO" and bounced.
+    """
+    page = {"props": {"company": {"founders": [
+        {"full_name": "Founder/CEO", "title": "", "is_active": True},
+        {"full_name": "Co-Founder & CTO", "title": "", "is_active": True},
+        {"full_name": "CEO", "title": "", "is_active": True},
+    ]}}}
+    html = f"<html><body><div data-page='{json.dumps(page)}'></div></body></html>"
+    assert parse_yc_founders(html) == []
+
+
+def test_names_with_digits_or_sign_punctuation_are_not_founders():
+    page = {"props": {"company": {"founders": [
+        {"full_name": "Agent 47", "title": "", "is_active": True},
+        {"full_name": "Jane@Acme", "title": "", "is_active": True},
+    ]}}}
+    html = f"<html><body><div data-page='{json.dumps(page)}'></div></body></html>"
+    assert parse_yc_founders(html) == []
+
+
+def test_real_names_still_pass_the_name_gate():
+    from src.scraper import _looks_like_name
+    for name in ("Jane Smith", "Jean-Luc Picard", "Maceo Mark",
+                 "Shaun O'Brien", "Jose Garcia", "Ada", "J. K. Rowling"):
+        assert _looks_like_name(name), name
+
+
 def test_robots_is_read_with_our_own_user_agent():
     # Bot firewalls 403 urllib's default agent; the real file allows everyone.
     from src.scraper import Fetcher

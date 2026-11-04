@@ -166,6 +166,17 @@ def test_followup_due_after_the_waiting_period(db, company_id):
     assert [r["email"] for r in db.due_for_followup(6, 2)] == ["a@acme.ai"]
 
 
+def test_no_limit_returns_every_due_followup_and_draft(db, company_id):
+    for i in range(60):
+        cid = db.upsert_contact(Contact(email=f"p{i}@acme.ai", company_id=company_id))
+        _sent_days_ago(db, cid, f"p{i}@acme.ai", days=7)
+        q = db.upsert_contact(Contact(email=f"q{i}@acme.ai", company_id=company_id))
+        db.queue_draft(q, "s", "b")
+    assert len(db.due_for_followup(6, 2, limit=None)) == 60
+    assert len(db.due_for_followup(6, 2)) == 50
+    assert len(db.queued_drafts(limit=None)) == 60
+
+
 def test_followup_not_due_before_the_waiting_period(db, company_id):
     cid = db.upsert_contact(Contact(email="a@acme.ai", company_id=company_id))
     _sent_days_ago(db, cid, "a@acme.ai", days=2)
