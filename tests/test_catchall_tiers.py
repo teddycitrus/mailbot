@@ -84,6 +84,9 @@ class DB:
     def company_closed(self, _c, _provenance=""):
         return ""
 
+    def company_key(self, company_id):
+        return company_id
+
     def mark_draft(self, *_a):
         raise AssertionError("a held draft must stay queued")
 

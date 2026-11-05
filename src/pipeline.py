@@ -920,10 +920,12 @@ class Pipeline:
                 if not self.settings.dry_run:
                     self.db.mark_draft(draft["id"], "skipped")
                 continue
-            if company in seen:
+            # One key per real company, however many rows it has.
+            key = self.db.company_key(company)
+            if key in seen:
                 held.append((draft, "colleague mailed today"))
                 continue
-            seen.add(company)
+            seen.add(key)
             ready.append(draft)
         return ready, held
 

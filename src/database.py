@@ -248,10 +248,17 @@ class Database:
         self.conn.commit()
 
     def upsert_company(self, c: Company) -> int:
-        """Insert, or return the existing id. Domain is the identity key."""
+        """Insert, or return the existing id. Domain is the identity key, and
+        a YC page already on file is too: a company that changed domain kept
+        its YC page, and adding it again under the new domain wrote to its
+        founders twice."""
         row = self.conn.execute(
             "SELECT id FROM companies WHERE domain = ?", (c.domain,)
         ).fetchone()
+        if row is None and c.yc_url:
+            row = self.conn.execute(
+                "SELECT id FROM companies WHERE yc_url = ? ORDER BY id LIMIT 1",
+                (c.yc_url,)).fetchone()
         if row:
             return int(row["id"])
         cur = self.conn.execute(
@@ -384,6 +391,55 @@ class Database:
             (status, limit),
         ).fetchall()
 
+    def company_family(self, company_id: int) -> list[int]:
+        """This company and any other row for it: same YC page, other domain.
+
+        Older databases hold 17 such pairs, added before upsert_company knew
+        to look. Every per-company rule reads the family, so a reply, an
+        opt-out, the daily spacing and the per-company cap all span both.
+        """
+        rows = self.conn.execute(
+            """SELECT o.id FROM companies c JOIN companies o
+                 ON o.id = c.id OR (c.yc_url <> '' AND o.yc_url = c.yc_url)
+               WHERE c.id = ? ORDER BY o.id""", (company_id,)).fetchall()
+        return [int(r[0]) for r in rows] or [company_id]
+
+    def company_key(self, company_id: int) -> int:
+        """One id per real company: the oldest row in its family."""
+        return self.company_family(company_id)[0]
+
+    def _family_marks(self, company_id: int) -> tuple[str, list[int]]:
+        family = self.company_family(company_id)
+        return ",".join("?" for _ in family), family
+
+    def same_person_elsewhere(self, email: str) -> str:
+        """Another address for this contact's person, already in play, or "".
+
+        The same full name at another row of the same company is one person
+        written to twice. The earlier row wins: a later one is refused while
+        the earlier is queued, sent, answered or closed.
+        """
+        row = self.conn.execute(
+            "SELECT id, company_id, first_name, last_name FROM contacts WHERE email = ?",
+            (email.lower().strip(),)).fetchone()
+        if (row is None or row["company_id"] is None
+                or not (row["first_name"] or "").strip()
+                or not (row["last_name"] or "").strip()):
+            return ""
+        marks, family = self._family_marks(row["company_id"])
+        if len(family) < 2:
+            return ""
+        other = self.conn.execute(
+            f"""SELECT email FROM contacts
+                WHERE company_id IN ({marks}) AND id <> ?
+                  AND lower(first_name) = lower(?) AND lower(last_name) = lower(?)
+                  AND (status IN (?,?,?,?) OR (status IN (?,?) AND id < ?))
+                ORDER BY id LIMIT 1""",
+            (*family, row["id"], row["first_name"], row["last_name"],
+             SENT, REPLIED, BOUNCED, SUPPRESSED, PENDING, QUEUED, row["id"]),
+        ).fetchone()
+        return other["email"] if other else ""
+
     def company_contacted_count(self, company_id: int, provenance: str = "") -> int:
         """People at this company already written to or waiting in the queue.
 
@@ -392,12 +448,13 @@ class Database:
         """
         skip_failed = provenance == PROV_GUESS_RETRY
         marks = ",".join("?" for _ in GUESS_PROVENANCE)
+        fam_marks, family = self._family_marks(company_id)
         return int(self.conn.execute(
-            """SELECT COUNT(*) FROM contacts
-               WHERE company_id = ? AND status IN (?,?,?,?)"""
+            f"""SELECT COUNT(*) FROM contacts
+               WHERE company_id IN ({fam_marks}) AND status IN (?,?,?,?)"""
             + (f" AND NOT (status = ? AND provenance IN ({marks})"
                " AND verify_status = 'catchall' AND lane = 'volume')" if skip_failed else ""),
-            (company_id, SENT, REPLIED, BOUNCED, QUEUED)
+            (*family, SENT, REPLIED, BOUNCED, QUEUED)
             + ((BOUNCED, *GUESS_PROVENANCE) if skip_failed else ()),
         ).fetchone()[0])
 
@@ -414,13 +471,14 @@ class Database:
         exactly what the retry corrects, so that bounce does not close the
         company to it. A reply or an opt-out still does.
         """
+        fam_marks, family = self._family_marks(company_id)
         rows = self.conn.execute(
-            """SELECT c.status, c.provenance, c.verify_status, c.lane, s.reason
+            f"""SELECT c.status, c.provenance, c.verify_status, c.lane, s.reason
                FROM contacts c
                LEFT JOIN suppression s ON s.email = c.email
-               WHERE c.company_id = ?
+               WHERE c.company_id IN ({fam_marks})
                  AND (c.status = ? OR s.reason IN ('opt-out reply', 'hard bounce'))""",
-            (company_id, REPLIED),
+            (*family, REPLIED),
         ).fetchall()
         if any(row["status"] == REPLIED for row in rows):
             return "someone there already replied"
@@ -478,8 +536,9 @@ class Database:
         ).fetchall()
 
     def companies_sent_on(self, local_date: str) -> set[int]:
-        """Companies that got a first email on this date."""
-        return {r[0] for r in self.conn.execute(
+        """Companies that got a first email on this date, as company_key ids,
+        so two rows of one company count as the same company."""
+        return {self.company_key(r[0]) for r in self.conn.execute(
             """SELECT DISTINCT c.company_id FROM sends s
                JOIN contacts c ON c.id = s.contact_id
                WHERE s.local_date = ? AND s.status IN ('sent', 'sending')
@@ -515,6 +574,9 @@ class Database:
         ).fetchone()
         if prior:
             return False, "already in send log"
+        twin = self.same_person_elsewhere(email)
+        if twin:
+            return False, f"same person as {twin}"
         # A stored contact is mailed only once its own mailbox accepted an SMTP
         # RCPT, or, on a catch-all domain, when it came from a trusted source.
         # An address with no row yet is being vetted by enrich, which applies

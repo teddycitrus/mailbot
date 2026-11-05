@@ -66,6 +66,9 @@ class PoolDB:
     def company_closed(self, company_id, provenance=""):
         return self.closed_companies.get(company_id, "")
 
+    def company_key(self, company_id):
+        return company_id
+
     def mark_draft(self, draft_id, status):
         pass
 
