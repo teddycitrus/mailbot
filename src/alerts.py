@@ -194,7 +194,9 @@ class BounceReport:
 
     @property
     def over(self) -> bool:
-        return bool(self.bounced) and not self.too_few and self.pct > self.threshold
+        # a threshold of 0 turns the alert off
+        return (self.threshold > 0 and bool(self.bounced) and not self.too_few
+                and self.pct > self.threshold)
 
 
 def _bounce_body(report: BounceReport, settings: Settings) -> str:
@@ -263,8 +265,9 @@ def bounce_check(settings: Settings, db: Database, day: str = "",
 
 def print_bounce_report(report: BounceReport) -> None:
     rate = f"{report.pct:.1f}%"
+    line = f"alerting above {report.threshold}%" if report.threshold > 0 else "alert off"
     print(f"bounce check {report.day}: {len(report.bounced)}/{report.sent} "
-          f"bounced = {rate} (alerting above {report.threshold}%)")
+          f"bounced = {rate} ({line})")
     for row in report.bounced:
         print(f"  {row['email']}  conf {row['confidence']}  "
               f"{row['verify_detail'][:52]}")

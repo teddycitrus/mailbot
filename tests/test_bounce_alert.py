@@ -107,6 +107,13 @@ def test_exactly_at_the_threshold_does_not_alarm(db):
     assert report.pct == 15.0 and not report.over
 
 
+def test_a_zero_threshold_turns_the_alert_off(db):
+    for i in range(4):
+        send(db, f"dead{i}@acme.ai", bounced=True)
+    report = bounce_check(settings(pct=0), db, DAY, notify=False)
+    assert report.pct == 100.0 and not report.over
+
+
 def test_another_days_bounces_do_not_count_against_this_one(db):
     """Attribution is by the day the message went out, not the day it failed."""
     for i in range(10):

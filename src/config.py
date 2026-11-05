@@ -397,7 +397,8 @@ class Settings:
         # Climbing while mail is bouncing is what gets an address blocked, so
         # fall back to the opening step until the bounce rate recovers. Only
         # bounces that can recur count (see Database.recent_bounce_pct).
-        if bounce_pct > self.send_ramp_max_bounce_pct:
+        # 0 turns the brake off.
+        if self.send_ramp_max_bounce_pct and bounce_pct > self.send_ramp_max_bounce_pct:
             held = max(0, min(cap, self.send_ramp_start))
             return held, (f"held at {held}, recurrable bounce rate "
                           f"{bounce_pct:.1f}% over {self.send_ramp_max_bounce_pct}%")

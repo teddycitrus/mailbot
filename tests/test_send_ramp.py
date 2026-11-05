@@ -87,6 +87,13 @@ def test_bounce_rate_on_the_threshold_does_not_trip_the_brake():
     assert cap == 25
 
 
+def test_a_zero_threshold_turns_the_brake_off():
+    """The volume lane sets 0: it keeps climbing whatever bounces."""
+    cap, why = settings(send_ramp_max_bounce_pct=0).daily_cap(active_days=20, bounce_pct=60.0)
+    assert cap == 25
+    assert "held" not in why
+
+
 # ---------------------------------------------------------- the growth limiter
 
 def test_volume_at_most_doubles_day_over_day():
