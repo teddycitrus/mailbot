@@ -243,6 +243,10 @@ class Settings:
     # The volume lane's own brake on those guesses: above this recent bounce
     # rate, or above it today with two or more bounced, they wait.
     guess_max_bounce_pct: int = 6
+    # Days after a guess hard-bounces before that person's next permutation
+    # is made, so the domain is not hit again at once and colleagues' late
+    # notices have arrived. See Pipeline.retry_guesses.
+    guess_retry_after_days: int = 2
 
     @property
     def operator_email(self) -> str:
@@ -336,6 +340,7 @@ class Settings:
             followup_share_pct=min(100, max(0, _int("FOLLOWUP_SHARE_PCT", 33))),
             volume_guesses=_bool("VOLUME_GUESSES", False),
             guess_max_bounce_pct=max(0, _int("GUESS_MAX_BOUNCE_PCT", 6)),
+            guess_retry_after_days=max(0, _int("GUESS_RETRY_AFTER_DAYS", 2)),
         )
 
     def catchall_provenance(self, bounce_pct: float) -> tuple[frozenset, str]:

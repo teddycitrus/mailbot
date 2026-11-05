@@ -63,7 +63,7 @@ class PoolDB:
     def companies_sent_on(self, _date):
         return self.sent_companies
 
-    def company_closed(self, company_id):
+    def company_closed(self, company_id, provenance=""):
         return self.closed_companies.get(company_id, "")
 
     def mark_draft(self, draft_id, status):

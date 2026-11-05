@@ -39,6 +39,8 @@ Write-Mailbot vc       --limit 45
 # unless VOLUME_GUESSES is on.
 Write-Mailbot reopen-catchall --limit 20
 Write-Mailbot enrich   --limit 100
+# Next permutation for anyone whose guess hard-bounced, drafted just below.
+Write-Mailbot retry-guesses
 # Draft immediately, while the contacts this run just found are fresh, rather
 # than leaving it to the morning. By the time anyone is awake the queue is
 # already deep and already copied to Gmail Drafts, so the morning has nothing

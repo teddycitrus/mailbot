@@ -71,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
         "reopen-catchall",
         help="re-enrich companies parked as catch-all, for the volume lane's guesses")
     p.add_argument("--limit", type=int, default=20)
+    p = sub.add_parser(
+        "retry-guesses",
+        help="after a guess hard-bounces, make that person's next permutation")
+    p.add_argument("--after-days", type=int, default=None,
+                   help="minimum age of the bounce (default GUESS_RETRY_AFTER_DAYS)")
     p = sub.add_parser("import-apollo", help="load an Apollo contacts export (CSV)")
     p.add_argument("csv")
     p.add_argument("--any-size", action="store_true",
@@ -236,6 +241,8 @@ def main(argv: list[str] | None = None) -> int:
             pipeline.enrich(args.limit)
         elif args.command == "reopen-catchall":
             pipeline.reopen_catchall(args.limit)
+        elif args.command == "retry-guesses":
+            pipeline.retry_guesses(args.after_days)
         elif args.command == "import-apollo":
             pipeline.import_apollo(args.csv, any_size=args.any_size,
                                    dry_run=args.dry_run, limit=args.limit)

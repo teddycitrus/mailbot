@@ -14,8 +14,9 @@ from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 from .models import (
-    BOUNCED, CATCHALL, Company, Contact, ENRICHED, MAIN_LANE, NO_CONTACTS,
-    PENDING, QUEUED, REPLIED, SENT, SKIP_CATCHALL_UNPROVABLE, SKIP_MX_UNRESOLVED,
+    BOUNCED, CATCHALL, Company, Contact, ENRICHED, GUESS_PROVENANCE, MAIN_LANE,
+    NO_CONTACTS, PENDING, PROV_GUESS_RETRY, QUEUED, REPLIED, SENT,
+    SKIP_CATCHALL_UNPROVABLE, SKIP_MX_UNRESOLVED,
     SKIP_PROBE_UNAVAILABLE, SUPPRESSED, VERIFIED, lane_deliverable,
 )
 from .verifier import is_personal_mailbox, sendable_address_class
@@ -383,45 +384,86 @@ class Database:
             (status, limit),
         ).fetchall()
 
-    def company_contacted_count(self, company_id: int) -> int:
-        """People at this company already written to or waiting in the queue."""
+    def company_contacted_count(self, company_id: int, provenance: str = "") -> int:
+        """People at this company already written to or waiting in the queue.
+
+        For a guess retry, a guess that bounced is not counted: the retry
+        takes that person's place rather than adding a person.
+        """
+        skip_failed = provenance == PROV_GUESS_RETRY
+        marks = ",".join("?" for _ in GUESS_PROVENANCE)
         return int(self.conn.execute(
             """SELECT COUNT(*) FROM contacts
-               WHERE company_id = ? AND status IN (?,?,?,?)""",
-            (company_id, SENT, REPLIED, BOUNCED, QUEUED),
+               WHERE company_id = ? AND status IN (?,?,?,?)"""
+            + (f" AND NOT (status = ? AND provenance IN ({marks}))" if skip_failed else ""),
+            (company_id, SENT, REPLIED, BOUNCED, QUEUED)
+            + ((BOUNCED, *GUESS_PROVENANCE) if skip_failed else ()),
         ).fetchone()[0])
 
-    def company_closed(self, company_id: int) -> str:
+    def company_closed(self, company_id: int, provenance: str = "") -> str:
         """Why nobody else at this company should be written to, or "".
 
         A reply means the conversation is happening; writing to a colleague
         after that reads as going around them. An opt-out or a hard bounce
         closes it too: the first is a no for the company, the second usually
         means the address pattern we used for everyone there is wrong.
+
+        Except for a guess retry, asked about with its `provenance`: a guess
+        that hard-bounced disproved one convention at the company, which is
+        exactly what the retry corrects, so that bounce does not close the
+        company to it. A reply or an opt-out still does.
         """
-        row = self.conn.execute(
-            """SELECT c.status, s.reason FROM contacts c
+        rows = self.conn.execute(
+            """SELECT c.status, c.provenance, s.reason FROM contacts c
                LEFT JOIN suppression s ON s.email = c.email
                WHERE c.company_id = ?
-                 AND (c.status = ? OR s.reason IN ('opt-out reply', 'hard bounce'))
-               LIMIT 1""",
+                 AND (c.status = ? OR s.reason IN ('opt-out reply', 'hard bounce'))""",
             (company_id, REPLIED),
-        ).fetchone()
-        if row is None:
-            return ""
-        if row["status"] == REPLIED:
+        ).fetchall()
+        if any(row["status"] == REPLIED for row in rows):
             return "someone there already replied"
-        return f"a colleague's {row['reason']}"
+        for row in rows:
+            if (provenance == PROV_GUESS_RETRY and row["reason"] == "hard bounce"
+                    and row["provenance"] in GUESS_PROVENANCE):
+                continue
+            return f"a colleague's {row['reason']}"
+        return ""
 
-    def company_slot(self, company_id: int, cap: int) -> tuple[bool, str]:
+    def company_slot(self, company_id: int, cap: int,
+                     provenance: str = "") -> tuple[bool, str]:
         """Whether one more person at this company may be queued."""
-        closed = self.company_closed(company_id)
+        closed = self.company_closed(company_id, provenance)
         if closed:
             return False, closed
-        have = self.company_contacted_count(company_id)
+        have = self.company_contacted_count(company_id, provenance)
         if have >= cap:
             return False, f"company already has {have} contacted"
         return True, ""
+
+    def guess_bounces(self, before: str) -> list[sqlite3.Row]:
+        """Volume-lane guesses that hard-bounced at or before `before` (UTC
+        ISO), oldest first: the ones whose convention is now disproved."""
+        marks = ",".join("?" for _ in GUESS_PROVENANCE)
+        return self.conn.execute(
+            f"""SELECT c.*, s.created_at AS bounced_at FROM contacts c
+                JOIN suppression s ON s.email = c.email
+                WHERE c.status = ? AND s.reason = 'hard bounce'
+                  AND c.provenance IN ({marks}) AND c.company_id IS NOT NULL
+                  AND s.created_at <= ?
+                ORDER BY s.created_at""",
+            (BOUNCED, *GUESS_PROVENANCE, before),
+        ).fetchall()
+
+    def guesses_at(self, company_id: int) -> list[sqlite3.Row]:
+        """Every guess and retry ever made at one company, oldest first."""
+        marks = ",".join("?" for _ in GUESS_PROVENANCE)
+        return self.conn.execute(
+            f"""SELECT c.*, co.domain AS company_domain FROM contacts c
+                JOIN companies co ON co.id = c.company_id
+                WHERE c.company_id = ? AND c.provenance IN ({marks})
+                ORDER BY c.id""",
+            (company_id, *GUESS_PROVENANCE),
+        ).fetchall()
 
     def companies_sent_on(self, local_date: str) -> set[int]:
         """Companies that got a first email on this date."""

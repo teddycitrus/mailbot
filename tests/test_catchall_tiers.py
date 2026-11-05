@@ -81,7 +81,7 @@ class DB:
     def companies_sent_on(self, _d):
         return set()
 
-    def company_closed(self, _c):
+    def company_closed(self, _c, _provenance=""):
         return ""
 
     def mark_draft(self, *_a):

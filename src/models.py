@@ -35,6 +35,7 @@ PROV_GIT_COMMIT = "git_commit"                # author address on the company's 
 PROV_HOUSE_PATTERN = "house_pattern"          # founder name + convention proven on the domain
 PROV_SITE = "site_unattributed"               # published on the site, tied to nobody
 PROV_GUESS = "guess"                          # a permutation of a founder's name
+PROV_GUESS_RETRY = "guess_retry"              # the next permutation, after a guess bounced
 PROV_APOLLO = "apollo"                        # from an Apollo export; see apollo.py
 # Sources good enough to send to on a catch-all domain. Unattributed site
 # addresses bounced 8 in 23 there; these bounced 4 in 75 between them.
@@ -67,7 +68,13 @@ VOLUME_LANE = "volume"
 # Catch-all addresses with no evidence behind them beyond a name and a
 # convention. Reserved for the volume lane, where a bad run costs a
 # throwaway account instead of the main one.
-VOLUME_PROVENANCE = frozenset({PROV_GUESS, PROV_APOLLO})
+VOLUME_PROVENANCE = frozenset({PROV_GUESS, PROV_GUESS_RETRY, PROV_APOLLO})
+# The two that are permutations of a name, which is what a retry works from.
+GUESS_PROVENANCE = frozenset({PROV_GUESS, PROV_GUESS_RETRY})
+# Addresses tried per person: the first guess, and one retry after it
+# hard-bounces. A bounce proves only that one convention is wrong there, so a
+# second try is worth one more bounce; a third would be spraying.
+GUESS_ATTEMPTS = 2
 
 
 def volume_tier(verify_status: str, provenance: str) -> bool:

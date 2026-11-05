@@ -13,6 +13,7 @@ import math
 import smtplib
 import time
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import Settings
@@ -32,10 +33,12 @@ from .github_source import GitHubClient
 from .hn_source import fetch_posts, fetch_recent_posts
 from .llm import Personalizer
 from .models import (
-    CATCHALL, Company, Contact, ENRICHED, MAIN_LANE, NO_CONTACTS, PENDING,
-    SKIP_CATCHALL_UNPROVABLE, SRC_SCRAPED, PROV_HN_POST, SKIP_NOT_VERIFIED,
-    TRUSTED_PROVENANCE, deliverable, lane_deliverable, volume_tier,
+    CATCHALL, Company, Contact, ENRICHED, GUESS_ATTEMPTS, MAIN_LANE, NO_CONTACTS,
+    PENDING, PROV_GUESS_RETRY, PROV_HN_POST, QUEUED, SKIP_CATCHALL_UNPROVABLE,
+    SKIP_NOT_VERIFIED, SRC_SCRAPED, SUPPRESSED, TRUSTED_PROVENANCE, VOLUME_LANE,
+    deliverable, lane_deliverable, volume_tier,
 )
+from . import patterns
 from . import priority as priority_list
 from .priority import from_settings as priority_set
 from .scraper import Fetcher
@@ -57,6 +60,10 @@ _PRIORITY_HEADER = """\
 # will work it out and write it back here, skipping any it cannot confirm.
 # Lines starting with # are ignored, so a name can be parked without deleting.
 """
+
+
+def _full_name(row) -> str:
+    return f"{row['first_name'] or ''} {row['last_name'] or ''}".strip()
 
 
 def _reserved_row(row) -> str:
@@ -386,6 +393,100 @@ class Pipeline:
               "companies back in the enrich queue")
         return reopened
 
+    def retry_guesses(self, after_days: int | None = None) -> int:
+        """After a guess hard-bounces, try that person's next permutation.
+
+        A hard bounce from a catch-all domain proves one thing: that
+        convention is wrong at that company. So each person whose guess
+        bounced gets the next most likely address, skipping every convention
+        disproved there, and any colleague still waiting on a disproved
+        convention is pulled and re-guessed before it bounces too. One retry
+        per person (GUESS_ATTEMPTS), never more, and only once the bounce is
+        GUESS_RETRY_AFTER_DAYS old, so the domain is not hit again the same
+        week and late notices for colleagues have landed. Retries are
+        ordinary volume-lane guesses after that: queued, spaced one per
+        company per day, and held by the guess brake.
+        """
+        settings = self.settings
+        if not getattr(settings, "volume_guesses", False):
+            print("retry-guesses: VOLUME_GUESSES is off, nothing to do")
+            return 0
+        days = (getattr(settings, "guess_retry_after_days", 2)
+                if after_days is None else after_days)
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(
+            timespec="seconds")
+        bounced = self.db.guess_bounces(cutoff)
+        if not bounced:
+            print(f"retry-guesses: no guess hard-bounced {days}+ day(s) ago")
+            return 0
+        created, pulled, rows = 0, 0, []
+        for company_id in dict.fromkeys(r["company_id"] for r in bounced):
+            guesses = self.db.guesses_at(company_id)
+            if not guesses:
+                continue
+            domain = guesses[0]["company_domain"]
+            label = domain.split(".")[0]
+
+            def pattern_of(row) -> str:
+                return patterns.detect(row["email"], _full_name(row), label)
+
+            dead = {r["email"] for r in bounced if r["company_id"] == company_id}
+            disproved = {pattern_of(r) for r in guesses if r["email"] in dead} - {""}
+            people: dict[tuple, list] = {}
+            for row in guesses:
+                key = ((row["first_name"] or "").lower(), (row["last_name"] or "").lower())
+                people.setdefault(key, []).append(row)
+            for tried in people.values():
+                if len(tried) >= GUESS_ATTEMPTS:
+                    continue
+                person = tried[0]
+                if person["email"] not in dead:
+                    # Not bounced yet, but built on a convention a colleague's
+                    # bounce just disproved: it would bounce too. A row we
+                    # pulled on an earlier pass is suppressed with no list
+                    # entry, so a run cut short picks up where it stopped.
+                    waiting = person["status"] in (PENDING, QUEUED) or (
+                        person["status"] == SUPPRESSED
+                        and not self.db.is_suppressed(person["email"]))
+                    if not waiting or pattern_of(person) not in disproved:
+                        continue
+                    if person["status"] != SUPPRESSED:
+                        self.db.drop_draft_for_contact(person["id"])
+                        self.db.set_contact_status(person["id"], SUPPRESSED)
+                        self.db.log("guess_disproved", person["email"],
+                                    f"{pattern_of(person)} bounced at {domain}")
+                        pulled += 1
+                        rows.append((person["email"], "pulled",
+                                     f"{pattern_of(person)} disproved at {domain}"))
+                taken = {r["email"] for r in tried}
+                retry = next((
+                    c for c in patterns.ordered_candidates(
+                        self.db, person["first_name"], person["last_name"], domain)
+                    if c not in taken
+                    and patterns.detect(c, _full_name(person), label) not in disproved
+                    and not is_never_send(c) and not is_role_account(c)
+                    and not self.db.contact_exists(c)), "")
+                if not retry or not self.db.can_send_to(retry, VOLUME_LANE)[0]:
+                    rows.append((person["email"], "no retry", "no untried convention left"))
+                    continue
+                self.db.upsert_contact(Contact(
+                    email=retry, company_id=company_id,
+                    first_name=person["first_name"], last_name=person["last_name"],
+                    role=person["role"], bio=person["bio"], linkedin=person["linkedin"],
+                    source=person["source"], verify_status=CATCHALL,
+                    verify_detail=(f"catch-all domain, retry after {person['email']} "
+                                   f"bounced ({', '.join(sorted(disproved))} disproved), "
+                                   "volume lane only"),
+                    confidence=max(0, person["confidence"] - 5), status=PENDING,
+                    provenance=PROV_GUESS_RETRY, lane=VOLUME_LANE,
+                ))
+                created += 1
+                rows.append((retry, "retry", f"instead of {person['email']}"))
+        print(f"retry-guesses: {created} retry address(es) made, {pulled} waiting "
+              "guess(es) pulled before they could bounce")
+        _print_table(rows, ("email", "state", "detail"))
+        return created
+
     def import_apollo(self, path: Path, any_size: bool = False,
                       dry_run: bool = False, limit: int = 0) -> int:
         """Load an Apollo contacts export. See apollo.py for the rules."""
@@ -466,7 +567,8 @@ class Pipeline:
                 continue
             if row["company_id"]:
                 open_, why = self.db.company_slot(
-                    row["company_id"], self.settings.max_contacts_per_company)
+                    row["company_id"], self.settings.max_contacts_per_company,
+                    row["provenance"] or "")
                 if not open_:
                     rows.append((row["email"], "skip", why))
                     continue
@@ -809,7 +911,10 @@ class Pipeline:
             if company is None:
                 ready.append(draft)
                 continue
-            closed = self.db.company_closed(company)
+            # Asked with the draft's provenance: a guess retry is the one
+            # draft a colleague's guess bounce does not close the company to.
+            closed = self.db.company_closed(
+                company, (draft["provenance"] if "provenance" in draft.keys() else "") or "")
             if closed:
                 held.append((draft, closed))
                 if not self.settings.dry_run:

@@ -77,6 +77,9 @@ case "$job" in
         # guesses. Does nothing unless VOLUME_GUESSES is on.
         run reopen-catchall --limit 20
         run enrich --limit 100
+        # Next permutation for anyone whose guess hard-bounced, so it is
+        # drafted below. Also a no-op unless VOLUME_GUESSES is on.
+        run retry-guesses
         run queue --limit 40
         run mirror --limit 60
         run stats

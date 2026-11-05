@@ -263,7 +263,12 @@ Every send passes these checks, in order, in `Database.can_send_to`:
    catch-all domain (provenance `guess`), reserved for the volume lane; the
    main account never sends one. The volume lane holds them while its recent
    bounce rate is over `GUESS_MAX_BOUNCE_PCT` (6%), or for the rest of the
-   day once two or more of today's have bounced over it.
+   day once two or more of today's have bounced over it. A guess that
+   hard-bounces disproves that convention at the company: after
+   `GUESS_RETRY_AFTER_DAYS` (2) the person gets one retry at the next
+   likeliest convention (`guess_retry`), and colleagues still waiting on the
+   disproved one are pulled and re-guessed. Two addresses per person at most;
+   that bounce closes the company to everything but those retries.
 
 Then the daily cap, the per-company limit (three people, never two on one day,
 across both accounts) and the recipient's local send window apply. Follow-ups
@@ -369,6 +374,7 @@ python -m src.main bounce-report  # email you if the day's bounce rate went over
 python -m src.main reverify       # re-probe contacts whose verdict was a failed probe
 python -m src.main import-apollo export.csv   # load an Apollo export (--dry-run first)
 python -m src.main reopen-catchall             # re-enrich parked catch-all companies
+python -m src.main retry-guesses               # next permutation after a guess bounced
 python -m src.main --lane volume send          # act as the second account
 ```
 
@@ -410,6 +416,7 @@ are never committed or bundled.
 | `ALERT_TO` | `FROM_EMAIL` | Where health and bounce alerts go |
 | `VOLUME_GUESSES` | `false` | Keep catch-all first-name guesses for the second account |
 | `GUESS_MAX_BOUNCE_PCT` | `6` | The second account's brake on those guesses |
+| `GUESS_RETRY_AFTER_DAYS` | `2` | Wait before a bounced guess gets its one retry |
 | `GROQ_API_KEY` | none | Optional. Writes one tailored sentence per email |
 | `GITHUB_TOKEN` | none | Optional. Raises the API limit from 60 to 5000 per hour |
 | `DRY_RUN` | `true` | Nothing is sent until this is false |
