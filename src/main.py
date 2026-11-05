@@ -125,6 +125,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="how far back to look")
         p.add_argument("--limit", type=int, default=500,
                        help="most recent messages to examine")
+        p.add_argument("--spam", action="store_true",
+                       help="scan the Spam folder instead, moving replies to the inbox")
     p = sub.add_parser("suppress", help="never contact an address")
     p.add_argument("email")
     sub.add_parser("stats", help="print the summary tables")
@@ -279,11 +281,13 @@ def main(argv: list[str] | None = None) -> int:
             pipeline.summary()
         elif args.command in ("bounces", "inbox"):
             settings.require_for_bounces()
-            scan = scan_inbox(settings, pipeline.db, args.days, args.limit)
+            scan = scan_inbox(settings, pipeline.db, args.days, args.limit,
+                              spam=args.spam)
             print(f"{pipeline._tag('inbox')}: examined {scan.examined} message(s) -> "
                   f"{len(scan.bounced)} bounced, {len(scan.replied)} replied, "
                   f"{len(scan.opted_out)} opted out, "
-                  f"{len(scan.drafted)} reply draft(s) saved")
+                  f"{len(scan.drafted)} reply draft(s) saved"
+                  + (f", {len(scan.rescued)} moved out of spam" if args.spam else ""))
             rows = ([(a, "bounce", "hard" if h else "soft") for a, h in scan.bounced]
                     + [(a, "reply", "") for a in scan.replied]
                     + [(a, "opt-out", "suppressed") for a in scan.opted_out]

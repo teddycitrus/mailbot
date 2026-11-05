@@ -200,11 +200,17 @@ def test_missing_or_broken_template_turns_drafting_off(tmp_path):
 
 
 class FakeIMAP:
-    """Just enough IMAP for scan_inbox: a fixed inbox and a Drafts folder."""
+    """Just enough IMAP for scan_inbox: an inbox, a Spam folder and Drafts."""
 
-    def __init__(self, messages):
-        self.messages = messages
+    def __init__(self, messages, spam=()):
+        self.folders = {"INBOX": list(messages), '"[Gmail]/Spam"': list(spam)}
+        self.selected = "INBOX"
         self.appended = []
+        self.moved = []
+
+    @property
+    def messages(self):
+        return self.folders[self.selected]
 
     def __call__(self, *_args):
         return self
@@ -212,18 +218,25 @@ class FakeIMAP:
     def login(self, *_args):
         return "OK", []
 
-    def select(self, *_args):
+    def select(self, mailbox, *_args):
+        self.selected = mailbox
         return "OK", []
 
-    def search(self, *_args):
-        return "OK", [b" ".join(str(i + 1).encode() for i in range(len(self.messages)))]
-
-    def fetch(self, uid, _what):
-        return "OK", [(b"1 (RFC822)", self.messages[int(uid) - 1].encode())]
+    def uid(self, command, *args):
+        if command == "SEARCH":
+            return "OK", [b" ".join(str(i + 1).encode()
+                                    for i in range(len(self.messages)))]
+        if command == "FETCH":
+            return "OK", [(b"1 (BODY[])", self.messages[int(args[0]) - 1].encode())]
+        if command == "MOVE":
+            self.moved.append((self.selected, args[0], args[1]))
+            return "OK", []
+        raise AssertionError(command)
 
     def list(self):
         return "OK", [b'(\\HasNoChildren) "/" "INBOX"',
-                      b'(\\HasNoChildren \\Drafts) "/" "[Gmail]/Drafts"']
+                      b'(\\HasNoChildren \\Drafts) "/" "[Gmail]/Drafts"',
+                      b'(\\HasNoChildren \\Junk) "/" "[Gmail]/Spam"']
 
     def append(self, mailbox, flags, _date, message):
         self.appended.append((mailbox, flags, message))
@@ -458,3 +471,36 @@ def test_unrelated_mail_from_a_stranger_is_ignored(tmp_path, monkeypatch,
     monkeypatch.setattr(inbox.imaplib, "IMAP4_SSL", imap)
     scan = scan_inbox(_settings(tmp_path), db_with_send)
     assert scan.replied == [] and scan.drafted == []
+
+
+# ------------------------------------------------------------ the Spam folder
+
+NEWSLETTER = ("From: Shop <deals@shop.example>\nTo: ada@example.com\n"
+              "Subject: Big sale\nMessage-ID: <n-1@shop.example>\n\nBuy now.\n")
+
+
+def test_reply_in_spam_counts_and_is_moved_to_the_inbox(tmp_path, monkeypatch,
+                                                         db_with_send):
+    imap = FakeIMAP([], spam=[NEWSLETTER, _reply().as_string()])
+    monkeypatch.setattr(inbox.imaplib, "IMAP4_SSL", imap)
+    scan = scan_inbox(_settings(tmp_path), db_with_send, spam=True)
+    assert scan.replied == ["stefan@acme.ai"]
+    assert scan.rescued == ["stefan@acme.ai"]
+    assert scan.drafted == ["stefan@acme.ai"]
+    assert imap.moved == [('"[Gmail]/Spam"', b"2", "INBOX")]
+
+
+def test_unsubscribe_in_spam_is_an_opt_out_not_a_reply(tmp_path, monkeypatch,
+                                                       db_with_send):
+    imap = FakeIMAP([], spam=[_reply(subject="unsubscribe", body="unsubscribe").as_string()])
+    monkeypatch.setattr(inbox.imaplib, "IMAP4_SSL", imap)
+    scan = scan_inbox(_settings(tmp_path), db_with_send, spam=True)
+    assert scan.replied == [] and scan.opted_out == ["stefan@acme.ai"]
+    assert db_with_send.is_suppressed("stefan@acme.ai")
+
+
+def test_inbox_scan_never_reads_spam(tmp_path, monkeypatch, db_with_send):
+    imap = FakeIMAP([], spam=[_reply().as_string()])
+    monkeypatch.setattr(inbox.imaplib, "IMAP4_SSL", imap)
+    scan = scan_inbox(_settings(tmp_path), db_with_send)
+    assert scan.replied == [] and imap.moved == []

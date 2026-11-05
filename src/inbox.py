@@ -13,6 +13,10 @@ pattern on our own words. Quoted text is stripped before matching.
 
 Every human reply also gets an answer drafted from the reply template and
 saved to the Drafts folder over IMAP. Drafts only: nothing here sends mail.
+
+Gmail sometimes files a real reply as spam, where nobody reads it and the
+follow-up goes out anyway. So once a day the Spam folder gets the same pass,
+and anything from someone we wrote to is moved back to the inbox.
 """
 
 from __future__ import annotations
@@ -82,6 +86,8 @@ class InboxScan:
     replied: list[str] = field(default_factory=list)
     opted_out: list[str] = field(default_factory=list)
     drafted: list[str] = field(default_factory=list)
+    # Replies found in Spam and moved back to the inbox.
+    rescued: list[str] = field(default_factory=list)
     examined: int = 0
 
 
@@ -248,6 +254,10 @@ def sent_mailbox(conn) -> str:
     return special_mailbox(conn, rb"\sent", "Sent")
 
 
+def spam_mailbox(conn) -> str:
+    return special_mailbox(conn, rb"\junk", "[Gmail]/Spam")
+
+
 def save_draft(conn, mailbox: str, draft: EmailMessage) -> bool:
     try:
         typ, _ = conn.append(mailbox, r"(\Draft \Seen)",
@@ -258,8 +268,14 @@ def save_draft(conn, mailbox: str, draft: EmailMessage) -> bool:
     return typ == "OK"
 
 
-def scan_inbox(settings, db, days: int = 30, limit: int = 500) -> InboxScan:
-    """Classify recent inbox mail against the people we have written to."""
+def scan_inbox(settings, db, days: int = 30, limit: int = 500,
+               spam: bool = False) -> InboxScan:
+    """Classify recent inbox mail against the people we have written to.
+
+    With `spam`, the Spam folder instead. Replies and opt-outs found there
+    count exactly as in the inbox, and are moved to the inbox so they get
+    read; the rest of Spam is left alone.
+    """
     result = InboxScan()
     contacted = {
         row["email"].lower()
@@ -280,14 +296,17 @@ def scan_inbox(settings, db, days: int = 30, limit: int = 500) -> InboxScan:
     conn = imaplib.IMAP4_SSL(settings.imap_host, settings.imap_port)
     try:
         conn.login(settings.imap_user, settings.imap_pass)
-        conn.select("INBOX")
+        typ, _ = conn.select(spam_mailbox(conn) if spam else "INBOX")
+        if typ != "OK":
+            return result
         since = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
-        typ, data = conn.search(None, f'(SINCE {since})')
+        typ, data = conn.uid("SEARCH", None, f'(SINCE {since})')
         if typ != "OK" or not data or not data[0]:
             return result
         uids = data[0].split()[-limit:]
+        rescue: list[bytes] = []
         for uid in uids:
-            typ, payload = conn.fetch(uid, "(RFC822)")
+            typ, payload = conn.uid("FETCH", uid, "(BODY.PEEK[])")
             if typ != "OK" or not payload or not isinstance(payload[0], tuple):
                 continue
             raw = payload[0][1].decode("utf-8", errors="replace")
@@ -345,6 +364,10 @@ def scan_inbox(settings, db, days: int = 30, limit: int = 500) -> InboxScan:
                     continue
                 who = row["email"]
 
+            if spam and not is_auto_reply(message):
+                rescue.append(uid)
+                result.rescued.append(sender)
+
             if is_refusal(message):
                 if not db.is_suppressed(who):
                     db.suppress(who, "opt-out reply")
@@ -374,6 +397,12 @@ def scan_inbox(settings, db, days: int = 30, limit: int = 500) -> InboxScan:
                 result.drafted.append(sender)
             else:
                 print(f"inbox: could not save a reply draft for {sender} to {mailbox}")
+        for uid in rescue:
+            typ, _ = conn.uid("MOVE", uid, "INBOX")
+            if typ == "OK":
+                db.log("spam_rescue", "", uid.decode())
+            else:
+                print(f"inbox: could not move spam message {uid.decode()} to the inbox")
     finally:
         try:
             conn.logout()

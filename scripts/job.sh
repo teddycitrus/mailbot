@@ -91,6 +91,10 @@ case "$job" in
         run reprobe --limit 25 --enrich 5
         ;;
     health)
+        # Gmail files the odd real reply as spam. Once a day, before the
+        # window opens, so it stops that morning's follow-up.
+        run inbox --spam --days 3 --limit 300
+        volume inbox --spam --days 3 --limit 300
         run health
         volume health
         ;;
