@@ -122,3 +122,19 @@ def test_the_bounce_closes_the_company_to_all_but_retries(setup):
                     "VALUES (?, 'cy@acme.test', 'replied', '2026-01-01')", (cid,))
     db.conn.commit()
     assert db.company_closed(cid, PROV_GUESS_RETRY) == "someone there already replied"
+
+
+def test_a_bounced_main_lane_verified_guess_is_never_retried(setup):
+    """Found on the live database: main's own guesses carry provenance
+    "guess" too, but they passed an SMTP probe on a domain that rejects
+    strangers. That bounce means the mailbox died, not that the convention
+    is wrong, and a retry would file a probe-able address as a catch-all."""
+    from src.models import VERIFIED
+    db, cid, bot = setup
+    db.upsert_contact(Contact(
+        email="naxin@acme.test", company_id=cid, first_name="Naxin", last_name="Wang",
+        verify_status=VERIFIED, provenance=PROV_GUESS, status=PENDING, confidence=90))
+    hard_bounce(db, "naxin@acme.test")
+    assert bot.retry_guesses() == 0
+    assert db.find_contact_by_email("naxin.wang@acme.test") is None
+    assert db.company_closed(cid, PROV_GUESS_RETRY) == "a colleague's hard bounce"

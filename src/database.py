@@ -395,7 +395,8 @@ class Database:
         return int(self.conn.execute(
             """SELECT COUNT(*) FROM contacts
                WHERE company_id = ? AND status IN (?,?,?,?)"""
-            + (f" AND NOT (status = ? AND provenance IN ({marks}))" if skip_failed else ""),
+            + (f" AND NOT (status = ? AND provenance IN ({marks})"
+               " AND verify_status = 'catchall' AND lane = 'volume')" if skip_failed else ""),
             (company_id, SENT, REPLIED, BOUNCED, QUEUED)
             + ((BOUNCED, *GUESS_PROVENANCE) if skip_failed else ()),
         ).fetchone()[0])
@@ -414,7 +415,8 @@ class Database:
         company to it. A reply or an opt-out still does.
         """
         rows = self.conn.execute(
-            """SELECT c.status, c.provenance, s.reason FROM contacts c
+            """SELECT c.status, c.provenance, c.verify_status, c.lane, s.reason
+               FROM contacts c
                LEFT JOIN suppression s ON s.email = c.email
                WHERE c.company_id = ?
                  AND (c.status = ? OR s.reason IN ('opt-out reply', 'hard bounce'))""",
@@ -423,8 +425,10 @@ class Database:
         if any(row["status"] == REPLIED for row in rows):
             return "someone there already replied"
         for row in rows:
+            # Only the volume lane's own catch-all guesses: see _VOLUME_GUESS.
             if (provenance == PROV_GUESS_RETRY and row["reason"] == "hard bounce"
-                    and row["provenance"] in GUESS_PROVENANCE):
+                    and row["provenance"] in GUESS_PROVENANCE
+                    and row["verify_status"] == CATCHALL and row["lane"] == "volume"):
                 continue
             return f"a colleague's {row['reason']}"
         return ""
@@ -440,6 +444,14 @@ class Database:
             return False, f"company already has {have} contacted"
         return True, ""
 
+    # The volume lane's unprovable guesses: catch-all, reserved for that lane.
+    # Main's own guesses carry provenance "guess" too, but those passed an
+    # SMTP probe on a domain that rejects strangers; a bounce there says the
+    # mailbox died, not that the convention is wrong, and a retry would be a
+    # probe-able address wrongly filed as a catch-all.
+    _VOLUME_GUESS = ("c.verify_status = 'catchall' AND c.lane = 'volume' "
+                     "AND c.provenance IN ({marks})")
+
     def guess_bounces(self, before: str) -> list[sqlite3.Row]:
         """Volume-lane guesses that hard-bounced at or before `before` (UTC
         ISO), oldest first: the ones whose convention is now disproved."""
@@ -448,19 +460,19 @@ class Database:
             f"""SELECT c.*, s.created_at AS bounced_at FROM contacts c
                 JOIN suppression s ON s.email = c.email
                 WHERE c.status = ? AND s.reason = 'hard bounce'
-                  AND c.provenance IN ({marks}) AND c.company_id IS NOT NULL
-                  AND s.created_at <= ?
+                  AND {self._VOLUME_GUESS.format(marks=marks)}
+                  AND c.company_id IS NOT NULL AND s.created_at <= ?
                 ORDER BY s.created_at""",
             (BOUNCED, *GUESS_PROVENANCE, before),
         ).fetchall()
 
     def guesses_at(self, company_id: int) -> list[sqlite3.Row]:
-        """Every guess and retry ever made at one company, oldest first."""
+        """Every volume-lane guess and retry made at one company, oldest first."""
         marks = ",".join("?" for _ in GUESS_PROVENANCE)
         return self.conn.execute(
             f"""SELECT c.*, co.domain AS company_domain FROM contacts c
                 JOIN companies co ON co.id = c.company_id
-                WHERE c.company_id = ? AND c.provenance IN ({marks})
+                WHERE c.company_id = ? AND {self._VOLUME_GUESS.format(marks=marks)}
                 ORDER BY c.id""",
             (company_id, *GUESS_PROVENANCE),
         ).fetchall()
