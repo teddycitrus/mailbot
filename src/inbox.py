@@ -17,6 +17,10 @@ saved to the Drafts folder over IMAP. Drafts only: nothing here sends mail.
 Gmail sometimes files a real reply as spam, where nobody reads it and the
 follow-up goes out anyway. So once a day the Spam folder gets the same pass,
 and anything from someone we wrote to is moved back to the inbox.
+
+A bounce notice about someone we mailed is moved to Trash once it is
+recorded. Notices about anyone else are left alone, since the main account
+is also a personal mailbox.
 """
 
 from __future__ import annotations
@@ -88,6 +92,8 @@ class InboxScan:
     drafted: list[str] = field(default_factory=list)
     # Replies found in Spam and moved back to the inbox.
     rescued: list[str] = field(default_factory=list)
+    # Bounce notices moved to Trash after being recorded.
+    trashed: int = 0
     examined: int = 0
 
 
@@ -258,6 +264,10 @@ def spam_mailbox(conn) -> str:
     return special_mailbox(conn, rb"\junk", "[Gmail]/Spam")
 
 
+def trash_mailbox(conn) -> str:
+    return special_mailbox(conn, rb"\trash", "[Gmail]/Trash")
+
+
 def save_draft(conn, mailbox: str, draft: EmailMessage) -> bool:
     try:
         typ, _ = conn.append(mailbox, r"(\Draft \Seen)",
@@ -305,6 +315,7 @@ def scan_inbox(settings, db, days: int = 30, limit: int = 500,
             return result
         uids = data[0].split()[-limit:]
         rescue: list[bytes] = []
+        trash: list[bytes] = []
         for uid in uids:
             typ, payload = conn.uid("FETCH", uid, "(BODY.PEEK[])")
             if typ != "OK" or not payload or not isinstance(payload[0], tuple):
@@ -319,7 +330,9 @@ def scan_inbox(settings, db, days: int = 30, limit: int = 500,
                 if is_delay_notice(raw):
                     continue
                 hard = is_hard_bounce(raw)
+                ours = False
                 for addr in extract_bounced_addresses(raw, own_domain):
+                    ours = ours or addr in contacted
                     # Each scan rereads every notice still in the inbox, so
                     # one already recorded must not be logged again.
                     row = db.find_contact_by_email(addr)
@@ -333,6 +346,8 @@ def scan_inbox(settings, db, days: int = 30, limit: int = 500,
                     db.conn.commit()
                     db.log("bounce", addr, "hard" if hard else "soft")
                     result.bounced.append((addr, hard))
+                if ours:
+                    trash.append(uid)
                 continue
 
             if sender in contacted:
@@ -403,6 +418,13 @@ def scan_inbox(settings, db, days: int = 30, limit: int = 500,
                 db.log("spam_rescue", "", uid.decode())
             else:
                 print(f"inbox: could not move spam message {uid.decode()} to the inbox")
+        bin_ = trash_mailbox(conn) if trash else ""
+        for uid in trash:
+            typ, _ = conn.uid("MOVE", uid, bin_)
+            if typ == "OK":
+                result.trashed += 1
+            else:
+                print(f"inbox: could not move bounce notice {uid.decode()} to {bin_}")
     finally:
         try:
             conn.logout()

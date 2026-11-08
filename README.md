@@ -366,7 +366,8 @@ python -m src.main mirror         # copy queued drafts into Gmail Drafts
 python -m src.main preview        # read the drafts before anything is sent
 python -m src.main send           # send, respecting cap and window
 python -m src.main followup       # one nudge to people who never replied
-python -m src.main inbox          # scan for bounces, replies and opt-outs, draft answers
+python -m src.main inbox          # scan for bounces, replies and opt-outs, draft answers,
+                                  # and bin the bounce notices for people it mailed
 python -m src.main digest         # email yourself a weekly summary
 python -m src.main doctor         # check everything the scheduled jobs rely on
 python -m src.main health         # same checks, but email you if any of them fail

@@ -287,6 +287,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"{len(scan.bounced)} bounced, {len(scan.replied)} replied, "
                   f"{len(scan.opted_out)} opted out, "
                   f"{len(scan.drafted)} reply draft(s) saved"
+                  + (f", {scan.trashed} bounce notice(s) binned" if scan.trashed else "")
                   + (f", {len(scan.rescued)} moved out of spam" if args.spam else ""))
             rows = ([(a, "bounce", "hard" if h else "soft") for a, h in scan.bounced]
                     + [(a, "reply", "") for a in scan.replied]

@@ -236,7 +236,8 @@ class FakeIMAP:
     def list(self):
         return "OK", [b'(\\HasNoChildren) "/" "INBOX"',
                       b'(\\HasNoChildren \\Drafts) "/" "[Gmail]/Drafts"',
-                      b'(\\HasNoChildren \\Junk) "/" "[Gmail]/Spam"']
+                      b'(\\HasNoChildren \\Junk) "/" "[Gmail]/Spam"',
+                      b'(\\HasNoChildren \\Trash) "/" "[Gmail]/Trash"']
 
     def append(self, mailbox, flags, _date, message):
         self.appended.append((mailbox, flags, message))
@@ -361,6 +362,30 @@ def test_the_final_failure_after_a_delay_is_still_a_bounce(tmp_path, monkeypatch
                         FakeIMAP([DELAY_NOTICE, BOUNCE_NOTICE]))
     assert scan_inbox(_settings(tmp_path), db_with_send).bounced == [
         ("stefan@acme.ai", True)]
+
+
+def test_a_recorded_bounce_notice_is_binned(tmp_path, monkeypatch, db_with_send):
+    imap = FakeIMAP([BOUNCE_NOTICE])
+    monkeypatch.setattr(inbox.imaplib, "IMAP4_SSL", imap)
+    scan = scan_inbox(_settings(tmp_path), db_with_send)
+    assert scan.trashed == 1
+    assert imap.moved == [("INBOX", b"1", '"[Gmail]/Trash"')]
+    assert db_with_send.is_suppressed("stefan@acme.ai")
+
+
+def test_a_bounce_already_recorded_is_still_binned(tmp_path, monkeypatch, db_with_send):
+    imap = FakeIMAP([BOUNCE_NOTICE, BOUNCE_NOTICE])
+    monkeypatch.setattr(inbox.imaplib, "IMAP4_SSL", imap)
+    assert scan_inbox(_settings(tmp_path), db_with_send).trashed == 2
+
+
+def test_bounces_about_strangers_and_delays_stay_put(tmp_path, monkeypatch, db_with_send):
+    """The main account is a personal mailbox too: only our own bounces go."""
+    stranger = BOUNCE_NOTICE.replace("stefan@acme.ai", "aunt@family.example")
+    imap = FakeIMAP([stranger, DELAY_NOTICE])
+    monkeypatch.setattr(inbox.imaplib, "IMAP4_SSL", imap)
+    assert scan_inbox(_settings(tmp_path), db_with_send).trashed == 0
+    assert imap.moved == []
 
 
 def test_an_opt_out_still_in_the_inbox_is_logged_once(tmp_path, monkeypatch,
