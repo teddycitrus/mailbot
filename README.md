@@ -260,8 +260,9 @@ Every send passes these checks, in order, in `Database.can_send_to`:
    no catch-all goes. Held drafts stay queued until the rate recovers.
 6. A contact reserved for a lane goes from that lane only. With
    `VOLUME_GUESSES=true`, enrich keeps one first-name guess per founder on a
-   catch-all domain (provenance `guess`), reserved for the volume lane; the
-   main account never sends one. The volume lane holds them while its recent
+   catch-all domain (provenance `guess`), and any address published on the
+   site there that names nobody (`site_unattributed`), both reserved for the
+   volume lane; the main account never sends one. The volume lane holds them while its recent
    bounce rate is over `GUESS_MAX_BOUNCE_PCT` (6%), or for the rest of the
    day once two or more of today's have bounced over it. A guess that
    hard-bounces disproves that convention at the company: after

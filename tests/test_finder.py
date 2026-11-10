@@ -70,6 +70,13 @@ def test_hiring_filter_can_be_relaxed():
     assert qualifies(record(isHiring=False), relaxed, NOW)[0]
 
 
+def test_yc_locations_override_the_shared_targets():
+    wide = SimpleNamespace(**{**SETTINGS.__dict__, "yc_locations": ("usa", "canada")})
+    assert qualifies(record(all_locations="Austin, TX, USA"), wide, NOW)[0]
+    assert not qualifies(record(all_locations="Austin, TX, USA"), SETTINGS, NOW)[0]
+    assert not qualifies(record(all_locations="Berlin, Germany"), wide, NOW)[0]
+
+
 @pytest.mark.parametrize("url,expected", [
     ("https://www.acme.ai/", "acme.ai"),
     ("http://acme.ai", "acme.ai"),
@@ -423,6 +430,28 @@ def test_published_addresses_are_tagged_by_how_they_were_found(tmp_path, monkeyp
     assert tags == {"ann@acme.ai": "founder_published", "zed@acme.ai": "site_unattributed"}
     # The trusted one sorts first, so it gets the per-company cap.
     assert result.contacts[0].email == "ann@acme.ai"
+    # Without volume guesses nothing is reserved, so the main gate drops it.
+    assert all(c.lane == "" for c in result.contacts)
+
+
+def test_an_unattributed_catchall_address_goes_to_the_volume_lane(tmp_path, monkeypatch):
+    from src import finder
+    from src.models import VOLUME_LANE, lane_deliverable, MAIN_LANE
+    from src.scraper import SiteScrape
+
+    db, company = _team_company(tmp_path, monkeypatch, [("Ann", "Lee", "CEO")])
+    monkeypatch.setattr(finder, "scrape_site", lambda *a, **k: SiteScrape(
+        emails={"ann@acme.ai", "zed@acme.ai"}))
+    settings = SimpleNamespace(target_roles=("ceo",), max_contacts_per_company=3,
+                               volume_guesses=True)
+    result = finder.enrich_company(company, _FetchAnything(), _CatchAll(db), settings)
+    by_email = {c.email: c for c in result.contacts}
+    zed = by_email["zed@acme.ai"]
+    assert zed.lane == VOLUME_LANE
+    assert by_email["ann@acme.ai"].lane == ""
+    assert lane_deliverable(zed.verify_status, zed.provenance, zed.lane, VOLUME_LANE)
+    assert not lane_deliverable(zed.verify_status, zed.provenance, zed.lane, MAIN_LANE)
+    db.close()
 
 
 # ----------------------------------------- guesses for the volume lane only

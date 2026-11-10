@@ -31,6 +31,8 @@ from .scraper import Fetcher, Person, parse_yc_founders, scrape_site
 from .verifier import Verifier, is_never_send, is_role_account
 
 YC_TAG_URL = "https://yc-oss.github.io/api/tags/{tag}.json"
+# Every YC company, read instead of the AI tags when YC_ALL_TAGS is on.
+YC_ALL_URL = "https://yc-oss.github.io/api/companies/all.json"
 
 # A first-name guess on a catch-all domain proves nothing, so it ranks under
 # every sendable address the company has. Below MIN_CONFIDENCE on purpose:
@@ -165,7 +167,8 @@ def qualifies(record: dict, settings, now_year: int,
     if priority is not None and priority.has(name=record.get("name", ""),
                                              domain=domain_from_url(record["website"])):
         return True, ""
-    if not _matches_location(record.get("all_locations", ""), settings.target_locations):
+    locations = getattr(settings, "yc_locations", ()) or settings.target_locations
+    if not _matches_location(record.get("all_locations", ""), locations):
         return False, "location"
     team = record.get("team_size") or 0
     if not 0 < team <= settings.max_employees:
@@ -185,8 +188,10 @@ def discover(fetcher: Fetcher, settings, db, limit: int = 15,
     """Return up to `limit` qualifying companies not already in the database."""
     stats = DiscoveryStats()
     raw: dict[int, dict] = {}
-    for tag in AI_TAGS:
-        payload = fetcher.get_json(YC_TAG_URL.format(tag=tag))
+    urls = ([YC_ALL_URL] if getattr(settings, "yc_all_tags", False)
+            else [YC_TAG_URL.format(tag=tag) for tag in AI_TAGS])
+    for url in urls:
+        payload = fetcher.get_json(url)
         if not payload:
             continue
         stats.fetched += 1
@@ -334,12 +339,17 @@ def enrich_company(company_row, fetcher: Fetcher, verifier: Verifier,
         # An address we can tie to a named founder beats an anonymous one, so it
         # wins the sort below rather than losing to alphabetical order.
         confidence = verdict.confidence + (5 if first else 0)
+        # A published address on a catch-all domain that names nobody is too
+        # weak for the main account, but it was printed on the site, so the
+        # volume lane takes it instead of it being dropped.
+        lane = (VOLUME_LANE if provenance == PROV_SITE and verdict.status == CATCHALL
+                and getattr(settings, "volume_guesses", False) else "")
         contacts.append(Contact(
             email=email, company_id=company_id, first_name=first, last_name=last,
             role=_role_for(first, targeted), source=SRC_SCRAPED,
             verify_status=verdict.status, verify_detail=verdict.detail,
             confidence=min(confidence, 99), status=PENDING,
-            bio=_bio_for(first, targeted), provenance=provenance,
+            bio=_bio_for(first, targeted), provenance=provenance, lane=lane,
         ))
 
     # 4. Then guess for the rest of the team, but only where a guess is provable.

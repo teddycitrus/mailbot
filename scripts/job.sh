@@ -70,17 +70,17 @@ case "$job" in
         ;;
     build)
         run hn --limit 60 --months 3
-        run discover --limit 60
+        run discover --limit 300
         run gh --limit 60
-        run vc --limit 45
-        # A few parked catch-all companies back in, for the volume lane's
+        run vc --limit 150
+        # Every parked catch-all company back in, for the volume lane's
         # guesses. Does nothing unless VOLUME_GUESSES is on.
-        run reopen-catchall --limit 20
-        run enrich --limit 100
+        run reopen-catchall --limit 400
+        run enrich --limit 400
         # Next permutation for anyone whose guess hard-bounced, so it is
         # drafted below. Also a no-op unless VOLUME_GUESSES is on.
         run retry-guesses
-        run queue --limit 40
+        run queue --limit 300
         run mirror --limit 60
         run stats
         ;;

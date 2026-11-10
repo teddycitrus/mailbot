@@ -67,7 +67,9 @@ def lanes(tmp_path):
     (CATCHALL, PROV_GUESS, "", VOLUME_LANE, False),
     # A verified contact reserved for the volume lane stays off main.
     (VERIFIED, "", VOLUME_LANE, "main", False),
-    (CATCHALL, "site_unattributed", VOLUME_LANE, VOLUME_LANE, False),
+    # A published site address reserved for it is the volume lane's too.
+    (CATCHALL, "site_unattributed", VOLUME_LANE, VOLUME_LANE, True),
+    (CATCHALL, "site_unattributed", VOLUME_LANE, "main", False),
 ])
 def test_lane_deliverable(verify, prov, reserved, lane, ok):
     assert lane_deliverable(verify, prov, reserved, lane) is ok

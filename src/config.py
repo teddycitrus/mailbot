@@ -247,6 +247,11 @@ class Settings:
     # is made, so the domain is not hit again at once and colleagues' late
     # notices have arrived. See Pipeline.retry_guesses.
     guess_retry_after_days: int = 2
+    # Read the whole YC directory instead of only its AI tags.
+    yc_all_tags: bool = False
+    # Locations for YC discovery only; empty uses TARGET_LOCATIONS. Matched
+    # as substrings, so "usa" takes every US company.
+    yc_locations: tuple[str, ...] = ()
 
     @property
     def operator_email(self) -> str:
@@ -341,6 +346,8 @@ class Settings:
             volume_guesses=_bool("VOLUME_GUESSES", False),
             guess_max_bounce_pct=max(0, _int("GUESS_MAX_BOUNCE_PCT", 6)),
             guess_retry_after_days=max(0, _int("GUESS_RETRY_AFTER_DAYS", 2)),
+            yc_all_tags=_bool("YC_ALL_TAGS", False),
+            yc_locations=_split(os.getenv("YC_LOCATIONS", "")),
         )
 
     def catchall_provenance(self, bounce_pct: float) -> tuple[frozenset, str]:

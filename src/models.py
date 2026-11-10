@@ -66,9 +66,10 @@ MAIN_LANE = "main"
 # the main account never risks. See Pipeline._guess_rule.
 VOLUME_LANE = "volume"
 # Catch-all addresses with no evidence behind them beyond a name and a
-# convention. Reserved for the volume lane, where a bad run costs a
-# throwaway account instead of the main one.
-VOLUME_PROVENANCE = frozenset({PROV_GUESS, PROV_GUESS_RETRY, PROV_APOLLO})
+# convention, or published on the site but tied to nobody. Reserved for the
+# volume lane, where a bad run costs a throwaway account instead of the
+# main one.
+VOLUME_PROVENANCE = frozenset({PROV_GUESS, PROV_GUESS_RETRY, PROV_APOLLO, PROV_SITE})
 # The two that are permutations of a name, which is what a retry works from.
 GUESS_PROVENANCE = frozenset({PROV_GUESS, PROV_GUESS_RETRY})
 # Addresses tried per person: the first guess, and one retry after it
