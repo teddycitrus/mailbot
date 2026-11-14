@@ -54,7 +54,6 @@ DEFAULT_ASPECTS = [
     "live news scoring against supplier graphs",  # Eureka
     "autonomous attack containment",          # Bastion
     "AI agents that act through tools",       # Bastion's investigator
-    "AI agents in isolated workspaces",       # Atrium
     "agentic research loops",                 # Kev-olution
     "computer-vision pipelines",              # Iris
     "speech-driven interfaces",               # Iris
@@ -140,9 +139,6 @@ ASPECT_CUES: dict[str, set[str]] = {
         "agent", "mcp", "tool", "api", "llm", "automat", "workflow", "integrat",
         "developer", "infrastructure", "platform", "data",
     },
-    "AI agents in isolated workspaces": {
-        "sandbox", "coding", "code", "review", "agent", "developer",
-    },
     "agentic research loops": {
         "research", "autoresearch", "hyperparameter", "hill-climb", "scientist",
         "experiment",
@@ -172,9 +168,6 @@ FACT_PARTS: dict[str, tuple[str, str]] = {
     "agentic research loops": (
         "Kev-olution",
         "getting triage to prune bad hypotheses without throwing out the eventual winner"),
-    "AI agents in isolated workspaces": (
-        "Atrium",
-        "cleaning up every process an agent left running after a command froze"),
     "AI agents that act through tools": (
         "Bastion's investigator agent",
         "making sure a retried action never fired twice"),
@@ -243,9 +236,6 @@ def _pick(options: list[str], key: str) -> str:
 # brought up, matched at the start of a word. Ordered by preference when more
 # than one fits. Kept narrow on purpose: a stretch reads worse than no line.
 MATCH_CUES: dict[str, tuple[str, ...]] = {
-    # Ahead of Bastion's agent line, which wins ties otherwise: running agents'
-    # code is Atrium's territory.
-    "AI agents in isolated workspaces": ("coding agent", "sandbox", "code review"),
     # Not bare "research" or "optimiz": those also match market research desks,
     # influencer marketing and fleet planning.
     "agentic research loops": ("ai research", "ml research", "research agent",

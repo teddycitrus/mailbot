@@ -76,9 +76,8 @@ def test_the_line_ends_with_the_one_ask():
 # ------------------------------------------------------------ matching
 
 @pytest.mark.parametrize("one_liner, aspect", [
-    (AGENTS, "AI agents in isolated workspaces"),
-    ("API sandboxes, built for AI agents", "AI agents in isolated workspaces"),
-    ("AI code review for your team", "AI agents in isolated workspaces"),
+    (AGENTS, "AI agents that act through tools"),
+    ("API sandboxes, built for AI agents", "AI agents that act through tools"),
     ("AI agents for accounting firms", "AI agents that act through tools"),
     ("Long-horizon research agents", "agentic research loops"),
     ("Autoresearch as a service", "agentic research loops"),
