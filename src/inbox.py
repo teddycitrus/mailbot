@@ -394,7 +394,11 @@ def scan_inbox(settings, db, days: int = 30, limit: int = 500,
                     db.log("reply", who, subject[:120])
                     result.replied.append(who)
 
-            if reply_template is None or who in drafted or is_auto_reply(message):
+            # Checked under both addresses: chat@ answering the note sent to
+            # gina@ is logged as chat@, so checking only gina@ redrafted it
+            # on every scan.
+            if (reply_template is None or who in drafted or sender in drafted
+                    or is_auto_reply(message)):
                 continue
             company = (db.get_company(row["company_id"])
                        if row is not None and row["company_id"] else None)
@@ -407,7 +411,7 @@ def scan_inbox(settings, db, days: int = 30, limit: int = 500,
             if mailbox is None:
                 mailbox = drafts_mailbox(conn)
             if save_draft(conn, mailbox, draft):
-                drafted.add(sender)
+                drafted.update((sender, who))
                 db.log("reply_draft", sender, subject[:120])
                 result.drafted.append(sender)
             else:

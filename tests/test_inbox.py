@@ -300,6 +300,18 @@ def test_no_template_means_no_drafts_but_replies_still_recorded(tmp_path, monkey
     assert imap.appended == []
 
 
+def test_a_reply_from_another_address_in_our_thread_is_drafted_once(
+        tmp_path, monkeypatch, db_with_send):
+    """chat@ answering the note sent to stefan@ got a fresh draft every scan."""
+    imap = FakeIMAP([_reply(sender="Acme <chat@acme.ai>").as_string()])
+    monkeypatch.setattr(inbox.imaplib, "IMAP4_SSL", imap)
+    settings = _settings(tmp_path)
+    first = scan_inbox(settings, db_with_send)
+    again = scan_inbox(settings, db_with_send)
+    assert first.drafted == ["chat@acme.ai"] and again.drafted == []
+    assert len(imap.appended) == 1
+
+
 def test_failed_save_is_retried_on_the_next_scan(tmp_path, monkeypatch, db_with_send):
     imap = FakeIMAP([_reply().as_string()])
     monkeypatch.setattr(inbox.imaplib, "IMAP4_SSL", imap)
