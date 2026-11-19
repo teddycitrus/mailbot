@@ -11,7 +11,7 @@ import pytest
 
 from src.llm import (
     BANNED, DEFAULT_ASPECTS, FACT_LINES, MAX_RETRIES, OPENERS, Personalizer, WORD_LIMIT,
-    clean_what, closing, compose, match_aspect, to_ascii, word_count,
+    clean_what, compose, match_aspect, to_ascii, word_count,
 )
 
 AGENTS = "The infrastructure to run coding agents for your team"
@@ -63,14 +63,14 @@ def test_every_composed_line_fits_the_word_limit():
     for opener in OPENERS:
         for aspect, lines in FACT_LINES.items():
             for fact in lines:
-                line = f"{opener} {longest}. {fact}{closing('Two Word')}"
+                line = f"{opener} {longest}. {fact}."
                 assert word_count(line) <= WORD_LIMIT
 
 
-def test_the_line_ends_with_the_one_ask():
+def test_the_line_leaves_the_ask_to_the_template():
     out = compose("Superserve", GOOD, "AI agents that act through tools")
-    assert out.endswith(", as well as discuss opportunities at Superserve.")
-    assert out.count("?") == 0
+    assert out.endswith("how you handle that.") or out.endswith("how you deal with it.")
+    assert "opportunit" not in out and out.count("?") == 0
 
 
 # ------------------------------------------------------------ matching

@@ -191,18 +191,13 @@ FACT_PARTS: dict[str, tuple[str, str]] = {
         "keeping it accurate when lighting and camera angles changed"),
 }
 
-# Rotated so consecutive emails do not end the same way. Left open because
-# compose() finishes the sentence with the ask, so the email makes one request
-# rather than a question about their work followed by a separate pitch.
+# Rotated so consecutive emails do not end the same way. The ask itself lives
+# in the template, so every email states it the same way whether or not it
+# carries this line.
 QUESTIONS = (
     "Would love to hear how you deal with it",
     "Would love to hear how you handle that",
 )
-
-
-def closing(company: str) -> str:
-    """The end of the personal line's last sentence: the one ask in the email."""
-    return f", as well as discuss opportunities at {company or 'your company'}."
 
 FACT_LINES: dict[str, list[str]] = {
     aspect: [f"When I built {built}, the annoying part was {pain}. {question}"
@@ -315,7 +310,7 @@ def compose(company: str, what: str, aspect: str) -> str:
     # is lowered and then the company's own spelling restored.
     opener = _pick(OPENERS, company)
     fact = _pick(FACT_LINES[aspect], company + aspect)
-    line = f"{opener} {what}. {fact}{closing(company)}".lower()
+    line = f"{opener} {what}. {fact}.".lower()
     if company:
         line = re.sub(r"\b" + re.escape(company) + r"\b", company, line, flags=re.I)
     return line
