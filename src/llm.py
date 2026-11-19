@@ -165,29 +165,30 @@ ASPECT_CUES: dict[str, set[str]] = {
 #
 # aspect: (what he built, the annoying part)
 FACT_PARTS: dict[str, tuple[str, str]] = {
+    # Projects are described, never named: a name means nothing to a stranger.
     "agentic research loops": (
-        "Kev-olution",
+        "my research agent",
         "getting triage to prune bad hypotheses without throwing out the eventual winner"),
     "AI agents that act through tools": (
-        "Bastion's investigator agent",
+        "my blue-team agent",
         "making sure a retried action never fired twice"),
     "autonomous attack containment": (
-        "the backend for Bastion",
+        "my blue-team agent",
         "stopping it from banning real users on a false alarm"),
     "autonomous incident briefings": (
-        "Vapi voice agents for Eureka",
+        "voice agents for incident briefings",
         "handling interruptions so the agent didn't talk over people"),
     "speech-driven interfaces": (
-        "the speech side of Iris",
+        "a speech interface",
         "making the voice sound natural instead of flat and robotic"),
     "real-time risk monitoring": (
-        "the risk monitoring in Eureka",
+        "a risk monitoring tool",
         "flagging real problems without drowning people in false alarms"),
     "supply-chain disruption detection": (
-        "supply chain disruption detection for Eureka",
+        "supply chain disruption detection",
         "matching messy news mentions to the right supplier"),
     "computer-vision pipelines": (
-        "a computer vision pipeline for Iris",
+        "a computer vision pipeline",
         "keeping it accurate when lighting and camera angles changed"),
 }
 
