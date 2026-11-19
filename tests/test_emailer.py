@@ -56,6 +56,12 @@ def test_render_fills_known_fields():
     assert "Hello Stefan, from Jane" in body
 
 
+def test_a_company_ending_in_a_period_does_not_double_it():
+    template = Template("Hi", "opportunities at {company}. wait...\n")
+    _, body = template.render({"company": "CrossBar, Inc."})
+    assert body == "opportunities at CrossBar, Inc. wait...\n"
+
+
 def test_render_does_not_raise_on_a_missing_field():
     template = Template("Hi", "Hello {nobody}\n")
     _, body = template.render({})

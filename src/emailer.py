@@ -61,6 +61,8 @@ class Template:
         subject = Formatter().vformat(self.subject, (), safe).strip()
         body = Formatter().vformat(self.body, (), safe)
         body = re.sub(r"\n{3,}", "\n\n", body).strip() + "\n"
+        # "CrossBar, Inc." before the template's own period. Ellipses survive.
+        body = re.sub(r"(?<!\.)\.\.(?!\.)", ".", body)
         return subject, body
 
 
