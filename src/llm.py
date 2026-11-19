@@ -158,52 +158,52 @@ ASPECT_CUES: dict[str, set[str]] = {
 
 
 # John's half of the line, written by hand so nothing about him is ever
-# generated: what he built, the part of it that was a grind, and a question
-# about how the company handles the same thing. The question is what gives a
-# founder a reason to reply; the pain point is what shows he has actually done
-# this work. Each pain is one nearly everyone who builds that kind of thing hits.
+# generated: an offer to help with an engineering problem the company has, and
+# the project where he hit the same one. The offer is what gives a founder a
+# reason to reply; the project is what shows he has actually done this work.
+# Each problem is one nearly everyone who builds that kind of thing hits.
 #
-# aspect: (what he built, the annoying part)
+# aspect: (what he built, the problem he would help with)
 FACT_PARTS: dict[str, tuple[str, str]] = {
     # Projects are described, never named: a name means nothing to a stranger.
     "agentic research loops": (
         "my research agent",
-        "getting triage to prune bad hypotheses without throwing out the eventual winner"),
+        "pruning bad hypotheses before they waste experiments"),
     "AI agents that act through tools": (
         "my blue-team agent",
-        "making sure a retried action never fired twice"),
+        "making agent actions safe to retry"),
     "autonomous attack containment": (
         "my blue-team agent",
-        "stopping it from banning real users on a false alarm"),
+        "containing attacks without blocking real users"),
     "autonomous incident briefings": (
         "voice agents for incident briefings",
-        "handling interruptions so the agent didn't talk over people"),
+        "handling interruptions in voice agents"),
     "speech-driven interfaces": (
         "a speech interface",
-        "making the voice sound natural instead of flat and robotic"),
+        "making generated voices sound natural"),
     "real-time risk monitoring": (
         "a risk monitoring tool",
-        "flagging real problems without drowning people in false alarms"),
+        "flagging real problems without flooding people with false alarms"),
     "supply-chain disruption detection": (
         "supply chain disruption detection",
         "matching messy news mentions to the right supplier"),
     "computer-vision pipelines": (
         "a computer vision pipeline",
-        "keeping it accurate when lighting and camera angles changed"),
+        "keeping vision models accurate across lighting and camera angles"),
 }
 
-# Rotated so consecutive emails do not end the same way. The ask itself lives
-# in the template, so every email states it the same way whether or not it
+# Rotated so consecutive emails do not read the same. The ask itself lives in
+# the template, so every email states it the same way whether or not it
 # carries this line.
-QUESTIONS = (
-    "Would love to hear how you deal with it",
-    "Would love to hear how you handle that",
+CREDITS = (
+    "since I dealt with the same thing building {built}",
+    "since I ran into the same problem building {built}",
 )
 
 FACT_LINES: dict[str, list[str]] = {
-    aspect: [f"When I built {built}, the annoying part was {pain}. {question}"
-             for question in QUESTIONS]
-    for aspect, (built, pain) in FACT_PARTS.items()
+    aspect: [f"Would love to help with {problem}, " + credit.format(built=built)
+             for credit in CREDITS]
+    for aspect, (built, problem) in FACT_PARTS.items()
 }
 
 # How the company half is introduced. Rotated per company.

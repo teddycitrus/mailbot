@@ -69,7 +69,8 @@ def test_every_composed_line_fits_the_word_limit():
 
 def test_the_line_leaves_the_ask_to_the_template():
     out = compose("Superserve", GOOD, "AI agents that act through tools")
-    assert out.endswith("how you handle that.") or out.endswith("how you deal with it.")
+    assert "would love to help with making agent actions safe to retry" in out
+    assert out.endswith("building my blue-team agent.")
     assert "opportunit" not in out and out.count("?") == 0
 
 
@@ -195,7 +196,7 @@ def test_compose_is_stable_per_company():
 def test_good_phrase_is_used_first_try():
     p = ScriptedPersonalizer([GOOD])
     out = line(p)
-    assert GOOD in out and "when i built" in out
+    assert GOOD in out and "would love to help with" in out
     assert p.asked == 1
 
 
