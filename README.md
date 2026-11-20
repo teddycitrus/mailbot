@@ -450,7 +450,6 @@ Registers seven Windows tasks:
 | Task | When | What |
 | --- | --- | --- |
 | `mailbot-health` | Every day 07:45 | Check everything, alert if anything is broken |
-| `mailbot-spam` | Hourly 07:20-23:20 | Move contact replies Gmail filed as spam back to the inbox |
 | `mailbot-draft` | Every day, 06:00 to 23:00, every 2h | Render drafts, copy them to Gmail Drafts |
 | `mailbot-prep` | Weekdays 08:25 | Full mailbox scan before the window opens |
 | `mailbot-send` | Weekdays 08:30 to 13:30, every 15m | Send each window's share of the day's cap |
