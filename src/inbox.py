@@ -179,15 +179,75 @@ def is_auto_reply(message) -> bool:
     return bool(AUTO_REPLY_SUBJECT.match(header_text(message.get("Subject", ""))))
 
 
-def reply_first_name(contact_first: str, from_header: str) -> str:
-    """Who to greet: the stored name, then the display name, then the address."""
-    if contact_first:
+NOT_A_NAME = frozenset({
+    "team", "support", "hello", "hi", "info", "the", "customer", "sales", "hr",
+    "careers", "recruiting", "admin", "noreply", "no", "contact", "help", "mail",
+    "office", "founders", "jobs", "hiring", "people", "talent", "dear",
+    "chat", "team", "inbox", "partners", "press", "billing", "ops", "community",
+})
+
+SIGN_OFF = re.compile(
+    r"^\s*(?:best|thanks|thank you|many thanks|cheers|regards|best regards|"
+    r"kind regards|warm regards|warmly|sincerely|all the best|talk soon|"
+    r"best wishes|good luck)\s*[,.!]?\s*(?P<rest>.*)$", re.I)
+
+
+def _name_word(text: str, company: str = "") -> str:
+    """The first word of `text` when it looks like a given name, else ""."""
+    words = re.sub(r"[\"'()<>|]", " ", text).split()
+    if not words:
+        return ""
+    word = words[0].rstrip(",.!-")
+    company_words = {w.lower() for w in re.findall(r"[A-Za-z]+", company)}
+    if (len(word) < 2 or not word.isalpha() or word.lower() in NOT_A_NAME
+            or word.lower() in company_words):
+        return ""
+    return word if not (word.islower() or word.isupper()) else word.capitalize()
+
+
+def _display_name(display: str) -> str:
+    """'Keyla from Acme' -> 'Keyla', 'Smith, Jane' -> 'Jane'."""
+    display = header_text(display).replace('"', "").strip()
+    display = re.split(r"\s+(?:from|at|@|via)\s+|\s+[-|]\s+", display, maxsplit=1)[0]
+    if display.count(",") == 1:
+        last, first = display.split(",")
+        display = first if first.strip() else last
+    return display
+
+
+def _signed_name(body: str, company: str = "") -> str:
+    """The name under a sign-off like 'Best,' at the end of what they typed."""
+    lines = [l.strip() for l in strip_quoted(body).splitlines() if l.strip()]
+    for i in range(len(lines) - 1, -1, -1):
+        found = SIGN_OFF.match(lines[i])
+        if not found:
+            continue
+        candidate = found.group("rest") or (lines[i + 1] if i + 1 < len(lines) else "")
+        if len(candidate.split()) <= 3:
+            return _name_word(candidate, company)
+        return ""
+    if lines and lines[-1].startswith("-") and len(lines[-1].split()) <= 3:
+        return _name_word(lines[-1].lstrip("- "), company)
+    return ""
+
+
+def reply_first_name(contact_first: str, from_header: str, same_person: bool = True,
+                     body: str = "", company: str = "") -> str:
+    """Who to greet.
+
+    The stored name only when the reply comes from the person we wrote to. A
+    colleague answering for them is greeted by their own name: the display
+    name, then the name they signed with, then the address.
+    """
+    if contact_first and same_person:
         return contact_first
     display, address = parseaddr(from_header)
-    words = header_text(display).replace('"', "").split()
-    if words and words[0].isalpha() and len(words[0]) > 1:
-        return words[0].capitalize()
-    return first_name_from_email(address)
+    from_address = first_name_from_email(address)
+    if from_address.lower() in NOT_A_NAME:
+        from_address = ""
+    return (_name_word(_display_name(display), company)
+            or _signed_name(body, company)
+            or from_address)
 
 
 def load_reply_template(path: Path) -> Optional[Template]:
@@ -402,11 +462,14 @@ def scan_inbox(settings, db, days: int = 30, limit: int = 500,
                 continue
             company = (db.get_company(row["company_id"])
                        if row is not None and row["company_id"] else None)
+            company_name = company["name"] if company is not None else ""
             draft = build_reply_draft(
                 reply_template, settings, message,
                 reply_first_name(row["first_name"] if row is not None else "",
-                                 message.get("From", "")),
-                company["name"] if company is not None else "",
+                                 message.get("From", ""),
+                                 same_person=sender == who.lower(),
+                                 body=plain_body(message), company=company_name),
+                company_name,
             )
             if mailbox is None:
                 mailbox = drafts_mailbox(conn)

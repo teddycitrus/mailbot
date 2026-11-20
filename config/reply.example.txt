@@ -1,11 +1,11 @@
 Subject: Re: {original_subject}
 
-Dear {first_name},
+dear {first_name},
 
 thanks regardless for reading my email.
 
-the work yall do at {company} is rly interesting to me, and id love to chat with you about it in the future. could i add you on linkedin/x?
+the work you guys do at {company} is really interesting to me, and id love to chat with you about it in the future. could i add you on linkedin/x?
 
-Best regards,
+best regards,
 {sender_name}
 [linkedin](https://www.linkedin.com/in/your-profile/), [x](https://x.com/your-handle)

@@ -167,6 +167,21 @@ def test_greeting_prefers_stored_name_then_display_name_then_address():
     assert reply_first_name("", "hello@acme.ai") == ""
 
 
+def test_a_colleague_answering_is_greeted_by_their_own_name():
+    def other(from_header, body="", company="Mighty Networks"):
+        return reply_first_name("Gina", from_header, same_person=False,
+                                body=body, company=company)
+
+    assert other("Keyla from Mighty Networks <chat@mightynetworks.com>") == "Keyla"
+    assert other('"Smith, Jane" <js@acme.ai>', company="Acme") == "Jane"
+    assert other("Mighty Networks <chat@mightynetworks.com>",
+                 "Not hiring right now, sorry.\n\nBest,\nKeyla\n\nOn Mon, Gina wrote:\n> hi") == "Keyla"
+    assert other("Mighty Networks <chat@mightynetworks.com>",
+                 "No thanks.\n\nCheers, Priya") == "Priya"
+    assert other("Mighty Networks <sam@mightynetworks.com>", "nope") == "Sam"
+    assert other("Support Team <chat@mightynetworks.com>", "nope") == ""
+
+
 def test_draft_threads_under_the_reply(tmp_path):
     settings = _settings(tmp_path)
     template = load_reply_template(settings.reply_template_path)
