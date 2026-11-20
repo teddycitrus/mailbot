@@ -75,6 +75,9 @@ class Template:
         body = re.sub(r"\n{3,}", "\n\n", body).strip() + "\n"
         # "CrossBar, Inc." before the template's own period. Ellipses survive.
         body = re.sub(r"(?<!\.)\.\.(?!\.)", ".", body)
+        # "[github](url), {resume_link}" with no resume link set leaves a
+        # dangling comma after the last link on the line.
+        body = re.sub(r"(\]\([^)\s]+\))[ \t]*,[ \t]*$", r"\1", body, flags=re.M)
         return subject, body
 
 

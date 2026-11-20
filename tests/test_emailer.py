@@ -62,6 +62,15 @@ def test_a_company_ending_in_a_period_does_not_double_it():
     assert body == "opportunities at CrossBar, Inc. wait...\n"
 
 
+def test_signature_links_drop_the_comma_when_the_resume_link_is_empty():
+    template = Template("Hi", "best,\n\njohn\n[github](https://g.co/x), {resume_link}\n")
+    _, empty = template.render({"resume_link": ""})
+    assert empty.endswith("john\n[github](https://g.co/x)\n")
+    assert "best,\n" in empty
+    _, filled = template.render({"resume_link": "[my resume](https://d.co/r)"})
+    assert "[github](https://g.co/x), [my resume](https://d.co/r)" in filled
+
+
 def test_render_does_not_raise_on_a_missing_field():
     template = Template("Hi", "Hello {nobody}\n")
     _, body = template.render({})
