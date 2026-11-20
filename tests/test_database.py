@@ -313,6 +313,16 @@ def test_subject_test_counts_first_emails_per_subject(db, company_id):
     assert got == {"one @ {company}": (3, 1, 1), "two @ {company}": (2, 0, 1)}
 
 
+def test_subject_test_counts_zero_when_nobody_has_answered(db, company_id):
+    cid = db.upsert_contact(Contact(email="quiet@acme.ai", company_id=company_id))
+    db.queue_draft(cid, "one @ Acme", "Body", (), "one @ {company}")
+    db.record_send(cid, "quiet@acme.ai", "s", "", "smtp", "2026-11-20")
+    db.mark_draft(db.conn.execute(
+        "SELECT id FROM drafts WHERE contact_id = ?", (cid,)).fetchone()[0], "sent")
+    [row] = db.subject_test()
+    assert (row["sent"], row["bounced"], row["replied"]) == (1, 0, 0)
+
+
 def test_subject_test_ignores_drafts_from_before_the_test(db, company_id):
     cid = db.upsert_contact(Contact(email="old@acme.ai", company_id=company_id))
     db.queue_draft(cid, "Hi", "Body")

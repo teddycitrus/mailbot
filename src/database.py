@@ -1194,8 +1194,10 @@ class Database:
         return self.conn.execute(
             """SELECT d.subject_variant AS subject, s.lane AS lane,
                       COUNT(*) AS sent,
-                      SUM(c.status = ?) AS bounced,
-                      SUM(c.status = ? OR x.reason = 'opt-out reply') AS replied
+                      COALESCE(SUM(c.status = ?), 0) AS bounced,
+                      COALESCE(SUM(c.status = ?
+                                   OR COALESCE(x.reason, '') = 'opt-out reply'), 0)
+                          AS replied
                FROM drafts d
                JOIN contacts c ON c.id = d.contact_id
                JOIN sends s ON s.id = (SELECT MIN(id) FROM sends
