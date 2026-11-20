@@ -10,7 +10,7 @@ import pytest
 from src.emailer import (
     greeting_name, strip_re_prefix,
     Template, build_message, extract_bounced_addresses, in_send_window,
-    is_hard_bounce, load_template, pace_delay, unedited_markers,
+    is_hard_bounce, load_template, pace_delay, parse_template, unedited_markers,
     validate_template,
 )
 
@@ -413,3 +413,25 @@ def test_a_draft_without_a_persons_name_is_blocked(name, blocked):
     draft = {"subject": "s", "body": f"Hi\n[my resume]({DRIVE})\n",
              "first_name": name, "attachments": ""}
     assert (draft_defect(draft, settings) == "no person's name") is blocked
+
+
+def test_several_subject_lines_are_variants_under_test():
+    template = parse_template("Subject: one @ {company}\nSubject: two @ {company}\n\nHi\n")
+    assert template.subjects == ("one @ {company}", "two @ {company}")
+    assert template.body == "Hi"
+    picks = {template.pick_subject(f"p{i}@x.com") for i in range(40)}
+    assert picks == set(template.subjects)
+    assert template.pick_subject("A@X.com") == template.pick_subject("a@x.com")
+    subject, _ = template.render({"company": "Acme"}, subject=template.subjects[1])
+    assert subject == "two @ Acme"
+
+
+def test_one_subject_line_is_no_test():
+    template = parse_template("Subject: only\n\nHi\n")
+    assert template.subjects == ("only",) and template.pick_subject("a@x.com") == "only"
+
+
+def test_a_placeholder_in_any_subject_is_validated():
+    template = parse_template("Subject: ok\nSubject: {nonsense}\n\nHi\n")
+    with pytest.raises(ValueError, match="nonsense"):
+        validate_template(template)

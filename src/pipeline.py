@@ -524,7 +524,7 @@ class Pipeline:
             limit = min(limit, room[False] + room[True])
         template = load_template(self.settings.template_path)
         validate_template(template)
-        holes = unedited_markers(f"{template.subject}\n{template.body}")
+        holes = unedited_markers("\n".join((*template.subjects, template.body)))
         if holes:
             print(f"warning: template still has {len(holes)} unedited placeholder(s): "
                   f"{', '.join(holes[:3])}")
@@ -601,11 +601,12 @@ class Pipeline:
                 "unsubscribe": self.settings.unsubscribe_mailto,
                 "resume_link": resume_link,
             }
-            subject, body = template.render(context)
+            variant = template.pick_subject(row["email"])
+            subject, body = template.render(context, subject=variant)
             if resume_link:
                 # Covers a template that has no {resume_link} placeholder.
                 body = with_resume_link(body, self.settings.resume_link)
-            self.db.queue_draft(row["id"], subject, body, attachments)
+            self.db.queue_draft(row["id"], subject, body, attachments, variant)
             queued += 1
             room[bool(reserved)] -= 1
             rows.append((row["email"], f"queued for {reserved}" if reserved
@@ -782,7 +783,7 @@ class Pipeline:
         # the author left, and send() blocks those for queued drafts. Nothing
         # blocked them here, so the follow-up was the one path an unfinished
         # template could still leave by.
-        holes = unedited_markers(f"{template.subject}\n{template.body}")
+        holes = unedited_markers("\n".join((*template.subjects, template.body)))
         if holes:
             print(f"{tag}: refusing to send, {settings.followup_template_path} "
                   f"still has unedited placeholder(s): {', '.join(holes[:3])}")

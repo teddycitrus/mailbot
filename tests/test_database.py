@@ -293,3 +293,28 @@ def test_named_people_are_drafted_and_sent_before_unnamed(db):
     for row in db.contacts_by_status("pending"):
         db.queue_draft(row["id"], "s", "b")
     assert [d["email"] for d in db.queued_drafts()] == ["ana@plain.ai", "sam@rich.ai"]
+
+
+def test_subject_test_counts_first_emails_per_subject(db, company_id):
+    """Replies, opt-outs and bounces each land on the subject that was sent."""
+    outcomes = {"a": REPLIED, "b": SENT, "c": BOUNCED, "d": "optout", "e": SENT}
+    for local, outcome in outcomes.items():
+        cid = db.upsert_contact(Contact(email=f"{local}@acme.ai", company_id=company_id))
+        variant = "one @ {company}" if local in "abc" else "two @ {company}"
+        db.queue_draft(cid, variant.format(company="Acme"), "Body", (), variant)
+        db.record_send(cid, f"{local}@acme.ai", "s", "", "smtp", "2026-11-19")
+        db.mark_draft(db.conn.execute(
+            "SELECT id FROM drafts WHERE contact_id = ?", (cid,)).fetchone()[0], "sent")
+        if outcome == "optout":
+            db.suppress(f"{local}@acme.ai", "opt-out reply")
+        elif outcome != SENT:
+            db.set_contact_status(cid, outcome)
+    got = {r["subject"]: (r["sent"], r["bounced"], r["replied"]) for r in db.subject_test()}
+    assert got == {"one @ {company}": (3, 1, 1), "two @ {company}": (2, 0, 1)}
+
+
+def test_subject_test_ignores_drafts_from_before_the_test(db, company_id):
+    cid = db.upsert_contact(Contact(email="old@acme.ai", company_id=company_id))
+    db.queue_draft(cid, "Hi", "Body")
+    db.record_send(cid, "old@acme.ai", "Hi", "", "smtp", "2026-11-01")
+    assert db.subject_test() == []

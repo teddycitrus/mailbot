@@ -92,7 +92,9 @@ CREATE TABLE IF NOT EXISTS drafts (
     -- the message has gone out, so that it cannot be sent a second time by
     -- hand. See mirror.py.
     gmail_message_id TEXT DEFAULT '',
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    -- The unrendered subject line this draft was given, for the subject test.
+    subject_variant TEXT DEFAULT ''
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_contact ON drafts(contact_id);
 
@@ -237,6 +239,7 @@ class Database:
             ("sends", "lane", f"TEXT DEFAULT '{MAIN_LANE}'"),
             # The only lane allowed to mail this contact, "" for any.
             ("contacts", "lane", "TEXT DEFAULT ''"),
+            ("drafts", "subject_variant", "TEXT DEFAULT ''"),
         ):
             have = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
             if column not in have:
@@ -643,14 +646,16 @@ class Database:
     # ---------- drafts ----------
 
     def queue_draft(self, contact_id: int, subject: str, body: str,
-                    attachments: Iterable[str] = ()) -> int:
+                    attachments: Iterable[str] = (), subject_variant: str = "") -> int:
         cur = self.conn.execute(
-            """INSERT INTO drafts (contact_id, subject, body, attachments, status, created_at)
-               VALUES (?,?,?,?,'queued',?)
+            """INSERT INTO drafts (contact_id, subject, body, attachments, status,
+                                   created_at, subject_variant)
+               VALUES (?,?,?,?,'queued',?,?)
                ON CONFLICT(contact_id) DO UPDATE SET
                  subject=excluded.subject, body=excluded.body,
-                 attachments=excluded.attachments, status='queued'""",
-            (contact_id, subject, body, "|".join(attachments), _now()),
+                 attachments=excluded.attachments, status='queued',
+                 subject_variant=excluded.subject_variant""",
+            (contact_id, subject, body, "|".join(attachments), _now(), subject_variant),
         )
         self.conn.execute(
             "UPDATE contacts SET status = ? WHERE id = ?", (QUEUED, contact_id)
@@ -1178,6 +1183,29 @@ class Database:
             (kind, ref, detail, _now()),
         )
         self.conn.commit()
+
+    def subject_test(self) -> list[sqlite3.Row]:
+        """First emails sent, bounced and answered, per subject line and lane.
+
+        Per lane because one account landing in spam would otherwise drag
+        down whichever subject it happened to send most. An opt-out counts as
+        an answer: it was opened and read, which is what a subject decides.
+        """
+        return self.conn.execute(
+            """SELECT d.subject_variant AS subject, s.lane AS lane,
+                      COUNT(*) AS sent,
+                      SUM(c.status = ?) AS bounced,
+                      SUM(c.status = ? OR x.reason = 'opt-out reply') AS replied
+               FROM drafts d
+               JOIN contacts c ON c.id = d.contact_id
+               JOIN sends s ON s.id = (SELECT MIN(id) FROM sends
+                                       WHERE contact_id = c.id AND status = 'sent')
+               LEFT JOIN suppression x ON x.email = c.email
+               WHERE d.status = 'sent' AND d.subject_variant != ''
+               GROUP BY d.subject_variant, s.lane
+               ORDER BY s.lane, d.subject_variant""",
+            (BOUNCED, REPLIED),
+        ).fetchall()
 
     def stats(self) -> dict[str, int]:
         def one(sql: str, args: tuple = ()) -> int:

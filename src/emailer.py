@@ -19,6 +19,7 @@ import smtplib
 import ssl
 import urllib.error
 import urllib.request
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, time as dtime, timezone
 from email.message import EmailMessage
@@ -46,19 +47,30 @@ class _Safe(dict):
 class Template:
     subject: str
     body: str
+    # Every subject line under test, the first included. Empty means one.
+    variants: tuple[str, ...] = ()
+
+    @property
+    def subjects(self) -> tuple[str, ...]:
+        return self.variants or (self.subject,)
+
+    def pick_subject(self, key: str) -> str:
+        """The subject under test for one recipient, the same on every render."""
+        return self.subjects[zlib.crc32(key.lower().encode("utf-8")) % len(self.subjects)]
 
     @property
     def placeholders(self) -> set[str]:
         fields = set()
-        for text in (self.subject, self.body):
+        for text in (*self.subjects, self.body):
             for _, field, _, _ in Formatter().parse(text):
                 if field:
                     fields.add(field)
         return fields
 
-    def render(self, context: dict[str, str]) -> tuple[str, str]:
+    def render(self, context: dict[str, str],
+               subject: Optional[str] = None) -> tuple[str, str]:
         safe = _Safe(context)
-        subject = Formatter().vformat(self.subject, (), safe).strip()
+        subject = Formatter().vformat(subject or self.subject, (), safe).strip()
         body = Formatter().vformat(self.body, (), safe)
         body = re.sub(r"\n{3,}", "\n\n", body).strip() + "\n"
         # "CrossBar, Inc." before the template's own period. Ellipses survive.
@@ -142,7 +154,11 @@ def validate_template(template: Template,
 
 
 def load_template(path: str | Path) -> Template:
-    """Template file is 'Subject: ...' on line one, blank line, then the body."""
+    """Template file is 'Subject: ...' on line one, blank line, then the body.
+
+    Several 'Subject:' lines in a row put those subjects under test: each
+    recipient gets one of them, always the same one.
+    """
     return parse_template(Path(path).read_text(encoding="utf-8"), str(path))
 
 
@@ -155,11 +171,14 @@ def parse_template(text: str, path: str = "template") -> Template:
         raise ValueError(
             f"template {path} must start with a 'Subject:' line, got {lines[0][:40]!r}"
         )
-    subject = lines[0].split(":", 1)[1].strip()
-    body = "\n".join(lines[1:]).lstrip("\n")
+    subjects = []
+    while lines and lines[0].lower().startswith("subject:"):
+        subjects.append(lines.pop(0).split(":", 1)[1].strip())
+    body = "\n".join(lines).lstrip("\n")
     if not body.strip():
         raise ValueError(f"template {path} has no body")
-    return Template(subject=subject, body=body)
+    return Template(subject=subjects[0], body=body,
+                    variants=tuple(subjects) if len(subjects) > 1 else ())
 
 
 # ------------------------------------------------------------- send window

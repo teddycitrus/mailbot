@@ -119,7 +119,7 @@ def _one_template(label: str, path, required: bool) -> Check:
         validate_template(tpl)
     except (ValueError, OSError) as exc:
         return Check(label, FAIL, str(exc)[:120])
-    holes = unedited_markers(tpl.subject + chr(10) + tpl.body)
+    holes = unedited_markers(chr(10).join((*tpl.subjects, tpl.body)))
     if holes:
         return Check(label, FAIL, f"unedited placeholders: {holes[:2]}")
     return Check(label, OK, str(path))

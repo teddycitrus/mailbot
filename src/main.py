@@ -29,7 +29,7 @@ from .verifier import port25_reachable
 # alert about a bad day must never be the thing that gets skipped because a
 # drafting run happened to hold the lock.
 LOCK_EXEMPT = frozenset({
-    "dashboard", "verify-build", "doctor", "stats", "preview", "health",
+    "dashboard", "verify-build", "doctor", "stats", "subjects", "preview", "health",
     "bounce-report",
 })
 
@@ -130,6 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("suppress", help="never contact an address")
     p.add_argument("email")
     sub.add_parser("stats", help="print the summary tables")
+    sub.add_parser("subjects", help="reply rate for each subject line under test")
     p = sub.add_parser("health", help="check everything and alert if it is broken")
     p.add_argument("--no-email", dest="email", action="store_false",
                    help="print the report without mailing it")
@@ -299,6 +300,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"suppressed {args.email}")
         elif args.command == "stats":
             pipeline.summary()
+        elif args.command == "subjects":
+            rows = []
+            for r in pipeline.db.subject_test():
+                delivered = r["sent"] - r["bounced"]
+                rate = f"{100 * r['replied'] / delivered:.1f}%" if delivered else "-"
+                rows.append((r["lane"], r["subject"], r["sent"], r["bounced"],
+                             r["replied"], rate))
+            _print_table(rows, ("lane", "subject", "sent", "bounced", "replied",
+                                "reply rate"))
         elif args.command == "reverify":
             report = recover(pipeline.db, pipeline.verifier, args.limit,
                              reopen=args.reopen)
