@@ -1,0 +1,10 @@
+[Unit]
+Description=mailbot hourly spam rescue
+
+[Timer]
+Unit=mailbot@spam.service
+OnCalendar=*-*-* 07..23:20:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

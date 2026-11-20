@@ -14,7 +14,7 @@ set -u
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root" || exit 2
 py="$root/.venv/bin/python"
-job=${1:?usage: job.sh <prep|tick|draft|build|reprobe|health|bounce|digest>}
+job=${1:?usage: job.sh <prep|tick|draft|build|reprobe|health|spam|bounce|digest>}
 
 case "$job" in
     prep|tick) log_name=send ;;
@@ -97,6 +97,12 @@ case "$job" in
         volume inbox --spam --days 3 --limit 300
         run health
         volume health
+        ;;
+    spam)
+        # Gmail keeps filing real replies as spam (Superhuman's tracking pixel
+        # on a one-line answer is enough), so rescue them within the hour.
+        run inbox --spam --days 3 --limit 100
+        volume inbox --spam --days 3 --limit 100
         ;;
     bounce)
         run inbox --days 1 --limit 80
