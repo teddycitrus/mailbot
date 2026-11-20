@@ -23,3 +23,5 @@ config/template.txt
 config/followup.txt
 config/reply.txt
 cache/
+
+backups/
